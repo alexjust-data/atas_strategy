@@ -1,0 +1,15 @@
+C:\Users\AlexJ\Desktop\MyAtasIndicator\bin\Release\net8.0-windows\MyAtasIndicator.deps.json
+C:\Users\AlexJ\Desktop\MyAtasIndicator\bin\Release\net8.0-windows\MyAtasIndicator.dll
+C:\Users\AlexJ\Desktop\MyAtasIndicator\bin\Release\net8.0-windows\MyAtasIndicator.pdb
+C:\Users\AlexJ\Desktop\MyAtasIndicator\bin\Release\net8.0-windows\Utils.Common.dll
+C:\Users\AlexJ\Desktop\MyAtasIndicator\bin\Release\net8.0-windows\Newtonsoft.Json.dll
+C:\Users\AlexJ\Desktop\MyAtasIndicator\bin\Release\net8.0-windows\protobuf-net.dll
+C:\Users\AlexJ\Desktop\MyAtasIndicator\bin\Release\net8.0-windows\protobuf-net.Core.dll
+C:\Users\AlexJ\Desktop\MyAtasIndicator\obj\Release\net8.0-windows\MyAtasIndicator.csproj.AssemblyReference.cache
+C:\Users\AlexJ\Desktop\MyAtasIndicator\obj\Release\net8.0-windows\MyAtasIndicator.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\AlexJ\Desktop\MyAtasIndicator\obj\Release\net8.0-windows\MyAtasIndicator.csproj.CoreCompileInputs.cache
+C:\Users\AlexJ\Desktop\MyAtasIndicator\obj\Release\net8.0-windows\MyAtasIn.ABC788AE.Up2Date
+C:\Users\AlexJ\Desktop\MyAtasIndicator\obj\Release\net8.0-windows\MyAtasIndicator.dll
+C:\Users\AlexJ\Desktop\MyAtasIndicator\obj\Release\net8.0-windows\refint\MyAtasIndicator.dll
+C:\Users\AlexJ\Desktop\MyAtasIndicator\obj\Release\net8.0-windows\MyAtasIndicator.pdb
+C:\Users\AlexJ\Desktop\MyAtasIndicator\obj\Release\net8.0-windows\ref\MyAtasIndicator.dll
