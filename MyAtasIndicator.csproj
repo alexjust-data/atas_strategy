@@ -1,0 +1,65 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <UseWPF>true</UseWPF>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+
+    <!-- Copia TODAS las dependencias NuGet al output (bin\...\) -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Referencias a ensamblados de ATAS pero SIN copiarlos (ATAS ya los tiene) -->
+    <Reference Include="ATAS.Types">
+      <HintPath>C:\Program Files (x86)\ATAS Platform\ATAS.Types.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ATAS.Indicators">
+      <HintPath>C:\Program Files (x86)\ATAS Platform\ATAS.Indicators.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ATAS.Indicators.Technical">
+      <HintPath>C:\Program Files (x86)\ATAS Platform\ATAS.Indicators.Technical.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ATAS.Strategies">
+      <HintPath>C:\Program Files (x86)\ATAS Platform\ATAS.Strategies.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="ATAS.DataFeedsCore">
+      <HintPath>C:\Program Files (x86)\ATAS Platform\ATAS.DataFeedsCore.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="OFT.Rendering">
+      <HintPath>C:\Program Files (x86)\ATAS Platform\OFT.Rendering.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Macross.Json.Extensions">
+      <HintPath>C:\Program Files (x86)\ATAS Platform\Macross.Json.Extensions.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+
+  <!-- Despliegue automático: copia TODO el contenido del output a las carpetas de ATAS -->
+  <Target Name="DeployToAtas" AfterTargets="Build">
+    <PropertyGroup>
+      <AtasIndicators>$(APPDATA)\ATAS\Indicators</AtasIndicators>
+      <AtasStrategies>$(APPDATA)\ATAS\Strategies</AtasStrategies>
+    </PropertyGroup>
+
+    <ItemGroup>
+      <!-- coge todas las DLL/JSON/PDB del output -->
+      <_OutputFiles Include="$(TargetDir)*.*" />
+    </ItemGroup>
+
+    <Copy SourceFiles="@(_OutputFiles)" DestinationFolder="$(AtasIndicators)" SkipUnchangedFiles="true" />
+    <Copy SourceFiles="@(_OutputFiles)" DestinationFolder="$(AtasStrategies)" SkipUnchangedFiles="true" />
+  </Target>
+
+</Project>
+
+
+

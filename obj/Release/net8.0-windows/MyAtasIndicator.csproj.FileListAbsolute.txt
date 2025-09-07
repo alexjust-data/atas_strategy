@@ -1,0 +1,10 @@
+C:\Users\AlexJ\Desktop\atas_strategy_yes\obj\Release\net8.0-windows\MyAtasIndicator.csproj.AssemblyReference.cache
+C:\Users\AlexJ\Desktop\atas_strategy_yes\obj\Release\net8.0-windows\MyAtasIndicator.GeneratedMSBuildEditorConfig.editorconfig
+C:\Users\AlexJ\Desktop\atas_strategy_yes\obj\Release\net8.0-windows\MyAtasIndicator.csproj.CoreCompileInputs.cache
+C:\Users\AlexJ\Desktop\atas_strategy_yes\bin\Release\net8.0-windows\MyAtasIndicator.deps.json
+C:\Users\AlexJ\Desktop\atas_strategy_yes\bin\Release\net8.0-windows\MyAtasIndicator.dll
+C:\Users\AlexJ\Desktop\atas_strategy_yes\bin\Release\net8.0-windows\MyAtasIndicator.pdb
+C:\Users\AlexJ\Desktop\atas_strategy_yes\obj\Release\net8.0-windows\MyAtasIndicator.dll
+C:\Users\AlexJ\Desktop\atas_strategy_yes\obj\Release\net8.0-windows\refint\MyAtasIndicator.dll
+C:\Users\AlexJ\Desktop\atas_strategy_yes\obj\Release\net8.0-windows\MyAtasIndicator.pdb
+C:\Users\AlexJ\Desktop\atas_strategy_yes\obj\Release\net8.0-windows\ref\MyAtasIndicator.dll
