@@ -67,6 +67,20 @@ namespace MyAtas.Strategies
         [Category("Risk/Targets"), DisplayName("TP3 (R multiple)")]
         public decimal TP3_R { get; set; } = 3.0m;
 
+        // --- Execution Control ---
+        [Category("Execution"), DisplayName("Attach brackets from actual net fill")]
+        public bool AttachBracketsFromNet { get; set; } = true;
+
+        [Category("Execution"), DisplayName("Top-up missing qty to target")]
+        public bool TopUpMissingQty { get; set; } = false;
+
+        // --- Risk/Timing ---
+        [Category("Risk/Timing"), DisplayName("Enable cooldown after flat")]
+        public bool EnableCooldown { get; set; } = true;
+
+        [Category("Risk/Timing"), DisplayName("Cooldown bars after flat")]
+        public int CooldownBars { get; set; } = 2;
+
         // ====================== INTERNAL STATE ======================
         private FourSixEightIndicator _ind;
         private Pending? _pending;           // captured at N (GL-cross close confirmed)
@@ -76,6 +90,16 @@ namespace MyAtas.Strategies
         // Candado de estado y tracking de órdenes para OnlyOnePosition
         private bool _tradeActive = false;             // true tras enviar la entrada hasta quedar plano y sin órdenes vivas
         private readonly List<Order> _liveOrders = new(); // órdenes creadas por ESTA estrategia y aún activas
+
+        // Post-fill bracket control
+        private int _targetQty = 0;          // qty solicitada en la entrada
+        private int _lastSignalBar = -1;     // N de la señal que originó la entrada
+        private int _entryDir = 0;           // +1 BUY / -1 SELL
+        private bool _bracketsPlaced = false; // ya colgados los brackets
+
+        // Cooldown management
+        private int _cooldownUntilBar = -1;   // bar index hasta el que no se permite re-entrada
+        private int _lastFlatBar = -1;        // último bar en el que quedamos planos
 
         private struct Pending { public Guid Uid; public int BarId; public int Dir; }
 
@@ -274,15 +298,19 @@ namespace MyAtas.Strategies
                 if (OnlyOnePosition)
                 {
                     int net = GetNetPosition();
-                    bool busy = _tradeActive || net != 0 || HasAnyActiveOrders();
-                    DebugLog.W("468/STR", $"GUARD OnlyOnePosition: active={_tradeActive} net={net} activeOrders={CountActiveOrders()} -> {(busy?"BLOCK":"PASS")}");
+                    bool inCooldown = EnableCooldown && CooldownBars > 0 && _cooldownUntilBar >= 0 && bar <= _cooldownUntilBar;
+                    bool busy = _tradeActive || net != 0 || HasAnyActiveOrders() || inCooldown;
+                    DebugLog.W("468/STR", $"GUARD OnlyOnePosition: active={_tradeActive} net={net} activeOrders={CountActiveOrders()} cooldown={(inCooldown ? $"YES(until={_cooldownUntilBar})" : "NO")} -> {(busy ? "BLOCK" : "PASS")}");
 
                     // Si net=0 pero hay órdenes activas "zombie", CANCELA en broker (no sólo limpiar lista)
                     if (net == 0 && HasAnyActiveOrders())
                     {
                         DebugLog.W("468/STR", "ZOMBIE CANCEL: net=0 but active orders present -> cancelling...");
                         CancelAllLiveActiveOrders();
-                        busy = false; // deja pasar la nueva entrada tras cancelar
+                        // CRITICAL FIX: NO re-entrar en el mismo ciclo. Esperar a que OnOrderChanged limpie.
+                        // Conservar señal pendiente para reevaluación en próximo tick/bar
+                        DebugLog.W("468/STR", "ZOMBIE CANCEL done – will re-check entry on next OnCalculate cycle");
+                        return; // ← salir y dejar que el próximo OnCalculate reevalúe
                     }
 
                     if (busy)
@@ -293,14 +321,10 @@ namespace MyAtas.Strategies
                     }
                 }
 
-                // --- Todas las confluencias OK -> primero brackets, luego MARKET ---
+                // --- Todas las confluencias OK -> solo market; los brackets se adjuntan post-fill ---
                 try
                 {
-                    // SL desde la vela de señal (N). TPs por R múltiplo.
-                    BuildAndSubmitBracket(dir, qty, s.BarId, bar);
-
-                    // Submit market order after brackets are in place
-                    SubmitMarket(dir, qty, bar);
+                    SubmitMarket(dir, qty, bar, s.BarId);
                     _lastExecUid = s.Uid;
 
                     DebugLog.Critical("468/STR", $"ENTRY + BRACKET sent at N+1 bar={bar} (signal N={s.BarId}) dir={(dir>0?"BUY":"SELL")} qty={qty}");
@@ -329,21 +353,42 @@ namespace MyAtas.Strategies
                 var before  = _liveOrders.Count;
                 DebugLog.W("468/ORD", $"OnOrderChanged: {comment} status={status} state={state} active={isActive} liveCount={before}");
 
-                // Activar candado sólo cuando la ENTRADA está realmente colocada/llenándose
-                if ((comment?.StartsWith("468ENTRY:") ?? false) && (status == OrderStatus.Placed || status == OrderStatus.PartlyFilled || status == OrderStatus.Filled))
+                // Activar candado y colgar brackets post-fill (según net real)
+                if ((comment?.StartsWith("468ENTRY:") ?? false)
+                    && (status == OrderStatus.Placed || status == OrderStatus.PartlyFilled || status == OrderStatus.Filled))
+                {
                     _tradeActive = true;
+                    if (!_bracketsPlaced)
+                    {
+                        int net = Math.Abs(GetNetPosition());
+                        if (net > 0 && _entryDir != 0 && _lastSignalBar >= 0)
+                        {
+                            BuildAndSubmitBracket(_entryDir, net, _lastSignalBar, CurrentBar);
+                            _bracketsPlaced = true;
+                            DebugLog.W("468/STR", $"BRACKETS ATTACHED (from net={net})");
+                        }
+                    }
+                }
 
                 if (!isActive)
                 {
-                    // eliminar por referencia o por comment (fallback)
                     int removed = _liveOrders.RemoveAll(o => ReferenceEquals(o, order) || (o?.Comment == order?.Comment));
                     DebugLog.W("468/ORD", $"Removed {removed} from _liveOrders (now {_liveOrders.Count})");
                 }
+
+                // Reconciliar siempre: TP/SL deben reflejar el net vivo
+                try { ReconcileBracketsWithNet(); } catch { /* best-effort */ }
 
                 // Si estamos planos y ya no hay órdenes vivas, libera el candado
                 if (GetNetPosition() == 0 && !HasAnyActiveOrders())
                 {
                     _tradeActive = false;
+                    _lastFlatBar = CurrentBar;
+                    if (EnableCooldown && CooldownBars > 0)
+                    {
+                        _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
+                        DebugLog.W("468/STR", $"COOLDOWN armed until bar={_cooldownUntilBar} (now={CurrentBar})");
+                    }
                     DebugLog.W("468/ORD", "Trade candado RELEASED: net=0 & no active orders");
                 }
             }
@@ -354,40 +399,70 @@ namespace MyAtas.Strategies
             base.OnOrderChanged(order);
         }
 
+        // Garantía extra: si el net aparece después, adjunta brackets aquí
+        protected override void OnPositionChanged(Position position)
+        {
+            try
+            {
+                var sec = position?.GetType().GetProperty("Security")?.GetValue(position);
+                if (!Equals(sec, Security)) return;
+
+                int net = Math.Abs(GetNetPosition());
+                if (net > 0 && !_bracketsPlaced && _entryDir != 0 && _lastSignalBar >= 0)
+                {
+                    BuildAndSubmitBracket(_entryDir, net, _lastSignalBar, CurrentBar);
+                    _bracketsPlaced = true;
+                    DebugLog.W("468/STR", $"BRACKETS ATTACHED (via OnPositionChanged, net={net})");
+                }
+
+                // Si quedamos planos y ya no hay órdenes activas, libera candado
+                if (net == 0 && !HasAnyActiveOrders())
+                {
+                    _tradeActive = false;
+                    DebugLog.W("468/ORD", "Trade lock RELEASED by OnPositionChanged (net=0 & no active orders)");
+                }
+            }
+            catch { }
+            base.OnPositionChanged(position);
+        }
+
         // ====================== BRACKETS - FIXED ======================
         private void BuildAndSubmitBracket(int dir, int totalQty, int signalBar, int execBar)
         {
             if (totalQty <= 0) return;
 
             var (slPx, tpList) = BuildBracketPrices(dir, signalBar, execBar);
-            var tpQty = SplitQtyForTPs(totalQty, tpList.Count);
+            var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
 
-            // FIXED: Proper OCO implementation - ONE STOP for total quantity + individual TPs
-            if (tpList.Count > 0)
+            // Crea sólo tantas patas como 'totalQty' (1→TP1, 2→TP1+TP2, 3→TP1+TP2+TP3)
+            int legs = Math.Min(totalQty, 3);
+
+            if (legs >= 1 && EnableTP1 && tpList.Count >= 1)
             {
-                // Create one OCO group for each TP level
-                for (int i = 0; i < tpList.Count; i++)
-                {
-                    var oco = Guid.NewGuid().ToString("N");
-                    int legQty = GetElementAtOrDefault(tpQty, i, 0);
-
-                    if (legQty > 0)
-                    {
-                        // STOP for this leg quantity only
-                        SubmitStop(oco, dir > 0 ? OrderDirections.Sell : OrderDirections.Buy, legQty, slPx);
-
-                        // LIMIT TP for this leg
-                        SubmitLimit(oco, dir > 0 ? OrderDirections.Sell : OrderDirections.Buy, legQty, tpList[i]);
-                    }
-                }
+                var o1 = Guid.NewGuid().ToString("N");
+                SubmitStop(o1, coverSide, 1, slPx);
+                SubmitLimit(o1, coverSide, 1, tpList[0]);
             }
-            else
+            if (legs >= 2 && EnableTP2 && tpList.Count >= 2)
             {
-                // No TPs enabled - just submit a stop loss for full quantity
-                SubmitStop(null, dir > 0 ? OrderDirections.Sell : OrderDirections.Buy, totalQty, slPx);
+                var o2 = Guid.NewGuid().ToString("N");
+                SubmitStop(o2, coverSide, 1, slPx);
+                SubmitLimit(o2, coverSide, 1, tpList[1]);
+            }
+            if (legs >= 3 && EnableTP3 && tpList.Count >= 3)
+            {
+                var o3 = Guid.NewGuid().ToString("N");
+                SubmitStop(o3, coverSide, 1, slPx);
+                SubmitLimit(o3, coverSide, 1, tpList[2]);
             }
 
-            DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))} | Qty split: {string.Join("/", tpQty)}");
+            // If no TPs enabled, just submit a stop loss for full quantity
+            if (legs == 0 || (!EnableTP1 && !EnableTP2 && !EnableTP3))
+            {
+                SubmitStop(null, coverSide, totalQty, slPx);
+            }
+
+            DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))} | Legs={legs}/{totalQty}");
         }
 
         private (decimal slPx, List<decimal> tpList) BuildBracketPrices(int dir, int signalBar, int execBar)
@@ -451,7 +526,7 @@ namespace MyAtas.Strategies
         }
 
         // ====================== ORDER WRAPPERS ======================
-        private void SubmitMarket(int dir, int qty, int bar)
+        private void SubmitMarket(int dir, int qty, int bar, int signalBar)
         {
             // *** CRITICAL DEBUG ***
             DebugLog.Critical("468/STR", $"SubmitMarket CALLED: dir={dir} qty={qty} bar={bar} t={GetCandle(bar).Time:HH:mm:ss} - THIS IS OUR N+1 EXECUTION");
@@ -467,6 +542,13 @@ namespace MyAtas.Strategies
             };
             OpenOrder(order);
             _liveOrders.Add(order);
+
+            // Track signal context for post-fill brackets
+            _targetQty = qty;
+            _lastSignalBar = signalBar;
+            _entryDir = dir;
+            _bracketsPlaced = false;
+
             DebugLog.Critical("468/STR", $"MARKET ORDER SENT: {(dir>0?"BUY":"SELL")} {qty} at N+1 (bar={bar}) - OpenOrder() called successfully");
         }
 
@@ -763,6 +845,49 @@ namespace MyAtas.Strategies
             }
             DebugLog.W("468/POS", "HasOpenPosition: NO POSITION DETECTED");
             return false;
+        }
+
+        // Cancela TPs sobrantes y asegura que el/los SL cubran exactamente el net vivo
+        private void ReconcileBracketsWithNet()
+        {
+            int net = Math.Abs(GetNetPosition());
+            if (net < 0) net = 0;
+
+            // TPs activos de esta estrategia
+            var tps = _liveOrders
+                .Where(o => o != null && (o.Comment?.StartsWith("468TP:") ?? false)
+                       && o.State == OrderStates.Active && o.Status() != OrderStatus.Filled && o.Status() != OrderStatus.Canceled)
+                .ToList();
+
+            // Si hay más TPs que net -> cancelar sobrantes
+            if (tps.Count > net)
+            {
+                // dejar los más cercanos primero (ordenar por Price asc. es suficiente para BUY)
+                var toCancel = tps.OrderBy(o => o.Price).Skip(net).ToList();
+                foreach (var o in toCancel)
+                    try { CancelOrder(o); } catch { }
+            }
+
+            // Stops activos
+            var sls = _liveOrders
+                .Where(o => o != null && (o.Comment?.StartsWith("468SL:") ?? false)
+                       && o.State == OrderStates.Active && o.Status() != OrderStatus.Filled && o.Status() != OrderStatus.Canceled)
+                .ToList();
+            int slQty = 0;
+            foreach (var s in sls) { try { slQty += (int)s.QuantityToFill; } catch { } }
+
+            // Si la suma de SL != net -> simplificar a un único SL = net
+            if (slQty != net)
+            {
+                foreach (var s in sls) { try { CancelOrder(s); } catch { } }
+                if (net > 0 && _lastSignalBar >= 0 && _entryDir != 0)
+                {
+                    var (slPx, _) = BuildBracketPrices(_entryDir, _lastSignalBar, CurrentBar);
+                    var coverSide = _entryDir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+                    var oco = Guid.NewGuid().ToString();
+                    SubmitStop(oco, coverSide, net, slPx);
+                }
+            }
         }
 
         // === Cálculo local para evitar races de N+1 ===
