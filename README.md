@@ -48,4 +48,5 @@ Run `scripts/deploy_all.ps1` to build and deploy all components to ATAS.
 - v1.0: Initial 468 strategy implementation
 
 ## Author
+Alex Just Rodriguez.
 Developed for professional quantitative trading with ATAS platform.
