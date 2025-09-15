@@ -248,3 +248,52 @@ CooldownBars = 2              ← 2 velas enfriamiento
 - Logs mejorados para diagnóstico completo
 
 **Status:** ✅ Problema de cantidades TPs resuelto completamente. Sistema robusto para fills parciales.
+
+---
+
+## 🔧 **V2.2 - DIAGNÓSTICO BRACKETS CANCELADOS (16 Sep 2025, 01:00)**
+
+### **🚨 NUEVO PROBLEMA IDENTIFICADO:**
+Los brackets post-fill **SÍ se crean correctamente** pero **se cancelan inmediatamente**:
+
+**LOG EVIDENCIA (00:42:20):**
+```
+[00:42:20.885-887] STOP/LIMIT submitted: 6 órdenes creadas (3 SL + 3 TP)
+[00:42:20.889] BRACKETS ATTACHED (from net=3) ✅
+[00:42:20.928-944] OnOrderChanged: status=Canceled (TODAS las órdenes) ❌
+[00:42:20.945] Trade candado RELEASED: net=0 & no active orders
+```
+
+### **🔍 CAUSA RAÍZ:**
+`GetNetPosition()` devuelve **siempre 0**, incluso después de ejecutar la market order. Esto activa la lógica de liberación del candado y `AutoCancel=true` cancela todos los brackets.
+
+### **📊 DIAGNÓSTICOS AÑADIDOS:**
+- **Enhanced logs** en `GetNetPosition()` para detectar si falla Portfolio API o Positions reflection
+- **Fallback robusto** con `GetFilledQtyFromOrder()` para PartlyFilled
+- **Logs detallados** de POST-FILL CHECK con status tracking
+
+### **🎯 PRÓXIMA SESIÓN - QUÉ BUSCAR:**
+
+#### **En logs nuevos buscar:**
+```bash
+grep -E "GetNetPosition via Portfolio|GetNetPosition via Positions|GetNetPosition: returning 0" EMERGENCY_ATAS_LOG.txt
+```
+
+#### **Posibles causas a investigar:**
+1. **API Portfolio lenta**: Position update delay después de market execution
+2. **Reflection falla**: ATAS API cambió propiedades `NetQuantity/NetPosition/Quantity`
+3. **Security mismatch**: El objeto Security no coincide en comparación
+4. **Timing issue**: Los brackets se crean antes de que el portfolio actualice
+
+#### **Soluciones a implementar:**
+1. **Delay brackets**: `Task.Delay(100ms)` antes de adjuntar brackets
+2. **Alternative tracking**: Trackear posición manualmente desde órdenes filled
+3. **Disable AutoCancel**: Temporal fix hasta resolver GetNetPosition()
+4. **Portfolio event**: Usar `OnPositionChanged` como trigger principal
+
+### **🛠️ CAMBIOS TÉCNICOS V2.2:**
+- Enhanced `GetNetPosition()` diagnostics con try/catch detallado
+- Fallback `GetFilledQtyFromOrder()` para casos PartlyFilled
+- Logs completos de reflection API failures
+
+**Status:** 🔍 Sistema post-fill funciona pero GetNetPosition() falla constantemente. Brackets se cancelan por AutoCancel cuando net=0.

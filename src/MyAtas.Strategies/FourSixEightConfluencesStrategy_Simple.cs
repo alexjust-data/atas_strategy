@@ -327,7 +327,7 @@ namespace MyAtas.Strategies
                     SubmitMarket(dir, qty, bar, s.BarId);
                     _lastExecUid = s.Uid;
 
-                    DebugLog.Critical("468/STR", $"ENTRY + BRACKET sent at N+1 bar={bar} (signal N={s.BarId}) dir={(dir>0?"BUY":"SELL")} qty={qty}");
+                    DebugLog.Critical("468/STR", $"ENTRY sent at N+1 bar={bar} (signal N={s.BarId}) dir={(dir>0?"BUY":"SELL")} qty={qty} - brackets will attach post-fill");
                 }
                 catch (Exception ex)
                 {
@@ -361,12 +361,38 @@ namespace MyAtas.Strategies
                     if (!_bracketsPlaced)
                     {
                         int net = Math.Abs(GetNetPosition());
+                        DebugLog.W("468/STR", $"POST-FILL CHECK: net={net} _entryDir={_entryDir} _lastSignalBar={_lastSignalBar} status={status}");
+
+                        // Fallbacks robustos si el portfolio aún no reflejó la posición (incluye parciales)
+                        if (net == 0)
+                        {
+                            int filled = GetFilledQtyFromOrder(order);   // ← nueva función
+                            if (filled > 0)
+                            {
+                                net = filled;
+                                DebugLog.W("468/STR", $"FALLBACK: Using FilledQuantity={net}");
+                            }
+                            else if (status == OrderStatus.Filled)
+                            {
+                                net = (int)Math.Abs(order.QuantityToFill);
+                                DebugLog.W("468/STR", $"FALLBACK: Using order.QuantityToFill={net}");
+                            }
+                        }
+
                         if (net > 0 && _entryDir != 0 && _lastSignalBar >= 0)
                         {
                             BuildAndSubmitBracket(_entryDir, net, _lastSignalBar, CurrentBar);
                             _bracketsPlaced = true;
                             DebugLog.W("468/STR", $"BRACKETS ATTACHED (from net={net})");
                         }
+                        else
+                        {
+                            DebugLog.W("468/STR", $"BRACKETS NOT ATTACHED: net={net} dir={_entryDir} bar={_lastSignalBar}");
+                        }
+                    }
+                    else
+                    {
+                        DebugLog.W("468/STR", $"BRACKETS ALREADY PLACED: _bracketsPlaced=true");
                     }
                 }
 
@@ -383,6 +409,7 @@ namespace MyAtas.Strategies
                 if (GetNetPosition() == 0 && !HasAnyActiveOrders())
                 {
                     _tradeActive = false;
+                    _bracketsPlaced = false;  // Reset para próxima entrada
                     _lastFlatBar = CurrentBar;
                     if (EnableCooldown && CooldownBars > 0)
                     {
@@ -419,6 +446,7 @@ namespace MyAtas.Strategies
                 if (net == 0 && !HasAnyActiveOrders())
                 {
                     _tradeActive = false;
+                    _bracketsPlaced = false;  // Reset para próxima entrada
                     DebugLog.W("468/ORD", "Trade lock RELEASED by OnPositionChanged (net=0 & no active orders)");
                 }
             }
@@ -592,6 +620,26 @@ namespace MyAtas.Strategies
             DebugLog.W("468/ORD", $"STOP submitted: {side} {qty} @{triggerPx:F2} OCO={(oco??"none")}");
         }
 
+        private int GetFilledQtyFromOrder(object order)
+        {
+            try
+            {
+                foreach (var name in new[] { "Filled", "FilledQuantity", "Executed", "QtyFilled" })
+                {
+                    var p = order.GetType().GetProperty(name);
+                    if (p == null) continue;
+                    var v = Math.Abs(Convert.ToDecimal(p.GetValue(order)));
+                    if (v > 0) return (int)Math.Round(v);
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/POS", $"GetNetPosition via Positions failed: {ex.Message}");
+            }
+            DebugLog.W("468/POS", "GetNetPosition: returning 0 (no position found)");
+            return 0;
+        }
+
         // ====================== HELPERS - FIXED ======================
         // FIXED: Use override instead of new to properly override base property
         protected virtual decimal InternalTickSize
@@ -640,9 +688,17 @@ namespace MyAtas.Strategies
                 var getPos    = portfolio?.GetType().GetMethod("GetPosition", new[] { security?.GetType() });
                 var pos       = (getPos != null && security != null) ? getPos.Invoke(portfolio, new[] { security }) : null;
                 var qProp     = pos?.GetType().GetProperty("NetQuantity") ?? pos?.GetType().GetProperty("NetPosition") ?? pos?.GetType().GetProperty("Quantity");
-                if (qProp != null) return Convert.ToInt32(Math.Truncate(Convert.ToDecimal(qProp.GetValue(pos))));
+                if (qProp != null)
+                {
+                    var netQty = Convert.ToInt32(Math.Truncate(Convert.ToDecimal(qProp.GetValue(pos))));
+                    DebugLog.W("468/POS", $"GetNetPosition via Portfolio: {netQty}");
+                    return netQty;
+                }
             }
-            catch { /* ignore */ }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/POS", $"GetNetPosition via Portfolio failed: {ex.Message}");
+            }
             // Vía 2: enumerar Positions y filtrar por Security actual
             try
             {
@@ -657,11 +713,19 @@ namespace MyAtas.Strategies
                         var qProp= p.GetType().GetProperty("NetQuantity") ?? p.GetType().GetProperty("NetPosition") ?? p.GetType().GetProperty("Quantity");
                         if (qProp == null) continue;
                         var qty  = Convert.ToInt32(Math.Truncate(Convert.ToDecimal(qProp.GetValue(p))));
-                        if (qty != 0) return qty;
+                        if (qty != 0)
+                        {
+                            DebugLog.W("468/POS", $"GetNetPosition via Positions: {qty}");
+                            return qty;
+                        }
                     }
                 }
             }
-            catch { /* ignore */ }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/POS", $"GetNetPosition via Positions failed: {ex.Message}");
+            }
+            DebugLog.W("468/POS", "GetNetPosition: returning 0 (no position found)");
             return 0;
         }
 
