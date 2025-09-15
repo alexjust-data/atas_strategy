@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Read(//c/Users/AlexJ/Desktop/**)",
+      "Bash(./script/deploy_all:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

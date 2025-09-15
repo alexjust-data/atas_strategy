@@ -1,0 +1,46 @@
+# Build results
+[Dd]ebug/
+[Dd]ebugPublic/
+[Rr]elease/
+[Rr]eleases/
+x64/
+x86/
+build/
+bld/
+[Bb]in/
+[Oo]bj/
+
+# Visual Studio files
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# MSBuild Binary and Structured Log
+*.binlog
+
+# NuGet Packages
+*.nupkg
+**/packages/*
+!**/packages/build/
+
+# Logs
+*.log
+ATAS_Strategy_Logs/
+
+# Keep emergency log for now
+!EMERGENCY_ATAS_LOG.txt
+
+# OS files
+Thumbs.db
+.DS_Store
+
+# IDE
+.vscode/
+*.swp
+*.swo
+
+# ATAS specific - ignore pdb in subdirectories but keep them in root for distribution
+src/**/[Bb]in/**/*.pdb
+src/**/[Oo]bj/**/*.pdb
