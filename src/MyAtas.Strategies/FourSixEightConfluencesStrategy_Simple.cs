@@ -149,6 +149,7 @@ namespace MyAtas.Strategies
 
         // Detectar primer tick de cada vela
         private int _lastSeenBar = -1;
+        private int _lastLoggedBar = -1; // For OnCalculate log throttling
         private bool IsFirstTickOf(int currentBar)
         {
             if (currentBar != _lastSeenBar) { _lastSeenBar = currentBar; return true; }
@@ -167,7 +168,8 @@ namespace MyAtas.Strategies
                 _ind.TriggerSource = FourSixEightIndicator.TriggerKind.GenialLine;
 
                 // FIXED: Safer indicator attachment via reflection
-                var addInd = GetType().GetMethod("AddIndicator",
+                // FIX: Search in base class (ChartStrategy) where AddIndicator is defined
+                var addInd = typeof(ChartStrategy).GetMethod("AddIndicator",
                     System.Reflection.BindingFlags.Instance |
                     System.Reflection.BindingFlags.Public |
                     System.Reflection.BindingFlags.NonPublic);
@@ -198,8 +200,12 @@ namespace MyAtas.Strategies
             }
             catch { }
 
-            // *** CRITICAL DEBUG: Identificar fuente de ejecución inmediata ***
-            DebugLog.Critical("468/STR", $"OnCalculate ENTRY: bar={bar} t={GetCandle(bar).Time:HH:mm:ss} pending={(_pending.HasValue ? "YES" : "NO")} tradeActive={_tradeActive}");
+            // *** THROTTLED DEBUG: Only log first tick of each bar to prevent spam ***
+            if (bar != _lastLoggedBar && IsFirstTickOf(bar))
+            {
+                _lastLoggedBar = bar;
+                DebugLog.W("468/STR", $"OnCalculate: bar={bar} t={GetCandle(bar).Time:HH:mm:ss} pending={(_pending.HasValue ? "YES" : "NO")} tradeActive={_tradeActive}");
+            }
 
             // --- DEBUG: Estado del pending ---
             if (_pending.HasValue)
@@ -374,15 +380,12 @@ namespace MyAtas.Strategies
             {
                 try
                 {
-                    // CRITICAL: Only check position if trade is actually active
-                    if (!_tradeActive) return;
-
                     int netWD = GetNetPosition();
                     bool timeOk = (_bracketsAttachedAt != DateTime.MinValue) &&
                                   (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds >= Math.Max(0, AntiFlatMs);
                     bool barsOk = (_antiFlatUntilBar < 0) || (bar > _antiFlatUntilBar);
 
-                    if (netWD == 0 && !HasAnyActiveOrders() && timeOk && barsOk)
+                    if (_tradeActive && netWD == 0 && !HasAnyActiveOrders() && timeOk && barsOk)
                     {
                         _tradeActive = false;
                         _bracketsPlaced = false;
