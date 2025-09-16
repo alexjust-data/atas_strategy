@@ -13,15 +13,18 @@
  *
  * ESTRUCTURA DE ARCHIVOS:
  * 06_ATAS_strategy - v2/
- * ├── EMERGENCY_ATAS_LOG.txt      ← Persistente (TODAS las sesiones)
- * ├── ATAS_SESSION_LOG.txt        ← Solo sesión actual (se limpia)
- * ├── ATAS_SESSION_ID.tmp         ← PID de control
+ * ├── logs/
+ * │   ├── current/
+ * │   │   ├── ATAS_SESSION_LOG.txt    ← Solo sesión actual (se limpia)
+ * │   │   └── ATAS_SESSION_ID.tmp     ← PID de control
+ * │   └── emergency/
+ * │       └── EMERGENCY_ATAS_LOG.txt  ← Persistente (TODAS las sesiones)
  * └── src/...
  *
  * USO PRÁCTICO:
- * - Sesión actual: tail -f ATAS_SESSION_LOG.txt
- * - Histórico: grep "pattern" EMERGENCY_ATAS_LOG.txt
- * - Nuevas sesiones: grep "NEW ATAS SESSION" EMERGENCY_ATAS_LOG.txt
+ * - Sesión actual: tail -f logs/current/ATAS_SESSION_LOG.txt
+ * - Histórico: grep "pattern" logs/emergency/EMERGENCY_ATAS_LOG.txt
+ * - Nuevas sesiones: grep "NEW ATAS SESSION" logs/emergency/EMERGENCY_ATAS_LOG.txt
  */
 
 using System;
@@ -46,9 +49,9 @@ namespace MyAtas.Shared
         private static readonly string _projectRoot = @"C:\Users\AlexJ\Desktop\projects\01_atas\06_ATAS_strategy - v2";
 
         // Rutas de archivos del sistema dual
-        private static readonly string _emergencyPath = Path.Combine(_projectRoot, "EMERGENCY_ATAS_LOG.txt");
-        private static readonly string _sessionPath = Path.Combine(_projectRoot, "ATAS_SESSION_LOG.txt");
-        private static readonly string _sessionIdPath = Path.Combine(_projectRoot, "ATAS_SESSION_ID.tmp");
+        private static readonly string _emergencyPath = Path.Combine(_projectRoot, "logs", "emergency", "EMERGENCY_ATAS_LOG.txt");
+        private static readonly string _sessionPath = Path.Combine(_projectRoot, "logs", "current", "ATAS_SESSION_LOG.txt");
+        private static readonly string _sessionIdPath = Path.Combine(_projectRoot, "logs", "current", "ATAS_SESSION_ID.tmp");
 
         // Estado del sistema
         private static bool _sessionInitialized = false;

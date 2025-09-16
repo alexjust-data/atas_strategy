@@ -1,9 +1,19 @@
 
-- [DEVELOPMENT_HISTORY](DEVELOPMENT_HISTORY.md)
+# ATAS 468 Strategy - Documentation
 
-# README (raw) — Panel de parámetros de la estrategia
+Documentación completa de la estrategia de trading cuantitativo 468.
 
-**Nombre en ATAS:** `468 – Strategy V5 (Anti-Flip + SL/TP)`
+## Índice
+- [DEVELOPMENT_HISTORY](DEVELOPMENT_HISTORY.md) - Historial completo de desarrollo
+- [validation/](validation/) - Análisis de confluencias y validaciones
+- [execution/](execution/) - Lógica de ejecución N+1 y timing
+- [concluencias/](concluencias/) - Análisis técnico de confluencias EMA vs Wilder
+- [grep-cheatsheet/](grep-cheatsheet/) - Herramientas de análisis de logs
+- [UI_Atas/](UI_Atas/) - Configuración de interfaz ATAS
+
+## README (raw) — Panel de parámetros de la estrategia
+
+**Nombre en ATAS:** `468 – Simple Strategy (GL close + 2 confluences) - FIXED`
 **Entrada:** Ejecuta en **N+1** al `open` de la barra siguiente a la señal del indicador 468 (cruce Genial/WPR, según `TriggerSource` del indicador). **Bracket OCO**: SL único por la **cantidad total** + TPs distribuidos por múltiplos de R. &#x20;
 
 ## Control

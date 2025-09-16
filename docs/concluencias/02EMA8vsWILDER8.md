@@ -45,6 +45,32 @@ Parámetros propuestos para el panel:
 
 ## Ejemplo práctico
 
+  Strict (Estricto)
+
+  - BUY: EMA8 > Wilder8 (diff > 0)
+  - SELL: EMA8 < Wilder8 (diff < 0)
+  - Sin tolerancia - requiere divergencia exacta en la dirección correcta
+
+  Inclusive (Inclusivo)
+
+  - BUY: EMA8 ≥ Wilder8 (diff ≥ 0)
+  - SELL: EMA8 ≤ Wilder8 (diff ≤ 0)
+  - Permite igualdad - acepta cuando EMA8 = Wilder8
+
+  Window (Ventana) - DEFAULT
+
+  - BUY: diff ≥ -tolerancia
+  - SELL: diff ≤ +tolerancia
+  - Con tolerancia configurable (EmaVsWilderPreTolTicks)
+  - Más flexible - permite cierta divergencia "contraria"
+
+  Ejemplo práctico:
+
+  Si EMA8=19900 y Wilder8=19901 (diff=-1):
+  - Strict: SELL=✅, BUY=❌
+  - Inclusive: SELL=✅, BUY=❌
+  - Window (tol=2): SELL=✅, BUY=✅ (porque -1 ≥ -2)
+
 * Señal **BUY** (N cruzó GL al alza). En N+1 tienes:
   `EMA8 = 19910,00` · `Wilder8 = 19909,75` → `diff = +0,25`
 

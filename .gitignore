@@ -28,9 +28,11 @@ bld/
 # Logs
 *.log
 ATAS_Strategy_Logs/
-
-# Keep emergency log for now
-!EMERGENCY_ATAS_LOG.txt
+logs/current/
+logs/emergency/
+ATAS_SESSION_LOG*.txt
+EMERGENCY_ATAS_LOG.txt
+ATAS_SESSION_ID.tmp
 
 # OS files
 Thumbs.db
