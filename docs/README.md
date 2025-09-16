@@ -1,7 +1,7 @@
 
 # ATAS 468 Strategy - Documentation
 
-Documentación completa de la estrategia de trading cuantitativo 468.
+Documentación completa de la estrategia de trading cuantitativo 468 con sistema avanzado de risk management (v2.2).
 
 ## Índice
 - [DEVELOPMENT_HISTORY](DEVELOPMENT_HISTORY.md) - Historial completo de desarrollo
@@ -10,6 +10,9 @@ Documentación completa de la estrategia de trading cuantitativo 468.
 - [concluencias/](concluencias/) - Análisis técnico de confluencias EMA vs Wilder
 - [grep-cheatsheet/](grep-cheatsheet/) - Herramientas de análisis de logs
 - [UI_Atas/](UI_Atas/) - Configuración de interfaz ATAS
+  - [RiskPositionSizing/](UI_Atas/RiskPositionSizing/) - Configuración detallada de position sizing
+  - [RiskDiagnostic/](UI_Atas/RiskDiagnostic/) - Panel de diagnósticos en tiempo real
+- **[NEW v2.2] Risk Management** - Sistema avanzado de position sizing y diagnósticos
 
 ## README (raw) — Panel de parámetros de la estrategia
 
@@ -23,10 +26,45 @@ Documentación completa de la estrategia de trading cuantitativo 468.
 
 ## Orders
 
-* **Quantity**
-  Nº total de contratos/lotes a entrar. Se reparte automáticamente entre los TPs activos (ver “Risk/Targets”).&#x20;
+* **Quantity** (Manual Mode)
+  Nº total de contratos/lotes a entrar cuando Position Sizing Mode = Manual. Se reparte automáticamente entre los TPs activos (ver "Risk/Targets").&#x20;
 * **Execution Mode**
   `Market` (true) entra a mercado en N+1; `Limit` (false) lanza una limit en N+1 al `open` como precio de referencia.&#x20;
+
+## Risk/Position Sizing (NEW v2.2)
+
+* **Position Sizing Mode**
+  - **Manual**: Usa cantidad fija definida en "Quantity"
+  - **Fixed Risk USD**: Calcula cantidad por riesgo fijo en dólares
+  - **% of Account**: Calcula cantidad por porcentaje de equity de cuenta
+
+* **Risk per Trade (USD)**
+  Cantidad fija en USD a arriesgar por operación (modo Fixed Risk USD)
+
+* **Risk % of Account**
+  Porcentaje de equity de cuenta a arriesgar (modo % of Account)
+
+* **Tick Value Overrides (CSV)**
+  Valores de tick personalizados: `MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10`
+
+* **Skip if Underfunded**
+  Aborta trade si risk/contract > target risk (protección inteligente)
+
+* **Min Qty if Underfunded**
+  Cantidad mínima si fuerza entrada (cuando Skip = false)
+
+* **Account Equity Override**
+  Equity manual cuando auto-detección falla
+
+## Diagnostics (Read-only UI v2.2)
+
+* **Effective Tick Value**: Valor $/tick usado (override/auto/fallback)
+* **Effective Account Equity**: Equity para cálculos de %
+* **Last Auto Qty**: Última cantidad calculada
+* **Last Risk/Contract**: Riesgo por contrato en USD
+* **Last Stop Distance**: Distancia SL en ticks
+* **Last Risk Input**: Riesgo objetivo configurado
+* **Refresh Diagnostics**: Botón para log instantáneo manual
 
 ## Confluences
 

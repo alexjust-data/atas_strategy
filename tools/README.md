@@ -51,9 +51,45 @@ Los scripts están configurados para trabajar con la nueva estructura de logs:
 
 ## 🔍 Análisis Automático
 
+### Confluence Testing (Scenarios A-F)
 Cada script de análisis proporciona:
 - Conteo automático de señales y ejecuciones
 - Análisis de confluencias (OK/FAIL)
 - Seguimiento de decisiones del guard
 - Estadísticas de timing N+1
 - Detección de trade lock releases
+
+### Risk Management Analysis (NEW v2.2)
+Commands for analyzing risk management logs:
+```bash
+# View all risk diagnostics
+grep -n "DIAG \[" ATAS_SESSION_LOG.txt
+
+# View tick value detection and mismatches
+grep -nE "TICK-VALUE|MinStepPrice|override|auto-detected|MISMATCH" ATAS_SESSION_LOG.txt
+
+# View auto-qty calculations and underfunded protection
+grep -n "AUTOQTY\|ABORT ENTRY\|Underfunded" ATAS_SESSION_LOG.txt
+
+# View account equity detection
+grep -nE "ACCOUNT EQUITY|auto-detected|override" ATAS_SESSION_LOG.txt
+```
+
+## 🆕 Version 2.2 Features
+
+### Enhanced Deployment
+- **All scripts updated** to use `tools/` directory path
+- **Risk management** components included in deployment
+- **Real-time diagnostics** deployed with strategy
+
+### Risk Management Tools
+- **UI Diagnostics**: Real-time display of effective tick values and equity
+- **Refresh Button**: Manual diagnostic echo with `DIAG [manual-refresh]`
+- **Auto Echo**: Automatic `DIAG [init]` at session start
+- **Enhanced Logging**: Comprehensive risk calculation logging
+
+### Preset Integration
+Default tick value overrides included:
+```
+MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10
+```

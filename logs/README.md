@@ -20,6 +20,7 @@ La estrategia detecta automáticamente nuevas sesiones ATAS:
 
 ## Uso Práctico
 
+### Monitoreo General
 ```bash
 # Monitorear sesión actual en tiempo real
 tail -f logs/current/ATAS_SESSION_LOG.txt
@@ -29,8 +30,29 @@ grep "MARKET ORDER SENT" logs/emergency/EMERGENCY_ATAS_LOG.txt
 
 # Detectar nuevas sesiones
 grep "NEW ATAS SESSION" logs/emergency/EMERGENCY_ATAS_LOG.txt
+```
 
-# Análisis de escenarios
+### Risk Management Analysis (NEW v2.2)
+```bash
+# Ver todos los diagnósticos de risk management
+grep -n "DIAG \[" logs/current/ATAS_SESSION_LOG.txt
+
+# Ver detección de tick values y mismatches
+grep -nE "TICK-VALUE|MinStepPrice|override|auto-detected|MISMATCH" logs/current/ATAS_SESSION_LOG.txt
+
+# Ver cálculos de auto-qty y protección underfunded
+grep -n "AUTOQTY\|ABORT ENTRY\|Underfunded" logs/current/ATAS_SESSION_LOG.txt
+
+# Ver detección de account equity
+grep -nE "ACCOUNT EQUITY|auto-detected|override" logs/current/ATAS_SESSION_LOG.txt
+
+# Ver errores de parsing
+grep -n "GetTickValueFromOverrides\|failed" logs/current/ATAS_SESSION_LOG.txt
+```
+
+### Confluence Testing
+```bash
+# Análisis de escenarios confluence
 cd tools && ./analizar_escenario.bat [A|B|C|D|E|F]
 ```
 
