@@ -133,6 +133,11 @@ namespace MyAtas.Strategies
         private int _flatStreak = 0;         // consecutive net==0 readings
         private DateTime _lastFlatRead = DateTime.MinValue;
 
+        // Enhanced position tracking
+        private int _cachedNetPosition = 0;  // cached position for latency issues
+        private DateTime _lastPositionUpdate = DateTime.MinValue;
+        private readonly Dictionary<string, int> _orderFills = new(); // track our fills
+
         // Cooldown management
         private int _cooldownUntilBar = -1;   // bar index hasta el que no se permite re-entrada
         private int _lastFlatBar = -1;        // último bar en el que quedamos planos
@@ -375,6 +380,16 @@ namespace MyAtas.Strategies
                 var before  = _liveOrders.Count;
                 DebugLog.W("468/ORD", $"OnOrderChanged: {comment} status={status} state={state} active={isActive} liveCount={before}");
 
+                // Track order fills for enhanced position detection
+                if (status == OrderStatus.Filled || status == OrderStatus.PartlyFilled)
+                {
+                    TrackOrderFill(order, "Filled");
+                }
+                else if (status == OrderStatus.Canceled)
+                {
+                    TrackOrderFill(order, "Canceled");
+                }
+
                 // Activar candado y colgar brackets post-fill (según net real)
                 if ((comment?.StartsWith("468ENTRY:") ?? false)
                     && (status == OrderStatus.Placed || status == OrderStatus.PartlyFilled || status == OrderStatus.Filled))
@@ -428,10 +443,18 @@ namespace MyAtas.Strategies
                     DebugLog.W("468/ORD", $"Removed {removed} from _liveOrders (now {_liveOrders.Count})");
                 }
 
-                // Reconciliar siempre: TP/SL deben reflejar el net vivo
+                // Reconciliar solo si tenemos posición O plano confirmado (evita reconciliar con net=0 fantasma)
                 if (EnableReconciliation)
                 {
-                    try { ReconcileBracketsWithNet(); } catch { /* best-effort */ }
+                    var netForReconcile = GetNetPosition();
+                    if (netForReconcile > 0 || FlatConfirmedNow(netForReconcile))
+                    {
+                        try { ReconcileBracketsWithNet(); } catch { /* best-effort */ }
+                    }
+                    else
+                    {
+                        DebugLog.W("468/STR", "RECONCILE SKIP: net uncertain (anti-flat in effect)");
+                    }
                 }
 
                 // Plano: confirma con nueva lógica híbrida
@@ -769,53 +792,195 @@ namespace MyAtas.Strategies
 
         private int GetNetPosition()
         {
-            // Vía 1: Portfolio.GetPosition(Security)
+            // Strategy 1: Try direct Portfolio access (fastest when it works)
+            int portfolioPos = TryGetPositionFromPortfolio();
+            if (portfolioPos != 0)
+            {
+                UpdatePositionCache(portfolioPos, "Portfolio");
+                return portfolioPos;
+            }
+
+            // Strategy 2: Try Positions enumeration
+            int positionsPos = TryGetPositionFromPositions();
+            if (positionsPos != 0)
+            {
+                UpdatePositionCache(positionsPos, "Positions");
+                return positionsPos;
+            }
+
+            // Strategy 3: Use our cached position with fill tracking
+            int cachedPos = GetCachedPositionWithFills();
+            if (cachedPos != 0)
+            {
+                DebugLog.W("468/POS", $"GetNetPosition via Cache+Fills: {cachedPos}");
+                return cachedPos;
+            }
+
+            // Strategy 4: Sticky cache ONLY while anti-flat protection is active
+            if (_cachedNetPosition != 0 && !FlatConfirmedNow(0))
+            {
+                DebugLog.W("468/POS", $"GetNetPosition via StickyCache (anti-flat active): {_cachedNetPosition}");
+                return _cachedNetPosition;
+            }
+
+            // All strategies failed
+            DebugLog.W("468/POS", "GetNetPosition: all strategies failed, returning 0");
+            return 0;
+        }
+
+        private int TryGetPositionFromPortfolio()
+        {
             try
             {
                 var portfolio = GetType().GetProperty("Portfolio", BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic)?.GetValue(this);
                 var security  = GetType().GetProperty("Security",  BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic)?.GetValue(this);
-                var getPos    = portfolio?.GetType().GetMethod("GetPosition", new[] { security?.GetType() });
-                var pos       = (getPos != null && security != null) ? getPos.Invoke(portfolio, new[] { security }) : null;
-                var qProp     = pos?.GetType().GetProperty("NetQuantity") ?? pos?.GetType().GetProperty("NetPosition") ?? pos?.GetType().GetProperty("Quantity");
-                if (qProp != null)
-                {
-                    var netQty = Convert.ToInt32(Math.Truncate(Convert.ToDecimal(qProp.GetValue(pos))));
-                    DebugLog.W("468/POS", $"GetNetPosition via Portfolio: {netQty}");
-                    return netQty;
-                }
+
+                if (portfolio == null || security == null)
+                    return 0;
+
+                var getPos = portfolio.GetType().GetMethod("GetPosition", new[] { security.GetType() });
+                var pos = getPos?.Invoke(portfolio, new[] { security });
+
+                if (pos == null)
+                    return 0;
+
+                var qProp = pos.GetType().GetProperty("NetQuantity")
+                         ?? pos.GetType().GetProperty("NetPosition")
+                         ?? pos.GetType().GetProperty("Quantity");
+
+                if (qProp == null)
+                    return 0;
+
+                return Convert.ToInt32(Math.Truncate(Convert.ToDecimal(qProp.GetValue(pos))));
             }
             catch (Exception ex)
             {
-                DebugLog.W("468/POS", $"GetNetPosition via Portfolio failed: {ex.Message}");
+                DebugLog.W("468/POS", $"Portfolio strategy failed: {ex.Message}");
+                return 0;
             }
-            // Vía 2: enumerar Positions y filtrar por Security actual
+        }
+
+        private int TryGetPositionFromPositions()
+        {
             try
             {
                 var positions = GetType().GetProperty("Positions", BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic)?.GetValue(this) as IEnumerable;
-                var mySec     = GetType().GetProperty("Security",  BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic)?.GetValue(this);
-                if (positions != null && mySec != null)
+                var mySec = GetType().GetProperty("Security", BindingFlags.Instance|BindingFlags.Public|BindingFlags.NonPublic)?.GetValue(this);
+
+                if (positions == null || mySec == null)
+                    return 0;
+
+                foreach (var p in positions)
                 {
-                    foreach (var p in positions)
-                    {
-                        var sec  = p.GetType().GetProperty("Security")?.GetValue(p);
-                        if (!Equals(sec, mySec)) continue;
-                        var qProp= p.GetType().GetProperty("NetQuantity") ?? p.GetType().GetProperty("NetPosition") ?? p.GetType().GetProperty("Quantity");
-                        if (qProp == null) continue;
-                        var qty  = Convert.ToInt32(Math.Truncate(Convert.ToDecimal(qProp.GetValue(p))));
-                        if (qty != 0)
-                        {
-                            DebugLog.W("468/POS", $"GetNetPosition via Positions: {qty}");
-                            return qty;
-                        }
-                    }
+                    var sec = p.GetType().GetProperty("Security")?.GetValue(p);
+                    if (!Equals(sec, mySec)) continue;
+
+                    var qProp = p.GetType().GetProperty("NetQuantity")
+                             ?? p.GetType().GetProperty("NetPosition")
+                             ?? p.GetType().GetProperty("Quantity");
+
+                    if (qProp == null) continue;
+
+                    var qty = Convert.ToInt32(Math.Truncate(Convert.ToDecimal(qProp.GetValue(p))));
+                    if (qty != 0)
+                        return qty;
+                }
+                return 0;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/POS", $"Positions strategy failed: {ex.Message}");
+                return 0;
+            }
+        }
+
+        private int GetCachedPositionWithFills()
+        {
+            try
+            {
+                // Calculate position based on our tracked fills
+                int fillsSum = 0;
+                foreach (var kvp in _orderFills)
+                {
+                    fillsSum += kvp.Value;
+                }
+
+                // Use fills if we have recent data
+                if (fillsSum != 0 && _orderFills.Count > 0)
+                {
+                    return fillsSum;
+                }
+
+                return _cachedNetPosition;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/POS", $"Cache+Fills strategy failed: {ex.Message}");
+                return _cachedNetPosition;
+            }
+        }
+
+        private void UpdatePositionCache(int position, string source)
+        {
+            _cachedNetPosition = position;
+            _lastPositionUpdate = DateTime.UtcNow;
+            DebugLog.W("468/POS", $"Position cache updated: {position} (source: {source})");
+        }
+
+        private void TrackOrderFill(Order order, string action)
+        {
+            try
+            {
+                var c = order?.Comment ?? "";
+                if (!(c.StartsWith("468ENTRY:") || c.StartsWith("468TP:") || c.StartsWith("468SL:")))
+                    return;
+
+                var orderId = order.Comment;
+
+                // Use FilledQuantity/Executed first, fallback to QuantityToFill
+                var qFilledProp = order.GetType().GetProperty("FilledQuantity")
+                               ?? order.GetType().GetProperty("Executed")
+                               ?? order.GetType().GetProperty("QtyFilled");
+                decimal qFilled = 0m;
+                if (qFilledProp != null)
+                    qFilled = Convert.ToDecimal(qFilledProp.GetValue(order));
+                else
+                    qFilled = Convert.ToDecimal(order.QuantityToFill); // último recurso
+
+                var qty = (int)Math.Abs(Math.Truncate(qFilled));
+
+                // Determine sign based on direction and order type
+                var direction = order.Direction;
+                int sign = 0;
+
+                if (c.StartsWith("468ENTRY:"))
+                {
+                    // Entry orders: Buy=+1, Sell=-1
+                    sign = (direction.ToString().Contains("Buy")) ? 1 : -1;
+                }
+                else if (c.StartsWith("468TP:") || c.StartsWith("468SL:"))
+                {
+                    // TP/SL orders reverse the position: Buy TP/SL=-1, Sell TP/SL=+1
+                    sign = (direction.ToString().Contains("Buy")) ? -1 : 1;
+                }
+
+                var netQty = qty * sign;
+
+                if (action == "Filled")
+                {
+                    _orderFills[orderId] = netQty;
+                    DebugLog.W("468/POS", $"Tracked fill: {orderId} = {netQty} (type: {c.Substring(0,8)})");
+                }
+                else if (action == "Canceled")
+                {
+                    _orderFills.Remove(orderId);
+                    DebugLog.W("468/POS", $"Removed fill tracking: {orderId}");
                 }
             }
             catch (Exception ex)
             {
-                DebugLog.W("468/POS", $"GetNetPosition via Positions failed: {ex.Message}");
+                DebugLog.W("468/POS", $"TrackOrderFill failed: {ex.Message}");
             }
-            DebugLog.W("468/POS", "GetNetPosition: returning 0 (no position found)");
-            return 0;
         }
 
         private bool HasLiveOrders()
@@ -1093,6 +1258,11 @@ namespace MyAtas.Strategies
         private void ReconcileBracketsWithNet()
         {
             int net = Math.Abs(GetNetPosition());
+            if (net <= 0 && !FlatConfirmedNow(0))
+            {
+                DebugLog.W("468/STR", "RECONCILE SKIP: net=0 (not flat-confirmed) → protect children");
+                return;
+            }
             if (net < 0) net = 0;
 
             // TPs activos de esta estrategia
