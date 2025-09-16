@@ -374,12 +374,15 @@ namespace MyAtas.Strategies
             {
                 try
                 {
+                    // CRITICAL: Only check position if trade is actually active
+                    if (!_tradeActive) return;
+
                     int netWD = GetNetPosition();
                     bool timeOk = (_bracketsAttachedAt != DateTime.MinValue) &&
                                   (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds >= Math.Max(0, AntiFlatMs);
                     bool barsOk = (_antiFlatUntilBar < 0) || (bar > _antiFlatUntilBar);
 
-                    if (_tradeActive && netWD == 0 && !HasAnyActiveOrders() && timeOk && barsOk)
+                    if (netWD == 0 && !HasAnyActiveOrders() && timeOk && barsOk)
                     {
                         _tradeActive = false;
                         _bracketsPlaced = false;
