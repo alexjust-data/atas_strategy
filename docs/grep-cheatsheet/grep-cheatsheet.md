@@ -79,3 +79,24 @@ grep -nE "CAPTURE|PROCESSING PENDING @N\+1|CONF#|ABORT ENTRY|MARKET submitted|On
 ```
 
 
+---------------------------------
+
+
+```bash
+# Verifica liberación normal del candado
+grep -nE "Trade lock RELEASED" ATAS_SESSION_LOG.txt
+
+# Incluye liberación por watchdog (nuevo diff)
+grep -nE "Trade lock RELEASED by watchdog" ATAS_SESSION_LOG.txt
+
+# Revisa bloqueos de la guardia (para confirmar que ya no aparecen tras quedar plano)
+grep -nE "GUARD OnlyOnePosition|ABORT ENTRY: OnlyOnePosition guard" ATAS_SESSION_LOG.txt
+
+# Revisa que el estado net y anti-flat se vayan a 0 correctamente
+grep -nE "ANTI-FLAT|net=0" ATAS_SESSION_LOG.txt
+```
+
+
+
+
+

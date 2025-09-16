@@ -113,6 +113,9 @@ namespace MyAtas.Strategies
         [Category("Risk/Timing"), DisplayName("Cooldown bars after flat")]
         public int CooldownBars { get; set; } = 2;
 
+        [Category("Risk/Timing"), DisplayName("Enable flat watchdog failsafe")]
+        public bool EnableFlatWatchdog { get; set; } = true;
+
         // ====================== INTERNAL STATE ======================
         private FourSixEightIndicator _ind;
         private Pending? _pending;           // captured at N (GL-cross close confirmed)
@@ -364,6 +367,32 @@ namespace MyAtas.Strategies
                 {
                     _pending = null;
                 }
+            }
+
+            // --- FAILSAFE: Flat watchdog to prevent stuck _tradeActive ---
+            if (EnableFlatWatchdog)
+            {
+                try
+                {
+                    int netWD = GetNetPosition();
+                    bool timeOk = (_bracketsAttachedAt != DateTime.MinValue) &&
+                                  (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds >= Math.Max(0, AntiFlatMs);
+                    bool barsOk = (_antiFlatUntilBar < 0) || (bar > _antiFlatUntilBar);
+
+                    if (_tradeActive && netWD == 0 && !HasAnyActiveOrders() && timeOk && barsOk)
+                    {
+                        _tradeActive = false;
+                        _bracketsPlaced = false;
+                        _orderFills.Clear();
+                        _cachedNetPosition = 0;
+                        _bracketsAttachedAt = DateTime.MinValue;
+                        _antiFlatUntilBar = -1;
+                        _flatStreak = 0;
+                        _lastFlatRead = DateTime.MinValue;
+                        DebugLog.W("468/ORD", "Trade lock RELEASED by watchdog (flat & no active orders)");
+                    }
+                }
+                catch { /* best-effort */ }
             }
         }
 
