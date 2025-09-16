@@ -13,6 +13,7 @@ using MyAtas.Shared;
 namespace MyAtas.Strategies
 {
     public enum EmaWilderRule { Strict, Inclusive, Window }
+    public enum AntiFlatMode { TimeOnly, BarsOnly, Hybrid }
 
     [DisplayName("468 – Simple Strategy (GL close + 2 confluences) - FIXED")]
     public class FourSixEightSimpleStrategy : ChartStrategy
@@ -84,7 +85,19 @@ namespace MyAtas.Strategies
 
         // --- Anti-flat window (para evitar cancelaciones por net=0 fantasma justo tras colgar brackets)
         [Category("Execution"), DisplayName("Anti-flat lock (ms)")]
-        public int AntiFlatMs { get; set; } = 400;
+        public int AntiFlatMs { get; set; } = 600;
+
+        [Category("Execution"), DisplayName("Anti-flat mode")]
+        public AntiFlatMode AntiFlatPolicy { get; set; } = AntiFlatMode.Hybrid;
+
+        [Category("Execution"), DisplayName("Anti-flat bars (confirm flat after N bars)")]
+        public int AntiFlatBars { get; set; } = 1;
+
+        [Category("Execution"), DisplayName("Confirm flat reads (consecutive)")]
+        public int ConfirmFlatReads { get; set; } = 3;
+
+        [Category("Execution"), DisplayName("Reattach brackets if missing")]
+        public bool ReattachIfMissing { get; set; } = true;
 
         // --- Advanced bracket controls ---
         [Category("Execution"), DisplayName("AutoCancel on TP/SL orders")]
@@ -116,6 +129,9 @@ namespace MyAtas.Strategies
         private int _entryDir = 0;           // +1 BUY / -1 SELL
         private bool _bracketsPlaced = false; // ya colgados los brackets
         private DateTime _bracketsAttachedAt = DateTime.MinValue;
+        private int _antiFlatUntilBar = -1;  // bar until which anti-flat protection is active
+        private int _flatStreak = 0;         // consecutive net==0 readings
+        private DateTime _lastFlatRead = DateTime.MinValue;
 
         // Cooldown management
         private int _cooldownUntilBar = -1;   // bar index hasta el que no se permite re-entrada
@@ -390,6 +406,9 @@ namespace MyAtas.Strategies
                             BuildAndSubmitBracket(_entryDir, net, _lastSignalBar, CurrentBar);
                             _bracketsPlaced = true;
                             _bracketsAttachedAt = DateTime.UtcNow;
+                            _antiFlatUntilBar = CurrentBar + Math.Max(0, AntiFlatBars);
+                            _flatStreak = 0;
+                            _lastFlatRead = DateTime.MinValue;
                             DebugLog.W("468/STR", $"BRACKETS ATTACHED (from net={net})");
                         }
                         else
@@ -415,34 +434,56 @@ namespace MyAtas.Strategies
                     try { ReconcileBracketsWithNet(); } catch { /* best-effort */ }
                 }
 
-                // Plano: confirma fuera de la ventana anti-flat y limpia tú los hijos
+                // Plano: confirma con nueva lógica híbrida
                 int netNow = GetNetPosition();
-                if (netNow == 0)
+                if (FlatConfirmedNow(netNow))
                 {
-                    if (WithinAntiFlatWindow())
+                    if (HasAnyActiveOrders())
                     {
-                        DebugLog.W("468/ORD", "ANTI-FLAT: net=0 detected but within window → suppress release");
+                        DebugLog.W("468/ORD", "FLAT CONFIRMED: cancelling remaining children...");
+                        CancelAllLiveActiveOrders();
                     }
-                    else
+                    if (!HasAnyActiveOrders())
                     {
-                        // Cancela hijos activos y libera sólo cuando no quede nada
-                        if (HasAnyActiveOrders())
+                        _tradeActive = false;
+                        _bracketsPlaced = false;
+                        _bracketsAttachedAt = DateTime.MinValue;
+                        _antiFlatUntilBar = -1;
+                        _flatStreak = 0;
+                        _lastFlatRead = DateTime.MinValue;
+                        _lastFlatBar = CurrentBar;
+                        if (EnableCooldown && CooldownBars > 0)
                         {
-                            DebugLog.W("468/ORD", "FLAT CONFIRMED: cancelling remaining children...");
-                            CancelAllLiveActiveOrders();
+                            _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
+                            DebugLog.W("468/STR", $"COOLDOWN armed until bar={_cooldownUntilBar} (now={CurrentBar})");
                         }
-                        if (!HasAnyActiveOrders())
+                        DebugLog.W("468/ORD", "Trade lock RELEASED (flat confirmed & no active orders)");
+                    }
+                }
+                else if (netNow == 0)
+                {
+                    DebugLog.W("468/ORD", $"ANTI-FLAT: net=0 detected but not confirmed yet (streak={_flatStreak}, policy={AntiFlatPolicy})");
+                }
+
+                // Self-healing: si hay posición y no hay hijos, reancla
+                if (ReattachIfMissing && netNow > 0)
+                {
+                    bool anyChild = _liveOrders.Any(o =>
+                        o != null && (o.Comment?.StartsWith("468TP:") == true || o.Comment?.StartsWith("468SL:") == true)
+                        && o.State == OrderStates.Active && o.Status() != OrderStatus.Canceled && o.Status() != OrderStatus.Filled);
+
+                    if (!anyChild && !_bracketsPlaced)
+                    {
+                        int net = Math.Abs(netNow);
+                        if (net > 0 && _entryDir != 0 && _lastSignalBar >= 0)
                         {
-                            _tradeActive = false;
-                            _bracketsPlaced = false;
-                            _bracketsAttachedAt = DateTime.MinValue;
-                            _lastFlatBar = CurrentBar;
-                            if (EnableCooldown && CooldownBars > 0)
-                            {
-                                _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
-                                DebugLog.W("468/STR", $"COOLDOWN armed until bar={_cooldownUntilBar} (now={CurrentBar})");
-                            }
-                            DebugLog.W("468/ORD", "Trade candado RELEASED (flat confirmed & no active orders)");
+                            BuildAndSubmitBracket(_entryDir, net, _lastSignalBar, CurrentBar);
+                            _bracketsPlaced = true;
+                            _bracketsAttachedAt = DateTime.UtcNow;
+                            _antiFlatUntilBar = CurrentBar + Math.Max(0, AntiFlatBars);
+                            _flatStreak = 0;
+                            _lastFlatRead = DateTime.MinValue;
+                            DebugLog.W("468/STR", $"SELF-HEAL: re-attached brackets (net={net})");
                         }
                     }
                 }
@@ -468,31 +509,34 @@ namespace MyAtas.Strategies
                     BuildAndSubmitBracket(_entryDir, net, _lastSignalBar, CurrentBar);
                     _bracketsPlaced = true;
                     _bracketsAttachedAt = DateTime.UtcNow;
+                    _antiFlatUntilBar = CurrentBar + Math.Max(0, AntiFlatBars);
+                    _flatStreak = 0;
+                    _lastFlatRead = DateTime.MinValue;
                     DebugLog.W("468/STR", $"BRACKETS ATTACHED (via OnPositionChanged, net={net})");
                 }
 
-                // Plano: respeta la ventana anti-flat y limpia tú mismo
-                if (net == 0)
+                // Plano: usa nueva lógica híbrida
+                if (FlatConfirmedNow(net))
                 {
-                    if (WithinAntiFlatWindow())
+                    if (HasAnyActiveOrders())
                     {
-                        DebugLog.W("468/ORD", "ANTI-FLAT (pos): net=0 but within window → suppress release");
+                        DebugLog.W("468/ORD", "FLAT CONFIRMED (pos): cancelling remaining children...");
+                        CancelAllLiveActiveOrders();
                     }
-                    else
+                    if (!HasAnyActiveOrders())
                     {
-                        if (HasAnyActiveOrders())
-                        {
-                            DebugLog.W("468/ORD", "FLAT CONFIRMED (pos): cancelling remaining children...");
-                            CancelAllLiveActiveOrders();
-                        }
-                        if (!HasAnyActiveOrders())
-                        {
-                            _tradeActive = false;
-                            _bracketsPlaced = false;
-                            _bracketsAttachedAt = DateTime.MinValue;
-                            DebugLog.W("468/ORD", "Trade lock RELEASED by OnPositionChanged (flat confirmed & no active orders)");
-                        }
+                        _tradeActive = false;
+                        _bracketsPlaced = false;
+                        _bracketsAttachedAt = DateTime.MinValue;
+                        _antiFlatUntilBar = -1;
+                        _flatStreak = 0;
+                        _lastFlatRead = DateTime.MinValue;
+                        DebugLog.W("468/ORD", "Trade lock RELEASED by OnPositionChanged (flat confirmed & no active orders)");
                     }
+                }
+                else if (net == 0)
+                {
+                    DebugLog.W("468/ORD", $"ANTI-FLAT (pos): net=0 detected but not confirmed yet (streak={_flatStreak}, policy={AntiFlatPolicy})");
                 }
             }
             catch { }
@@ -829,6 +873,40 @@ namespace MyAtas.Strategies
             if (_bracketsAttachedAt == DateTime.MinValue) return false;
             var ms = Math.Max(0, AntiFlatMs);
             return (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds < ms;
+        }
+
+        private bool FlatConfirmedNow(int netNow)
+        {
+            // 1) Actualiza racha de lecturas planas
+            if (netNow == 0)
+            {
+                if (_lastFlatRead == DateTime.MinValue || (DateTime.UtcNow - _lastFlatRead).TotalMilliseconds >= 50)
+                {
+                    _flatStreak++;
+                    _lastFlatRead = DateTime.UtcNow;
+                }
+            }
+            else
+            {
+                _flatStreak = 0;
+                _lastFlatRead = DateTime.MinValue;
+            }
+
+            // 2) Condiciones de tiempo/barras según política
+            bool timeOk = (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds >= Math.Max(0, AntiFlatMs);
+            bool barsOk = (AntiFlatBars <= 0) || (CurrentBar > _antiFlatUntilBar);
+
+            bool policyOk = AntiFlatPolicy switch
+            {
+                AntiFlatMode.TimeOnly => timeOk,
+                AntiFlatMode.BarsOnly => barsOk,
+                _ => (timeOk && barsOk) // Hybrid
+            };
+
+            // 3) Lecturas consistentes
+            bool readsOk = _flatStreak >= Math.Max(1, ConfirmFlatReads);
+
+            return (netNow == 0) && policyOk && readsOk;
         }
 
         private void CancelAllLiveActiveOrders()

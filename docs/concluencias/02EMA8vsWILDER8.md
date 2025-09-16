@@ -41,7 +41,7 @@ Parámetros propuestos para el panel:
 
 * **EMA vs Wilder rule**: `Strict | Inclusive | Window`
 * **EMA vs Wilder pre-cross tolerance (ticks)**: `0–2`
-* **Count equality as pass**: `true/false`
+* **Count equality as pass**: `true/false` (decide si la igualdad entre EMA8 y Wilder8 aprueba la confluencia.)
 
 ## Ejemplo práctico
 
