@@ -74,6 +74,10 @@ namespace MyAtas.Strategies
         [Category("Execution"), DisplayName("Top-up missing qty to target")]
         public bool TopUpMissingQty { get; set; } = false;
 
+        // --- Anti-flat window (para evitar cancelaciones por net=0 fantasma justo tras colgar brackets)
+        [Category("Execution"), DisplayName("Anti-flat lock (ms)")]
+        public int AntiFlatMs { get; set; } = 400;
+
         // --- Risk/Timing ---
         [Category("Risk/Timing"), DisplayName("Enable cooldown after flat")]
         public bool EnableCooldown { get; set; } = true;
@@ -96,6 +100,7 @@ namespace MyAtas.Strategies
         private int _lastSignalBar = -1;     // N de la señal que originó la entrada
         private int _entryDir = 0;           // +1 BUY / -1 SELL
         private bool _bracketsPlaced = false; // ya colgados los brackets
+        private DateTime _bracketsAttachedAt = DateTime.MinValue;
 
         // Cooldown management
         private int _cooldownUntilBar = -1;   // bar index hasta el que no se permite re-entrada
@@ -383,6 +388,7 @@ namespace MyAtas.Strategies
                         {
                             BuildAndSubmitBracket(_entryDir, net, _lastSignalBar, CurrentBar);
                             _bracketsPlaced = true;
+                            _bracketsAttachedAt = DateTime.UtcNow;
                             DebugLog.W("468/STR", $"BRACKETS ATTACHED (from net={net})");
                         }
                         else
@@ -405,18 +411,36 @@ namespace MyAtas.Strategies
                 // Reconciliar siempre: TP/SL deben reflejar el net vivo
                 try { ReconcileBracketsWithNet(); } catch { /* best-effort */ }
 
-                // Si estamos planos y ya no hay órdenes vivas, libera el candado
-                if (GetNetPosition() == 0 && !HasAnyActiveOrders())
+                // Plano: confirma fuera de la ventana anti-flat y limpia tú los hijos
+                int netNow = GetNetPosition();
+                if (netNow == 0)
                 {
-                    _tradeActive = false;
-                    _bracketsPlaced = false;  // Reset para próxima entrada
-                    _lastFlatBar = CurrentBar;
-                    if (EnableCooldown && CooldownBars > 0)
+                    if (WithinAntiFlatWindow())
                     {
-                        _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
-                        DebugLog.W("468/STR", $"COOLDOWN armed until bar={_cooldownUntilBar} (now={CurrentBar})");
+                        DebugLog.W("468/ORD", "ANTI-FLAT: net=0 detected but within window → suppress release");
                     }
-                    DebugLog.W("468/ORD", "Trade candado RELEASED: net=0 & no active orders");
+                    else
+                    {
+                        // Cancela hijos activos y libera sólo cuando no quede nada
+                        if (HasAnyActiveOrders())
+                        {
+                            DebugLog.W("468/ORD", "FLAT CONFIRMED: cancelling remaining children...");
+                            CancelAllLiveActiveOrders();
+                        }
+                        if (!HasAnyActiveOrders())
+                        {
+                            _tradeActive = false;
+                            _bracketsPlaced = false;
+                            _bracketsAttachedAt = DateTime.MinValue;
+                            _lastFlatBar = CurrentBar;
+                            if (EnableCooldown && CooldownBars > 0)
+                            {
+                                _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
+                                DebugLog.W("468/STR", $"COOLDOWN armed until bar={_cooldownUntilBar} (now={CurrentBar})");
+                            }
+                            DebugLog.W("468/ORD", "Trade candado RELEASED (flat confirmed & no active orders)");
+                        }
+                    }
                 }
             }
             catch (Exception ex)
@@ -439,15 +463,32 @@ namespace MyAtas.Strategies
                 {
                     BuildAndSubmitBracket(_entryDir, net, _lastSignalBar, CurrentBar);
                     _bracketsPlaced = true;
+                    _bracketsAttachedAt = DateTime.UtcNow;
                     DebugLog.W("468/STR", $"BRACKETS ATTACHED (via OnPositionChanged, net={net})");
                 }
 
-                // Si quedamos planos y ya no hay órdenes activas, libera candado
-                if (net == 0 && !HasAnyActiveOrders())
+                // Plano: respeta la ventana anti-flat y limpia tú mismo
+                if (net == 0)
                 {
-                    _tradeActive = false;
-                    _bracketsPlaced = false;  // Reset para próxima entrada
-                    DebugLog.W("468/ORD", "Trade lock RELEASED by OnPositionChanged (net=0 & no active orders)");
+                    if (WithinAntiFlatWindow())
+                    {
+                        DebugLog.W("468/ORD", "ANTI-FLAT (pos): net=0 but within window → suppress release");
+                    }
+                    else
+                    {
+                        if (HasAnyActiveOrders())
+                        {
+                            DebugLog.W("468/ORD", "FLAT CONFIRMED (pos): cancelling remaining children...");
+                            CancelAllLiveActiveOrders();
+                        }
+                        if (!HasAnyActiveOrders())
+                        {
+                            _tradeActive = false;
+                            _bracketsPlaced = false;
+                            _bracketsAttachedAt = DateTime.MinValue;
+                            DebugLog.W("468/ORD", "Trade lock RELEASED by OnPositionChanged (flat confirmed & no active orders)");
+                        }
+                    }
                 }
             }
             catch { }
@@ -591,7 +632,7 @@ namespace MyAtas.Strategies
                 Price     = px,
                 QuantityToFill = qty,
                 OCOGroup  = oco,
-                AutoCancel = true,
+                AutoCancel = false,
                 IsAttached = true,
                 Comment   = $"468TP:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
             };
@@ -611,7 +652,7 @@ namespace MyAtas.Strategies
                 TriggerPrice = triggerPx,
                 QuantityToFill = qty,
                 OCOGroup = oco,
-                AutoCancel = true,
+                AutoCancel = false,
                 IsAttached = true,
                 Comment = $"468SL:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
             };
@@ -777,6 +818,13 @@ namespace MyAtas.Strategies
             }
             catch { }
             return n;
+        }
+
+        private bool WithinAntiFlatWindow()
+        {
+            if (_bracketsAttachedAt == DateTime.MinValue) return false;
+            var ms = Math.Max(0, AntiFlatMs);
+            return (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds < ms;
         }
 
         private void CancelAllLiveActiveOrders()

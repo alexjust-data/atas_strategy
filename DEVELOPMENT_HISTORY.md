@@ -1,299 +1,200 @@
-# DEVELOPMENT HISTORY - ATAS 468 Strategy v2.0
 
-## 🚀 **Initial Commit: 06_ATAS_strategy - v2**
-**Commit:** d6e5967 - 2025-01-15
-**Repository:** https://github.com/alexjust-data/atas_strategy.git
 
----
+# 1) Objetivo de la estrategia
 
-## 📋 **Version 2.0 - Professional N+1 Trading System Implementation**
+* **Señal base (obligatoria):** cierre de la vela **N** cruza la **Genial Line**.
+* **Ejecución:** en la **vela N+1**.
+* **Confluencias (opcionales):**
 
-### **🔍 Problems Encountered & Solutions Implemented:**
-
-#### **1. PowerShell Deployment Scripts Environment Issues**
-- **Problem:** `$env:APPDATA` variable returned null in MINGW64/Git Bash environment
-- **Root Cause:** Windows environment variables not accessible in Unix-like shell
-- **Solution:** Hardcoded ATAS paths in deployment scripts
-- **Files Fixed:** `scripts/deploy_all.ps1`, `deploy_indicators.ps1`, `deploy_strategies.ps1`
-
-#### **2. Multiple Position Entries Despite OnlyOnePosition**
-- **Problem:** Strategy executing multiple market entries ignoring position limits
-- **Root Cause:** Missing robust position checking and guard mechanisms
-- **Solution:** Implemented triple guard system:
-  - Local `_tradeActive` flag
-  - Live portfolio position checking via reflection
-  - Active order verification
-- **File:** `FourSixEightConfluencesStrategy_Simple.cs`
-
-#### **3. N+1 Execution Timing and Signal Management**
-- **Problem:** Signals captured but not executed at proper N+1 timing
-- **Investigation:** Deep log analysis revealed normal N+1 behavior, not a bug
-- **Enhancement:** Professional N+1 execution with:
-  - Exact windowing (armed/execute/expire)
-  - Price tolerance for real-world latency (2 ticks default)
-  - Signal expiration to prevent stale executions
-  - Strict first-tick execution requirements
-
-#### **4. ATAS API Enum Usage vs String Parsing**
-- **Problem:** Initial approach used string parsing for order states
-- **Correction:** Proper ATAS enum usage (`OrderDirections`, `OrderTypes`)
-- **Impact:** More robust order management and status checking
-
-#### **5. Emergency Logging System Location**
-- **Problem:** Log files scattered to Desktop, difficult to track
-- **Solution:** Centralized emergency logging to project directory
-- **Enhancement:** Dual logging system (timestamped files + emergency fallback)
-- **File:** `DebugLog.cs` - Modified to use project root path
-
-#### **6. Repository Management and Version Control**
-- **Problem:** Initial merge conflicts with unrelated course content
-- **Solution:** Clean repository setup with only ATAS strategy components
-- **Action:** Removed course files, maintained only trading system code
-
-### **🎯 Key Technical Improvements:**
-
-#### **Professional N+1 Execution Logic:**
-```csharp
-// Exact windowing implementation
-if (bar < execBar) {
-    // ARMED - wait for N+1
-    return;
-}
-if (bar > execBar) {
-    // EXPIRED - signal too old
-    _pending = null;
-    return;
-}
-// EXECUTE at exactly N+1
-```
-
-#### **Price Tolerance for Real-World Trading:**
-```csharp
-[Category("Execution"), DisplayName("Open tolerance (ticks)")]
-public int OpenToleranceTicks { get; set; } = 2;
-
-// Tolerance check for late execution
-if (Math.Abs(lastPx - openN1) > tol) {
-    DebugLog.W("468/STR", $"EXPIRE: missed first tick tolerance");
-    _pending = null;
-    return;
-}
-```
-
-#### **Triple Guard Position Management:**
-- `_tradeActive` flag for local state
-- Portfolio reflection for live positions
-- Order status verification
-
-### **🛡️ Risk Management Features:**
-- Stop Loss calculation from signal candle structure
-- Take Profit targets based on R-multiples
-- OCO (One-Cancels-Other) bracket orders
-- Configurable position sizing
-
-### **📊 Logging and Monitoring:**
-- Comprehensive execution traceability
-- Emergency logging failsafe system
-- Real-time strategy diagnostics
-- Visual markers for trade analysis
-
-### **⚙️ Configuration Parameters:**
-- `StrictN1Open`: First tick execution requirement
-- `OpenToleranceTicks`: Latency tolerance (default: 2)
-- `RequireGenialSlope`: Slope confluence validation
-- `RequireEmaVsWilder`: EMA vs Wilder8 confluence
-
-### **✅ Final Result v2.0:**
-- Professional-grade N+1 execution timing
-- Robust position management preventing multiple entries
-- Real-world latency handling with configurable tolerance
-- Signal expiration preventing stale trade executions
-- Comprehensive logging for complete operational visibility
-- Clean deployment to ATAS platform via PowerShell automation
+  * **CONF#1 – Pendiente de Genial Line a favor de la señal**: BUY exige GL **subiendo**; SELL exige GL **bajando**.
+  * **CONF#2 – EMA8 vs Wilder8**: BUY ⇒ EMA8 ≥ W8 (con tolerancia); SELL ⇒ EMA8 ≤ W8 (con tolerancia).
+* **Brackets:** SL bajo/encima de la vela de señal (según setting). TP1/TP2/TP3 = R1/R2/R3 desde **Open(N+1)**.
 
 ---
 
-**Status:** Production-ready quantitative trading strategy with professional risk management and execution control.
+# 2) Fallos detectados y correcciones (cronológico)
 
+## A. Confluencias y señal
 
+* **(A1) Igualdad EMA8=Wilder8 → bloqueaba entradas**
+  *Síntoma:* `CONF#2 ... -> FAIL` incluso cuando iban iguales.
+  *Fix:* permitir igualdad o mejor **tolerancia** de 1–2 ticks (recomendado).
+* **(A2) Pendiente GL mal interpretada/duplicada en logs**
+  *Síntoma:* mensajes “raros” (a veces lectura de **precio** en vez de la **serie**).
+  *Fix:* unificar el cálculo de pendiente en una sola función y **eliminar el log duplicado** que mezclaba fuentes.
+* **(A3) Debate > vs >= para N+1**
+  *Hallazgo:* `bar > pendingBar` ya fuerza N+1; el problema real era **diagnóstico confuso** en el mismo tick de captura.
+  *Mejora:* ventana explícita **N+1** y logs claros (ARMED → EXEC\@N+1 → EXPIRED).
 
+## B. Ejecución N+1 (riesgo)
 
+* **(B1) Ventana exacta N+1**
+  *Añadido:* `execBar = N+1` con tres caminos:
+  `bar < execBar` → **ARMED** (espera),
+  `bar == execBar` → **EJECUTA**,
+  `bar > execBar` → **EXPIRED** (descarta señal tardía).
+* **(B2) Apertura estricta con tolerancia**
+  *Opción de riesgo:* `StrictN1Open = true` + **OpenToleranceTicks (1–2)**.
+  Si te pierdes el **primer tick** y el precio ya se desvió más que la tolerancia → **expira**.
 
-##############################################################################################
+## C. Anti-dobles entradas / solapes
 
+* **(C1) OnlyOnePosition (triple guardia)**
+  Bloquea si: (a) `net!=0`, (b) hay **órdenes activas** de la estrategia, (c) `_tradeActive=true`.
+* **(C2) Zombies**
+  Si `net=0` pero hay órdenes activas, **cancelar** y **salir** del ciclo (no re-entrar en el mismo tick).
+* **(C3) Cooldown opcional (N velas)**
+  Tras quedar plano, **enfriamiento** de 1–2 velas antes de aceptar otra señal (evita flip-flop).
 
-Buenísima pregunta. Si tu objetivo es **minimizar riesgo operativo y de precio**, mi orden de prioridades sería:
+## D. OCO y brackets (corazón del problema práctico)
 
-### 1) Señal y ejecución
+* **(D1) Pre-fill vs post-fill**
+  *Problema original:* crear TP/SL **antes** de saber cuántos contratos entraron ⇒ desalineación (ej: net=1 pero 3 TPs/SL).
+  *Fix crítico:* **colgar brackets post-fill** en `OnOrderChanged` (o en `OnPositionChanged` como fallback) usando el **net real**.
+* **(D2) Número de patas = posición real**
+  Si net=1 ⇒ sólo **1 TP + 1 SL**; net=2 ⇒ **TP1+TP2 + sus SL**; net=3 ⇒ **TP1+TP2+TP3 + sus SL**.
+  (Cada par TP/SL con su **OCO** propio).
+* **(D3) Reconciliación continua**
+  En cada `OnOrderChanged`:
 
-* **N+1 estricto**: `StrictN1Open = true` con **tolerancia 1–2 ticks** a la *Open(N+1)*. Si te pierdes N+1 fuera de tolerancia → **caducar** la señal. Evitas entrar con confluencias ya cambiadas o con un precio peor.
-* **Ventana exacta**: arma la señal con `execBar = N+1`; si `bar > execBar` → **PENDING EXPIRED**. Nada de “pendiente para siempre”.
+  * Si hay **más TPs que net** → cancelar sobrantes.
+  * Si la **suma de SLs ≠ net** → cancelar y crear **1 SL** con qty=net.
+* **(D4) Fallbacks de net cuando el portfolio llega tarde**
+  Si `GetNetPosition()` devuelve 0, leer de la **orden**: `Filled/FilledQuantity/Executed/QtyFilled`.
+  Si `status==Filled` y aún 0 → usar `QuantityToFill`. (Cubre **fills parciales** y **completos**).
+* **(D5) “Secuencia mortal” y solución final**
+  *Síntoma en logs:* `BRACKETS ATTACHED` → **GetNetPosition=0** de inmediato → candado liberado → con `AutoCancel=true`, **ATAS cancela** todo.
+  *Fix definitivo:*
 
-### 2) Control de entradas simultáneas (anti-solapes)
-
-* **OnlyOnePosition** con triple guardia: (a) `net!=0`, (b) **órdenes activas** de la propia estrategia, (c) **candado interno** de trade en curso.
-* **Cancelar “zombies” y salir**: si tienes órdenes activas con `net=0`, **cancela** y **no re-entres en el mismo tick**. Re-evalúa en el siguiente tick/vela. Esto corta el “flip-flop” que viste.
-* **Cooldown**: añade un enfriamiento de **1–2 velas** tras cerrar posición antes de aceptar otra señal contraria.
-
-### 3) Brackets y OCO
-
-* **Adjuntar brackets post-entrada** (lo más seguro): coloca TP/SL **después** de que la market esté **Placed/PartlyFilled/Filled** (evento `OnOrderChanged`).
-* **OCO por pierna**: **un OCO único por cada TP con su SL correspondiente**.
-* **AutoCancel = true** en TP/SL: al quedar plano, ATAS cancela lo que reste.
-* **No brackets antes de la entrada**: evitas que un TP se ejecute “abrirte” una posición equivocada.
-
-### 4) Precio y slippage
-
-* **Referencia de R**: calcula SL/TP desde **Open(N+1)** (aunque la orden salga unos ticks después dentro de N+1).
-* **Límite de slippage**: si el precio actual se desvía más de **OpenToleranceTicks** respecto a Open(N+1) → **no ejecutar**.
-* **Hysteresis** (1–2 ticks) en el cruce de la GenialLine para reducir señales por micro-ruido.
-
-### 5) Confluencias (sólo GL activada ahora)
-
-* **Pendiente GenialLine estricta**: BUY exige GL **subiendo**; SELL exige GL **bajando** (no plano).
-* **Log claro**: loguea `prev(N)=..., curr(N+1)=..., trend=UP/DOWN/FLAT` desde la misma función que decide (evita dobles logs inconsistentes).
-
-### 6) Límites de sesión (riesgo de cuenta)
-
-* **Límite diario de pérdida** (p.ej. −2R/−3R) → parar la estrategia.
-* **Máx. nº de trades/día** (p.ej. 5).
-* **Bloqueo tras racha negativa** (p.ej. 2 pérdidas seguidas) → pausa X minutos/velas.
-* **Tamaño de posición por volatilidad**: ajusta contratos con **ATR** para mantener R fijo en €.
-
-### 7) Auditoría
-
-* **Explicar cada decisión** en log: `ARMED`, `EXEC@N+1`, `ABORT (conf#1/guard)`, `EXPIRED`, `ZOMBIE CANCEL (N orders)`.
-* **IDs**: etiqueta la market de entrada y cada OCO; imprime `activeOrders` y `net` en cada heartbeat.
-
----
-
-#### Si tuviera que elegir 3 cambios “de oro” ahora mismo
-
-1. `StrictN1Open = true` + **tolerancia 1–2 ticks** y **caducidad** si se pierde N+1.
-2. **Cancelar zombies y salir** (no re-entrada en el mismo ciclo).
-3. **Brackets post-fill** con `AutoCancel=true` y **OCO por pierna**.
-
-Con eso cortas de raíz las dobles entradas, evitas ejecuciones fuera de plan y mantienes R fiel a lo diseñado.
+  * **Desactivar `AutoCancel`** en TP/SL (lo cancelamos nosotros).
+  * **Anti-flat window** (p.ej. 400 ms) justo tras colgar brackets: si detectas `net==0` dentro de esa ventana, **no** liberas ni cancelas; asumes glitch transitorio.
+  * Pasada la ventana: si de verdad `net==0`, cancelas hijos y **liberas candado** (limpieza controlada).
 
 ---
 
-## 🔧 **V2.1 - POST-FILL BRACKETS + COOLDOWN SYSTEM (16 Sep 2025, 00:15)**
+# 3) Parámetros recomendados (por defecto)
 
-### **🚨 PROBLEMA IDENTIFICADO:**
-Entry orders con fill parcial generaban brackets para cantidades inexistentes:
-- Market: 3 contratos → PartlyFilled: 1 contrato
-- Brackets: 1/1/1 TPs (para 3 contratos) ❌
-- Resultado: TPs sobrantes sin contratos que cubrir
-
-### **✅ SOLUCIÓN IMPLEMENTADA:**
-
-#### **1. Brackets Post-Fill Dinámicos:**
-```csharp
-[Category("Execution"), DisplayName("Attach brackets from actual net fill")]
-public bool AttachBracketsFromNet { get; set; } = true;
-```
-- **Brackets después del fill real**, no antes
-- **Cantidad basada en posición neta**, no en orden solicitada
-- **Solo crea TPs para contratos reales**: 1→TP1, 2→TP1+TP2, 3→TP1+TP2+TP3
-
-#### **2. Sistema de Cooldown Anti-Flip:**
-```csharp
-[Category("Risk/Timing"), DisplayName("Enable cooldown after flat")]
-public bool EnableCooldown { get; set; } = true;
-
-[Category("Risk/Timing"), DisplayName("Cooldown bars after flat")]
-public int CooldownBars { get; set; } = 2;
-```
-- **Enfriamiento automático** tras quedar plano
-- **Previene entradas inmediatas** señal contraria
-- **Logs detallados**: `cooldown=YES(until=X)` o `cooldown=NO`
-
-#### **3. Top-Up Opcional:**
-```csharp
-[Category("Execution"), DisplayName("Top-up missing qty to target")]
-public bool TopUpMissingQty { get; set; } = false;
-```
-- **Relleno automático** si fill < objetivo (desactivado por defecto)
-- **Control granular** de gestión de cantidades
-
-### **🎯 RESULTADO V2.1:**
-
-**ANTES (V2.0):**
-```
-Market: 3 → PartlyFilled: 1
-Brackets: SL+TP1+TP2+TP3 (1/1/1) ❌ TPs sobrantes
-TP1 ejecuta → TP2/TP3 cancelados (no hay contratos)
-```
-
-**DESPUÉS (V2.1):**
-```
-Market: 3 → PartlyFilled: 1
-BRACKETS ATTACHED (from net=1) → Solo SL+TP1 ✅
-TP1 ejecuta → Posición plana, sin sobrantes ✅
-```
-
-### **📋 CONFIGURACIÓN RECOMENDADA:**
-```
-AttachBracketsFromNet = ON    ← Clave para el fix
-TopUpMissingQty = OFF         ← Sin relleno automático
-EnableCooldown = ON           ← Evita flip-flop
-CooldownBars = 2              ← 2 velas enfriamiento
-```
-
-### **🛠️ CAMBIOS TÉCNICOS:**
-- `SubmitMarket()` actualizado para trackear contexto de señal
-- `OnOrderChanged()` con brackets post-fill automáticos
-- `BuildAndSubmitBracket()` con lógica de legs dinámicos
-- Sistema guard con cooldown inteligente
-- Logs mejorados para diagnóstico completo
-
-**Status:** ✅ Problema de cantidades TPs resuelto completamente. Sistema robusto para fills parciales.
+* **StrictN1Open = true**
+* **OpenToleranceTicks = 1–2**
+* **RequireGenialSlope = ON** (si buscas máxima calidad de señal)
+* **RequireEmaVsWilder = ON** con **tolerancia 1–2 ticks**
+* **OnlyOnePosition = ON**
+* **EnableCooldown = ON**, **CooldownBars = 2**
+* **AntiFlatMs = 400**
+* **AutoCancel (TP/SL) = false** *(los cancelamos manualmente al confirmar plano)*
+* **Brackets post-fill = ON** (adjuntar según **net** real)
+* **Reconciliación continua = ON**
 
 ---
 
-## 🔧 **V2.2 - DIAGNÓSTICO BRACKETS CANCELADOS (16 Sep 2025, 01:00)**
+# 4) Qué ver en los logs (chuleta)
 
-### **🚨 NUEVO PROBLEMA IDENTIFICADO:**
-Los brackets post-fill **SÍ se crean correctamente** pero **se cancelan inmediatamente**:
+* **Señal:**
+  `CAPTURE: N=... BUY/SELL uid=...`
+* **Ventana N+1:**
+  `PENDING ARMED: now=..., execBar=...`
+  `PROCESSING PENDING @N+1: bar=...`
+  `PENDING EXPIRED: missed N+1`
+* **Confluencias:**
+  `CONF#1 (GL slope) trend=UP/DOWN/FLAT -> OK/FAIL`
+  `CONF#2 (EMA8 vs W8 @N+1) e8=..., w8=..., tol=... -> OK/FAIL`
+* **Guardias:**
+  `ABORT ENTRY: OnlyOnePosition guard is active`
+  `ZOMBIE CANCEL ... will re-check on next tick/bar`
+* **Entrada:**
+  `MARKET submitted: BUY/SELL ...`
+  `OnOrderChanged: 468ENTRY ... Placed/PartlyFilled/Filled`
+* **Brackets:**
+  `BRACKETS ATTACHED (from net=...)` (OnOrderChanged/OnPositionChanged)
+  `ReconcileBracketsWithNet ... cancel ... / recreate SL ...`
+* **Anti-flat:**
+  `ANTI-FLAT: net=0 detected but within window → suppress release`
+  `Trade lock RELEASED (flat confirmed & no active orders)`
 
-**LOG EVIDENCIA (00:42:20):**
-```
-[00:42:20.885-887] STOP/LIMIT submitted: 6 órdenes creadas (3 SL + 3 TP)
-[00:42:20.889] BRACKETS ATTACHED (from net=3) ✅
-[00:42:20.928-944] OnOrderChanged: status=Canceled (TODAS las órdenes) ❌
-[00:42:20.945] Trade candado RELEASED: net=0 & no active orders
-```
+---
 
-### **🔍 CAUSA RAÍZ:**
-`GetNetPosition()` devuelve **siempre 0**, incluso después de ejecutar la market order. Esto activa la lógica de liberación del candado y `AutoCancel=true` cancela todos los brackets.
+# 5) Cómo interpretar los triángulos del gráfico
 
-### **📊 DIAGNÓSTICOS AÑADIDOS:**
-- **Enhanced logs** en `GetNetPosition()` para detectar si falla Portfolio API o Positions reflection
-- **Fallback robusto** con `GetFilledQtyFromOrder()` para PartlyFilled
-- **Logs detallados** de POST-FILL CHECK con status tracking
+* **Triángulo azul:** entrada ejecutada (BUY/SELL).
+* **Triángulo rojo:** TP ejecutado (salida parcial).
+  Si ves “triángulo rojo” y el panel indica **net=1** pero hay **2** límites y un **stop de 2**, es el viejo síntoma de **brackets creados antes** del fill real o de **no reconciliar**. Con los cambios, eso **se corrige solo** en el mismo evento.
 
-### **🎯 PRÓXIMA SESIÓN - QUÉ BUSCAR:**
+---
 
-#### **En logs nuevos buscar:**
-```bash
-grep -E "GetNetPosition via Portfolio|GetNetPosition via Positions|GetNetPosition: returning 0" EMERGENCY_ATAS_LOG.txt
-```
+# 6) Edge cases y comportamiento actual
 
-#### **Posibles causas a investigar:**
-1. **API Portfolio lenta**: Position update delay después de market execution
-2. **Reflection falla**: ATAS API cambió propiedades `NetQuantity/NetPosition/Quantity`
-3. **Security mismatch**: El objeto Security no coincide en comparación
-4. **Timing issue**: Los brackets se crean antes de que el portfolio actualice
+* **Fill parcial de la market:**
+  Se adjuntan brackets **según net**; reconciliación limpia cualquier sobrante.
+* **Portfolio lento en actualizar net:**
+  Fallback lee **FilledQuantity** de la orden; si aún así no hay net, usa `QuantityToFill` cuando el `status==Filled`.
+* **Net=0 fantasma justo tras colgar brackets:**
+  Anti-flat window evita liberar/cancelar; ATAS ya **no** puede barrer hijos porque `AutoCancel=false`.
+* **Señal tardía (N+2+):**
+  **Expira** (log `PENDING EXPIRED`); no hay “pendientes eternos”.
+* **Solapes de entradas contrarias:**
+  Zombies se cancelan y **no** re-entra en el mismo tick; hay **cooldown**.
 
-#### **Soluciones a implementar:**
-1. **Delay brackets**: `Task.Delay(100ms)` antes de adjuntar brackets
-2. **Alternative tracking**: Trackear posición manualmente desde órdenes filled
-3. **Disable AutoCancel**: Temporal fix hasta resolver GetNetPosition()
-4. **Portfolio event**: Usar `OnPositionChanged` como trigger principal
+---
 
-### **🛠️ CAMBIOS TÉCNICOS V2.2:**
-- Enhanced `GetNetPosition()` diagnostics con try/catch detallado
-- Fallback `GetFilledQtyFromOrder()` para casos PartlyFilled
-- Logs completos de reflection API failures
+# 7) Resultado final
 
-**Status:** 🔍 Sistema post-fill funciona pero GetNetPosition() falla constantemente. Brackets se cancelan por AutoCancel cuando net=0.
+* **Entradas** coherentes con la señal (N→N+1) y confluencias.
+* **Gestión de riesgo**: apertura N+1 estricta con tolerancia, expiración, OnlyOnePosition, cooldown.
+* **Brackets** robustos: se crean **post-fill**, se **reconcilian** siempre y **no desaparecen** por `AutoCancel` + net=0 fantasma.
+* **Logs** que explican cada decisión (perfectos para auditar “qué pasó y por qué”).
+
+---
+
+> ---
+
+---
+
+# D5) “Secuencia mortal” — explicación con ejemplo práctico
+
+## ¿Qué es?
+
+Un **glitch temporal** justo después de colgar los brackets: `GetNetPosition()` devuelve **0** por unos milisegundos (el portfolio aún no “marcó” la posición), y como los TP/SL estaban con **AutoCancel=true**, **ATAS** cree que estás **plano** y **cancela** todos los brackets. Visualmente “desaparecen”.
+
+## El patrón en los logs (lo que viste)
+
+1. `00:48:22.159  BRACKETS ATTACHED (from net=3)` → **colgamos** TP/SL correctamente.
+2. `00:48:22.159  GetNetPosition: returning 0` → **glitch**: el portfolio aún reporta **0**.
+3. `00:48:22.160  Trade candado RELEASED: net=0 & no active orders` → el código **cree** que estás plano y libera.
+4. `00:48:22.183-243 status=Placed` → los brackets se ven **colocados**.
+5. `00:48:22.256-299 status=Cancelled` → con **AutoCancel=true**, **ATAS** los **cancela** al pensar que estás plano.
+
+## El fix (lo que hicimos)
+
+1. **AutoCancel=false** en TP/SL
+
+   * ATAS ya **no** podrá barrer los brackets por su cuenta si detecta plano momentáneo.
+
+2. **Anti-flat window** (p.ej. **400 ms**) tras colgar los brackets
+
+   * Si `net==0` **dentro** de esa ventana → **NO** liberamos candado ni cancelamos nada; lo tratamos como **glitch transitorio**.
+   * Normalmente, en esos milisegundos el portfolio se actualiza a net>0 y todo queda estable.
+
+3. **Limpieza controlada pasado el window**
+
+   * Si **tras** la ventana **sigue** `net==0` y no hay órdenes activas → **ahora sí** cancelamos nosotros los hijos (si queda alguno) y liberamos candado.
+   * Esto cubre el caso real de quedarte plano (ej. TP final, cierre manual, cancelación total, etc.).
+
+## Ejemplo paso a paso (con timestamps)
+
+* `00:48:22.150` → entra market BUY 3.
+* `00:48:22.159` → **BRACKETS ATTACHED (from net=3)** y guardamos `_bracketsAttachedAt=22.159`.
+* `00:48:22.159` → `GetNetPosition()` responde **0** (glitch).
+* **Antes**: se liberaba el candado y **ATAS** (AutoCancel=true) barría los TP/SL.
+* **Ahora**:
+
+  * Comprobamos `WithinAntiFlatWindow()` → **sí** (han pasado < 400 ms).
+  * **NO** liberamos, **NO** cancelamos; esperamos.
+* `00:48:22.260` → el portfolio ya refleja **net=3**.
+* Los brackets **siguen vivos** (AutoCancel=false y no liberamos lock).
+* Más tarde, cuando cierras todo:
+
+  * Detectamos **net=0 fuera** de la ventana, **cancelamos** hijos si queda algo, y **liberamos** candado con logs:
+    `FLAT CONFIRMED: cancelling remaining children…` → `Trade lock RELEASED (flat confirmed & no active orders)`.
+
+
+
