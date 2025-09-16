@@ -28,6 +28,7 @@ using System;
 using System.IO;
 using System.Threading;
 using System.Diagnostics;
+using System.Linq;
 
 namespace MyAtas.Shared
 {
@@ -216,7 +217,7 @@ Process Name: {Process.GetCurrentProcess().ProcessName}
         }
 
         /// <summary>
-        /// Método principal de logging - escribe en todos los sistemas
+        /// Método principal de logging - escribe en todos los sistemas con validación automática de sesión
         /// </summary>
         public static void WriteLog(string category, string message, LogLevel level = LogLevel.Info)
         {
@@ -229,12 +230,20 @@ Process Name: {Process.GetCurrentProcess().ProcessName}
                 Console.WriteLine(logLine);
                 System.Diagnostics.Debug.WriteLine(logLine);
 
-                // 2. Sistema dual (sesión + persistente)
+                // 2. Validación automática de sesión antes de escribir
+                if (!ValidateSessionIntegrity())
+                {
+                    var warningLine = $"[{timestamp}] WARNING  SESSION: Session validation failed - reinitializing";
+                    Console.WriteLine(warningLine);
+                    EnsureSessionInitialized(); // Reinicializar si falla validación
+                }
+
+                // 3. Sistema dual (sesión + persistente)
                 EnsureSessionInitialized();
                 AppendToFile(_emergencyPath, logLine + Environment.NewLine);
                 AppendToFile(_sessionPath, logLine + Environment.NewLine);
 
-                // 3. Sistema legacy (con timestamp en nombre)
+                // 4. Sistema legacy (con timestamp en nombre)
                 lock (_lockObj)
                 {
                     InitializeLegacyLogFile();
@@ -346,6 +355,104 @@ Process Name: {Process.GetCurrentProcess().ProcessName}
         }
 
         /// <summary>
+        /// Valida que la sesión guardada corresponde al proceso actual
+        /// </summary>
+        private static bool ValidateSessionIntegrity()
+        {
+            try
+            {
+                // Si no estamos inicializados, no podemos validar
+                if (!_sessionInitialized)
+                    return true; // Permitir inicialización
+
+                // Verificar que el archivo de sesión existe
+                if (!File.Exists(_sessionIdPath))
+                {
+                    Console.WriteLine($"*** SESSION VALIDATION FAILED: Session ID file missing");
+                    return false;
+                }
+
+                // Leer PID almacenado
+                var storedPidText = File.ReadAllText(_sessionIdPath).Trim();
+                if (!int.TryParse(storedPidText, out int storedPid))
+                {
+                    Console.WriteLine($"*** SESSION VALIDATION FAILED: Invalid PID format: '{storedPidText}'");
+                    return false;
+                }
+
+                // Verificar que el PID almacenado corresponde al proceso actual
+                var currentPid = Process.GetCurrentProcess().Id;
+                if (storedPid != currentPid)
+                {
+                    Console.WriteLine($"*** SESSION VALIDATION FAILED: PID mismatch - Stored: {storedPid}, Current: {currentPid}");
+                    return false;
+                }
+
+                // Verificar que el proceso con ese PID realmente existe y es ATAS
+                try
+                {
+                    var process = Process.GetProcessById(storedPid);
+                    var processName = process.ProcessName;
+
+                    // Validar que es un proceso ATAS válido
+                    if (!IsAtasProcess(processName, process))
+                    {
+                        Console.WriteLine($"*** SESSION VALIDATION FAILED: Process {storedPid} is not ATAS - Found: {processName}");
+                        return false;
+                    }
+
+                    // Validación exitosa
+                    return true;
+                }
+                catch (ArgumentException)
+                {
+                    Console.WriteLine($"*** SESSION VALIDATION FAILED: Process {storedPid} no longer exists");
+                    return false;
+                }
+                catch (Exception ex)
+                {
+                    Console.WriteLine($"*** SESSION VALIDATION FAILED: Error checking process {storedPid}: {ex.Message}");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine($"*** SESSION VALIDATION ERROR: {ex.Message}");
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Verifica si un proceso es realmente ATAS
+        /// </summary>
+        private static bool IsAtasProcess(string processName, Process process)
+        {
+            try
+            {
+                // Nombres conocidos de procesos ATAS
+                var validAtasNames = new[] { "OFT.Platform", "ATAS", "ATAS.Platform", "AtasPlatform" };
+
+                if (validAtasNames.Any(name => processName.Contains(name, StringComparison.OrdinalIgnoreCase)))
+                    return true;
+
+                // Verificación adicional por ruta del ejecutable
+                try
+                {
+                    var mainModule = process.MainModule;
+                    if (mainModule?.FileName?.Contains("ATAS", StringComparison.OrdinalIgnoreCase) == true)
+                        return true;
+                }
+                catch { /* MainModule puede fallar por permisos */ }
+
+                return false;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        /// <summary>
         /// Información del sistema de logs (para debug)
         /// </summary>
         public static void LogSystemInfo()
@@ -354,6 +461,18 @@ Process Name: {Process.GetCurrentProcess().ProcessName}
             WriteLog("SYSTEM", $"Emergency Log: {_emergencyPath}", LogLevel.Info);
             WriteLog("SYSTEM", $"Session ID File: {_sessionIdPath}", LogLevel.Info);
             WriteLog("SYSTEM", $"Legacy Log: {GetLogPath()}", LogLevel.Info);
+
+            // Validación en tiempo real
+            var isValid = ValidateSessionIntegrity();
+            WriteLog("SYSTEM", $"Session Integrity: {(isValid ? "VALID" : "INVALID")}", isValid ? LogLevel.Info : LogLevel.Critical);
+        }
+
+        /// <summary>
+        /// Fuerza validación manual de la sesión (para testing)
+        /// </summary>
+        public static bool ValidateCurrentSession()
+        {
+            return ValidateSessionIntegrity();
         }
     }
 }

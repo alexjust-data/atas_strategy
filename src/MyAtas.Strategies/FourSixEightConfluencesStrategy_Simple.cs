@@ -480,6 +480,9 @@ namespace MyAtas.Strategies
                             _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
                             DebugLog.W("468/STR", $"COOLDOWN armed until bar={_cooldownUntilBar} (now={CurrentBar})");
                         }
+                        // Clear fill tracking cache when truly flat
+                        _orderFills.Clear();
+                        _cachedNetPosition = 0;
                         DebugLog.W("468/ORD", "Trade lock RELEASED (flat confirmed & no active orders)");
                     }
                 }
@@ -554,6 +557,9 @@ namespace MyAtas.Strategies
                         _antiFlatUntilBar = -1;
                         _flatStreak = 0;
                         _lastFlatRead = DateTime.MinValue;
+                        // Clear fill tracking cache when truly flat
+                        _orderFills.Clear();
+                        _cachedNetPosition = 0;
                         DebugLog.W("468/ORD", "Trade lock RELEASED by OnPositionChanged (flat confirmed & no active orders)");
                     }
                 }
@@ -953,16 +959,9 @@ namespace MyAtas.Strategies
                 var direction = order.Direction;
                 int sign = 0;
 
-                if (c.StartsWith("468ENTRY:"))
-                {
-                    // Entry orders: Buy=+1, Sell=-1
-                    sign = (direction.ToString().Contains("Buy")) ? 1 : -1;
-                }
-                else if (c.StartsWith("468TP:") || c.StartsWith("468SL:"))
-                {
-                    // TP/SL orders reverse the position: Buy TP/SL=-1, Sell TP/SL=+1
-                    sign = (direction.ToString().Contains("Buy")) ? -1 : 1;
-                }
+                // FIX: For ALL orders (ENTRY, TP, SL), use consistent sign logic
+                // Buy = +1, Sell = -1 (TP/SL do NOT reverse, they reduce position)
+                sign = (direction.ToString().Contains("Buy")) ? 1 : -1;
 
                 var netQty = qty * sign;
 
