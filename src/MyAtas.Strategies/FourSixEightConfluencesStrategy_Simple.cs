@@ -168,11 +168,12 @@ namespace MyAtas.Strategies
                 _ind.TriggerSource = FourSixEightIndicator.TriggerKind.GenialLine;
 
                 // FIXED: Safer indicator attachment via reflection
-                // FIX: Search in base class (ChartStrategy) where AddIndicator is defined
-                var addInd = typeof(ChartStrategy).GetMethod("AddIndicator",
+                // FIX: Search with FlattenHierarchy to find AddIndicator in inheritance chain
+                var addInd = GetType().GetMethod("AddIndicator",
                     System.Reflection.BindingFlags.Instance |
                     System.Reflection.BindingFlags.Public |
-                    System.Reflection.BindingFlags.NonPublic);
+                    System.Reflection.BindingFlags.NonPublic |
+                    System.Reflection.BindingFlags.FlattenHierarchy);
                 if (addInd != null)
                 {
                     addInd.Invoke(this, new object[] { _ind });
