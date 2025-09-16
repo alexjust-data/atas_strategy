@@ -167,21 +167,41 @@ namespace MyAtas.Strategies
                 // Force indicator to publish only GenialLine cross signals
                 _ind.TriggerSource = FourSixEightIndicator.TriggerKind.GenialLine;
 
-                // FIXED: Safer indicator attachment via reflection
-                // FIX: Search with FlattenHierarchy to find AddIndicator in inheritance chain
-                var addInd = GetType().GetMethod("AddIndicator",
-                    System.Reflection.BindingFlags.Instance |
-                    System.Reflection.BindingFlags.Public |
-                    System.Reflection.BindingFlags.NonPublic |
-                    System.Reflection.BindingFlags.FlattenHierarchy);
+                // Attach indicator: search up the inheritance chain for non-public instance method
+                System.Reflection.MethodInfo addInd = null;
+                var t = this.GetType();
+                while (t != null && addInd == null)
+                {
+                    addInd = t.GetMethod("AddIndicator",
+                        System.Reflection.BindingFlags.Instance |
+                        System.Reflection.BindingFlags.NonPublic |
+                        System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.DeclaredOnly);
+                    t = t.BaseType;
+                }
+                // Fallback simple y seguro: usar el tipo base directamente
+                if (addInd == null)
+                {
+                    addInd = typeof(ChartStrategy).GetMethod("AddIndicator",
+                        System.Reflection.BindingFlags.Instance |
+                        System.Reflection.BindingFlags.NonPublic |
+                        System.Reflection.BindingFlags.Public);
+                }
                 if (addInd != null)
                 {
-                    addInd.Invoke(this, new object[] { _ind });
-                    DebugLog.Critical("468/STR", "INIT OK (Indicator attached via reflection)");
+                    try
+                    {
+                        addInd.Invoke(this, new object[] { _ind });
+                        DebugLog.Critical("468/STR", "INIT OK (Indicator attached via reflection)");
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugLog.W("468/STR", "AttachIndicator invoke failed: " + ex.GetBaseException().Message);
+                    }
                 }
                 else
                 {
-                    DebugLog.W("468/STR", "WARNING: Could not attach indicator");
+                    DebugLog.W("468/STR", "WARNING: Could not attach indicator (method not found in hierarchy)");
                 }
             }
             catch (Exception ex)
@@ -788,7 +808,7 @@ namespace MyAtas.Strategies
             }
             catch (Exception ex)
             {
-                DebugLog.W("468/POS", $"GetNetPosition via Positions failed: {ex.Message}");
+                DebugLog.W("468/POS", $"GetFilledQtyFromOrder failed: {ex.Message}");
             }
             DebugLog.W("468/POS", "GetNetPosition: returning 0 (no position found)");
             return 0;
@@ -1093,7 +1113,8 @@ namespace MyAtas.Strategies
             }
 
             // 2) Condiciones de tiempo/barras según política
-            bool timeOk = (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds >= Math.Max(0, AntiFlatMs);
+            bool timeOk = _bracketsAttachedAt != DateTime.MinValue &&
+                         (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds >= Math.Max(0, AntiFlatMs);
             bool barsOk = (AntiFlatBars <= 0) || (CurrentBar > _antiFlatUntilBar);
 
             bool policyOk = AntiFlatPolicy switch
