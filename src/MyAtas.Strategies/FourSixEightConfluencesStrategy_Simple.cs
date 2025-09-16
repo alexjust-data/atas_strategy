@@ -12,6 +12,8 @@ using MyAtas.Shared;
 
 namespace MyAtas.Strategies
 {
+    public enum EmaWilderRule { Strict, Inclusive, Window }
+
     [DisplayName("468 – Simple Strategy (GL close + 2 confluences) - FIXED")]
     public class FourSixEightSimpleStrategy : ChartStrategy
     {
@@ -35,8 +37,14 @@ namespace MyAtas.Strategies
         [Category("Confluences"), DisplayName("Require EMA8 vs Wilder8 (EMA8>W8 for long; EMA8<W8 for short)")]
         public bool RequireEmaVsWilder { get; set; } = true;
 
-        [Category("Confluences"), DisplayName("EMA vs Wilder tolerance (ticks)")]
-        public int EmaVsWilderToleranceTicks { get; set; } = 1;
+        [Category("Confluences"), DisplayName("EMA vs Wilder rule")]
+        public EmaWilderRule EmaVsWilderMode { get; set; } = EmaWilderRule.Window;
+
+        [Category("Confluences"), DisplayName("EMA vs Wilder pre-cross tolerance (ticks)")]
+        public int EmaVsWilderPreTolTicks { get; set; } = 1;
+
+        [Category("Confluences"), DisplayName("EMA vs Wilder: count equality as pass")]
+        public bool EmaVsWilderAllowEquality { get; set; } = true;
 
         // === Execution window ===
         [Category("Execution"), DisplayName("Strict N+1 open (require first tick)")]
@@ -77,6 +85,13 @@ namespace MyAtas.Strategies
         // --- Anti-flat window (para evitar cancelaciones por net=0 fantasma justo tras colgar brackets)
         [Category("Execution"), DisplayName("Anti-flat lock (ms)")]
         public int AntiFlatMs { get; set; } = 400;
+
+        // --- Advanced bracket controls ---
+        [Category("Execution"), DisplayName("AutoCancel on TP/SL orders")]
+        public bool EnableAutoCancel { get; set; } = false;
+
+        [Category("Execution"), DisplayName("Enable bracket reconciliation")]
+        public bool EnableReconciliation { get; set; } = true;
 
         // --- Risk/Timing ---
         [Category("Risk/Timing"), DisplayName("Enable cooldown after flat")]
@@ -278,24 +293,10 @@ namespace MyAtas.Strategies
                     if (!glOk) { _pending = null; DebugLog.W("468/STR", "ABORT ENTRY: Conf#1 failed"); return; }
                 }
 
-                // --- Confluencia #2: EMA8 vs Wilder8 en N+1, con tolerancia configurable y lectura segura
+                // --- Confluencia #2: EMA8 vs Wilder8 en N+1, con reglas granulares
                 if (RequireEmaVsWilder)
                 {
-                    bool e8Has = TryGetSeries("EMA 8", bar, out var e8_ind);
-                    bool w8Has = TryGetSeries("Wilder 8", bar, out var w8_ind);
-
-                    // Si aún no están listos en el primer tick de N+1, usa N como proxy
-                    if (!e8Has && TryGetSeries("EMA 8", bar - 1, out var e8_prev)) { e8_ind = e8_prev; e8Has = true; }
-                    if (!w8Has && TryGetSeries("Wilder 8", bar - 1, out var w8_prev)) { w8_ind = w8_prev; w8Has = true; }
-
-                    // Si aún faltan series, calcula localmente con cierres (no "skip as OK")
-                    if (!e8Has) e8_ind = EmaFromCloses(8, bar);
-                    if (!w8Has) w8_ind = RmaFromCloses(8, bar);
-
-                    decimal tol = Ticks(Math.Max(0, EmaVsWilderToleranceTicks));
-                    bool emaOk = (dir > 0) ? (e8_ind >= w8_ind - tol)
-                                           : (e8_ind <= w8_ind + tol);
-                    DebugLog.W("468/STR", $"CONF#2 (EMA8 vs W8 @N+1) e8={e8_ind:F5}{(e8Has? "[IND]":"[LOCAL]")}  w8={w8_ind:F5}{(w8Has?"[IND]":"[LOCAL]")}  tol={tol:F5} -> {(emaOk ? "OK" : "FAIL")}");
+                    bool emaOk = CheckEmaVsWilderAtExec(dir, bar);
                     if (!emaOk) { _pending = null; DebugLog.W("468/STR", "ABORT ENTRY: Conf#2 failed"); return; }
                 }
 
@@ -409,7 +410,10 @@ namespace MyAtas.Strategies
                 }
 
                 // Reconciliar siempre: TP/SL deben reflejar el net vivo
-                try { ReconcileBracketsWithNet(); } catch { /* best-effort */ }
+                if (EnableReconciliation)
+                {
+                    try { ReconcileBracketsWithNet(); } catch { /* best-effort */ }
+                }
 
                 // Plano: confirma fuera de la ventana anti-flat y limpia tú los hijos
                 int netNow = GetNetPosition();
@@ -632,7 +636,7 @@ namespace MyAtas.Strategies
                 Price     = px,
                 QuantityToFill = qty,
                 OCOGroup  = oco,
-                AutoCancel = false,
+                AutoCancel = EnableAutoCancel,
                 IsAttached = true,
                 Comment   = $"468TP:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
             };
@@ -652,7 +656,7 @@ namespace MyAtas.Strategies
                 TriggerPrice = triggerPx,
                 QuantityToFill = qty,
                 OCOGroup = oco,
-                AutoCancel = false,
+                AutoCancel = EnableAutoCancel,
                 IsAttached = true,
                 Comment = $"468SL:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
             };
@@ -909,6 +913,54 @@ namespace MyAtas.Strategies
             DebugLog.W("468/STR", $"CONF#1 (GL slope @N+1) gN={gN:F5} gN1={gN1:F5} " +
                                    $"trend={(up? "UP": (down? "DOWN":"FLAT"))} -> {(ok? "OK":"FAIL")}");
             return ok;
+        }
+
+        private bool CheckEmaVsWilderAtExec(int dir, int bar)
+        {
+            bool e8Has = TryGetSeries("EMA 8", bar, out var e8_ind);
+            bool w8Has = TryGetSeries("Wilder 8", bar, out var w8_ind);
+
+            // Si aún no están listos en el primer tick de N+1, usa N como proxy
+            if (!e8Has && TryGetSeries("EMA 8", bar - 1, out var e8_prev)) { e8_ind = e8_prev; e8Has = true; }
+            if (!w8Has && TryGetSeries("Wilder 8", bar - 1, out var w8_prev)) { w8_ind = w8_prev; w8Has = true; }
+
+            // Si aún faltan series, calcula localmente con cierres (no "skip as OK")
+            if (!e8Has) e8_ind = EmaFromCloses(8, bar);
+            if (!w8Has) w8_ind = RmaFromCloses(8, bar);
+
+            var diff = e8_ind - w8_ind;
+            var oneTick = InternalTickSize;
+            bool result;
+
+            switch (EmaVsWilderMode)
+            {
+                case EmaWilderRule.Strict:     // BUY: EMA > W; SELL: EMA < W
+                    result = dir > 0 ? (diff > 0m) : (diff < 0m);
+                    break;
+                case EmaWilderRule.Inclusive:  // BUY: EMA ≥ W; SELL: EMA ≤ W
+                    result = dir > 0 ? (diff >= 0m) : (diff <= 0m);
+                    break;
+                case EmaWilderRule.Window:     // BUY: diff ≥ -tolPre ; SELL: diff ≤ +tolPre
+                default:
+                    var tolPre = Ticks(Math.Max(0, EmaVsWilderPreTolTicks));
+                    if (EmaVsWilderAllowEquality)
+                        result = dir > 0 ? (diff >= -tolPre) : (diff <= +tolPre);
+                    else
+                        result = dir > 0 ? (diff > -tolPre - 1e-9m * oneTick) // estrictamente mayor
+                                        : (diff < +tolPre + 1e-9m * oneTick);
+                    break;
+            }
+
+            // Log detallado con el nuevo sistema
+            string modeStr = EmaVsWilderMode.ToString();
+            string dirStr = dir > 0 ? "BUY" : "SELL";
+            string diffStr = diff >= 0 ? $"+{diff:F5}" : $"{diff:F5}";
+            string tolStr = EmaVsWilderMode == EmaWilderRule.Window ? $" tolPre={Ticks(Math.Max(0, EmaVsWilderPreTolTicks)):F5}" : "";
+            string equalityStr = EmaVsWilderMode == EmaWilderRule.Window && !EmaVsWilderAllowEquality ? " (strict)" : "";
+
+            DebugLog.W("468/STR", $"CONF#2 (EMA8 vs W8 @N+1) e8={e8_ind:F5}{(e8Has ? "[IND]" : "[LOCAL]")} w8={w8_ind:F5}{(w8Has ? "[IND]" : "[LOCAL]")} diff={diffStr} mode={modeStr}{tolStr}{equalityStr} {dirStr} -> {(result ? "OK" : "FAIL")}");
+
+            return result;
         }
 
         // === Posición abierta: consulta en vivo (robusto a reinicios y cierres manuales) ===
