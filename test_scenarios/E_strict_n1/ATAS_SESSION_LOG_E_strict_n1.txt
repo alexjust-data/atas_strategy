@@ -1,0 +1,15 @@
+# ESCENARIO E - EXPIRACIÓN STRICT N+1 (control de timing)
+#
+# CONFIG:
+# - Strict N+1 = ✅
+# - Open tolerance (ticks) = 0
+# - Confluences: ambas ON (como Escenario A)
+#
+# GREP TEST:
+# grep -nE "PENDING ARMED|PROCESSING PENDING @N\+1|PENDING EXPIRED|beyond open tolerance|first tick" ATAS_SESSION_LOG_E_strict_n1.txt
+#
+# EXPECTED PATTERN (si el primer tick no es ejecutable):
+# PENDING ARMED
+# PENDING EXPIRED | beyond open tolerance | first tick missed
+#
+# SESSION START:

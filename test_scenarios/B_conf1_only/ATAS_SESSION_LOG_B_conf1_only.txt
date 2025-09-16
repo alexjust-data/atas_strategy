@@ -1,0 +1,21 @@
+# ESCENARIO B - SÓLO CONF#1 (GL slope)
+#
+# CONFIG:
+# - Require GenialLine slope = ✅
+# - Require EMA8 vs Wilder8 = ❌ (desactivar)
+#
+# GREP TEST:
+# grep -nE "CAPTURE: N=|CONF#1 .* -> (OK|FAIL)|ABORT ENTRY: Conf#1|MARKET ORDER SENT" ATAS_SESSION_LOG_B_conf1_only.txt
+#
+# EXPECTED PATTERN (VALID):
+# CAPTURE: N=...
+# CONF#1 ... -> OK
+# (No debe aparecer CONF#2; si hay líneas de CONF#2, deben indicar SKIP/Disabled)
+# GUARD ... -> PASS
+# MARKET ORDER SENT → BRACKETS ATTACHED
+#
+# EXPECTED PATTERN (REJECT):
+# CONF#1 ... -> FAIL
+# ABORT ENTRY: Conf#1 failed
+#
+# SESSION START:

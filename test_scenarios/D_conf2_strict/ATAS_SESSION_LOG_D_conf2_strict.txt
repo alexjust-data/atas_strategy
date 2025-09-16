@@ -1,0 +1,17 @@
+# ESCENARIO D - NEGATIVO DURO DE CONF#2 (ventana estricta)
+#
+# CONFIG:
+# - Require GL slope = ❌
+# - Require EMA vs Wilder = ✅
+# - Pre-cross tolerance = 0 (estricto)
+# - Count equality = ❌
+#
+# GREP TEST:
+# grep -nE "CONF#2 .* -> FAIL|ABORT ENTRY: Conf#2 failed" ATAS_SESSION_LOG_D_conf2_strict.txt
+#
+# EXPECTED PATTERN:
+# Múltiples:
+# CONF#2 ... -> FAIL → ABORT ENTRY: Conf#2 failed
+# Hasta que se dé una igualdad exacta, en cuyo caso también fallará por no contar igualdad.
+#
+# SESSION START:

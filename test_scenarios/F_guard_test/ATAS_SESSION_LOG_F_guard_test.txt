@@ -1,0 +1,20 @@
+# ESCENARIO F - GUARDIA OnlyOnePosition
+#
+# CONFIG:
+# - Como Escenario A (ambas confluencias ON)
+# - Cooldown = 2 barras
+#
+# GREP TEST:
+# grep -nE "GUARD OnlyOnePosition|Trade lock RELEASED" ATAS_SESSION_LOG_F_guard_test.txt
+#
+# PROCEDIMIENTO:
+# 1. Espera una entrada válida y brackets
+# 2. Mientras la posición siga abierta, capta cualquier nueva señal:
+#    GUARD OnlyOnePosition ... active=True ... -> BLOCK
+# 3. Tras cerrar y pasar anti-flat + confirmación:
+#    Trade lock RELEASED (flat confirmed & no active orders) o
+#    Trade lock RELEASED by watchdog (flat & no active orders)
+# 4. Los siguientes guards deben mostrar:
+#    active=False net=0 activeOrders=0 -> PASS
+#
+# SESSION START:

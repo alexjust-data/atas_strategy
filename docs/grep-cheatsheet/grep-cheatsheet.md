@@ -78,6 +78,20 @@ grep -nE "FALLBACK: Using FilledQuantity|FALLBACK: Using order\.QuantityToFill|P
 grep -nE "CAPTURE|PROCESSING PENDING @N\+1|CONF#|ABORT ENTRY|MARKET submitted|OnOrderChanged|BRACKETS ATTACHED|ReconcileBracketsWithNet|ANTI-FLAT|Trade (candado|lock) RELEASED|status=Cancelled" EMERGENCY_ATAS_LOG.txt
 ```
 
+## 11) **ANALYSIS COMPACTO: Confluencias + Guard Decisions** ⭐
+
+```bash
+# Muestra TODAS las señales válidas (ambas confluencias OK) + decisión del guard
+grep -nE "CONF#1.*-> OK|CONF#2.*-> OK|GUARD OnlyOnePosition.*-> (PASS|BLOCK)|OnOrderChanged.*status=Filled" EMERGENCY_ATAS_LOG.txt | grep -A3 -B3 "CONF#2.*-> OK"
+```
+
+**Explicación**: Este comando muestra cada vez que ambas confluencias pasaron (CONF#1 OK + CONF#2 OK) junto con la decisión inmediata del guard (PASS/BLOCK). Perfecto para validar comportamiento de OnlyOnePosition.
+
+**Resultado esperado**:
+- **PASS + Filled**: Señal ejecutada correctamente
+- **BLOCK**: Guard bloqueó entrada válida (esperado cuando active=True)
+- **PASS sin Filled**: Confluencias pasaron pero no se ejecutó (investigar)
+
 
 ---------------------------------
 

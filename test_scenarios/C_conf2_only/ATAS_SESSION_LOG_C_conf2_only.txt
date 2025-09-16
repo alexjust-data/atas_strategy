@@ -1,0 +1,23 @@
+# ESCENARIO C - SÓLO CONF#2 (EMA8 vs Wilder8, modo Window)
+#
+# CONFIG:
+# - Require GenialLine slope = ❌
+# - Require EMA8 vs Wilder8 = ✅
+# - EMA vs Wilder rule = Window
+# - Pre-cross tolerance = 4 (amplio para facilitar un OK)
+# - Count equality = ✅
+#
+# GREP TEST:
+# grep -nE "CAPTURE: N=|CONF#2 .* -> (OK|FAIL)|ABORT ENTRY: Conf#2|MARKET ORDER SENT" ATAS_SESSION_LOG_C_conf2_only.txt
+#
+# EXPECTED PATTERN (VALID):
+# CAPTURE: N=...
+# CONF#2 ... -> OK (verás diff=... dentro de la ventana)
+# GUARD ... -> PASS
+# MARKET ORDER SENT → BRACKETS ATTACHED
+#
+# EXPECTED PATTERN (REJECT):
+# CONF#2 ... -> FAIL
+# ABORT ENTRY: Conf#2 failed
+#
+# SESSION START:

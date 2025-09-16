@@ -44,3 +44,6 @@ Thumbs.db
 # ATAS specific - ignore pdb in subdirectories but keep them in root for distribution
 src/**/[Bb]in/**/*.pdb
 src/**/[Oo]bj/**/*.pdb
+
+# Claude session continuity file - not for repository
+CLAUDE.md
