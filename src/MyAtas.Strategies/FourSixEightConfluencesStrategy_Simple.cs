@@ -363,30 +363,62 @@ namespace MyAtas.Strategies
             // --- Risk Management Pulse Logging & Calculation Engine Exercise ---
             try
             {
-                if (IsFirstTickOf(bar))
+                // ===== Capa 2: Dry-run del motor de cálculo con throttle (no altera órdenes) =====
+                // Requisitos de ejecución:
+                //  - RM habilitado (OFF = baseline sin cambios)
+                //  - Primer tick de la vela
+                //  - Ha pasado el cooldown O han cambiado inputs clave O es cada N velas
+                if (RMEnabled)
                 {
-                    if (!EnableDetailedRiskLogging)
+                    bool isFirstTick = IsFirstTickOf(bar);
+                    if (isFirstTick && bar > 0)
                     {
-                        // Pulse every 60 seconds when detailed logging is off
-                        if (_lastPulseLogTime == DateTime.MinValue || (DateTime.UtcNow - _lastPulseLogTime).TotalSeconds >= 60)
-                        {
-                            var securityCode = Security?.Code ?? "UNKNOWN";
-                            var qty = CalculateQuantity();
-                            DebugLog.W("468/CALC", $"PULSE sym={securityCode} bar={bar} mode={PositionSizingMode} qty={qty}");
-                            _lastPulseLogTime = DateTime.UtcNow;
-                        }
-                    }
-                    else
-                    {
-                        // When detailed logging is ON, exercise calculation engine every 10 bars
-                        if ((bar % 10) == 0)
-                        {
-                            var qty = CalculateQuantity(); // This will generate detailed 468/CALC logs
-                            DebugLog.W("468/CALC", $"ENGINE_TEST bar={bar} mode={PositionSizingMode} qty={qty}");
-                        }
-                    }
+                        // Refrescar diagnósticos antes de calcular
+                        UpdateDiagnostics();
 
-                    // Periodic diagnostic refresh every 20 bars (both modes)
+                        string inputsHash = ComputeCalcInputsHash();
+                        bool inputsChanged = !string.Equals(inputsHash, _lastCalcInputsHash, StringComparison.Ordinal);
+                        bool barInterval   = (bar % _calcEveryNBars) == 0;
+                        bool cooldownOk    = (DateTime.UtcNow - _lastCalcUtc) >= _calcCooldown;
+
+                        if (cooldownOk || inputsChanged || barInterval)
+                        {
+                            try
+                            {
+                                var qty = CalculateQuantity(); // dry-run: no toca Quantity real
+
+                                var sym = GetEffectiveSecurityCode();
+                                var qc  = Security?.QuoteCurrency ?? "USD";
+                                var mode = PositionSizingMode;
+
+                                // Snapshot siempre que haya cálculo (para auditoría)
+                                CalcLog("468/CALC",
+                                    $"SNAPSHOT [{sym}] mode={mode} qty={qty} slTicks={LastStopDistance:F1} " +
+                                    $"rpc={LastRiskPerContract:F2}{qc} equity={EffectiveAccountEquity:F2}USD " +
+                                    $"tickValue={EffectiveTickValue:F2}{qc}/t");
+
+                                // Pulso mínimo cuando el log detallado está OFF (ritmo visible sin inundar)
+                                if (!EnableDetailedRiskLogging)
+                                {
+                                    CalcLog("468/CALC", $"PULSE sym={sym} bar={bar} mode={mode} qty={qty}");
+                                }
+
+                                _lastCalcInputsHash = inputsHash;
+                                _lastCalcUtc = DateTime.UtcNow;
+                                _lastCalcBar = bar;
+                            }
+                            catch (Exception ex)
+                            {
+                                CalcLog("468/CALC", $"Engine dry-run error at bar={bar}: {ex.Message}");
+                            }
+                        }
+                    }
+                }
+                // ===============================================================================
+
+                // Periodic diagnostic refresh for non-RM mode (every 20 bars when RM is OFF)
+                if (!RMEnabled && IsFirstTickOf(bar))
+                {
                     if (_lastDiagnosticRefreshBar == -1 || (bar - _lastDiagnosticRefreshBar) >= 20)
                     {
                         UpdateDiagnostics();
@@ -596,20 +628,7 @@ namespace MyAtas.Strategies
                 }
             }
 
-            // --- PASO 3 TESTING: Calculate position size (pure calculation, no order effects) ---
-            if (IsFirstTickOf(bar) && (bar % 10) == 0) // Test every 10 bars to avoid spam
-            {
-                try
-                {
-                    int calculatedQty = CalculateQuantity();
-                    // The calculation updates LastAutoQty and other diagnostic properties
-                    // No orders are affected - this is pure testing of the calculation engine
-                }
-                catch (Exception ex)
-                {
-                    DebugLog.W("468/CALC", $"Testing calculation error: {ex.Message}");
-                }
-            }
+            // --- NOTA: PASO 3 calculation now handled by Capa 2 throttling system above ---
 
             // --- FAILSAFE: Flat watchdog to prevent stuck _tradeActive ---
             if (EnableFlatWatchdog && IsFirstTickOf(bar))
@@ -1620,6 +1639,9 @@ namespace MyAtas.Strategies
         {
             try
             {
+                // Nota (Capa 2): este valor solo se usa para diagnóstico y cálculo dry-run,
+                // no modifica la Quantity real ni el envío de órdenes.
+
                 // Priority 1: Security.TickCost (ATAS)
                 var qc = Security?.QuoteCurrency ?? "USD";
                 var secTickCost = (Security != null ? Security.TickCost : 0m);
@@ -1797,6 +1819,14 @@ namespace MyAtas.Strategies
         /// </summary>
         private string _cachedSecurityCode;
         private string _cachedSymbolSource; // Capa 1: cachear también la fuente del símbolo
+
+        // ====================== Capa 2 — throttle del motor de cálculo ======================
+        private DateTime _lastCalcUtc = DateTime.MinValue;
+        private int _lastCalcBar = -1;
+        // _lastCalcInputsHash ya definido arriba en PASO 3
+        private static readonly TimeSpan _calcCooldown = TimeSpan.FromSeconds(30);
+        private const int _calcEveryNBars = 10; // dispara cada N velas (además de por cambio de inputs)
+        // ===============================================================================
         private string GetEffectiveSecurityCode()
         {
             try
@@ -1981,7 +2011,7 @@ namespace MyAtas.Strategies
                 decimal totalRisk = manualQty * riskPerContract;
                 var quoteCurrency = Security?.QuoteCurrency ?? "USD";
 
-                DebugLog.W("468/CALC", $"MANUAL mode: qty={manualQty} (user-defined) " +
+                CalcLog("468/CALC", $"MANUAL mode: qty={manualQty} (user-defined) " +
                                       $"riskPerContract={riskPerContract:F2}{quoteCurrency} " +
                                       $"totalRisk={totalRisk:F2}{quoteCurrency}");
             }
@@ -2168,5 +2198,35 @@ namespace MyAtas.Strategies
                 return 10; // Conservative fallback
             }
         }
+
+        // ============== Capa 2: hash de inputs de cálculo (para throttle inteligente) ==============
+        private string ComputeCalcInputsHash()
+        {
+            try
+            {
+                // Entradas que afectan el qty calculado
+                var mode = PositionSizingMode;
+
+                // Usamos los efectivos/diagnóstico (no cambian comportamiento live)
+                decimal tickValue = EffectiveTickValue;
+                decimal slTicks   = GetStopLossDistanceInTicks();
+                decimal eq        = EffectiveAccountEquity;
+                decimal pct       = RiskPercentOfAccount;
+                decimal fixedUsd  = RiskPerTradeUsd;
+                decimal tsize     = EffectiveTickSize;
+
+                // Símbolo efectivo por si hay overrides dependientes de él
+                var sym = GetEffectiveSecurityCode();
+
+                // Compacto y determinista
+                return $"{mode}|{sym}|tv={tickValue:F4}|tsz={tsize:F4}|sl={slTicks:F2}|eq={eq:F2}|pct={pct:F4}|usd={fixedUsd:F2}";
+            }
+            catch
+            {
+                // Fallback: fuerza cálculo (hash distinto) si algo falla
+                return Guid.NewGuid().ToString("N");
+            }
+        }
+        // ===========================================================================================
     }
 }
