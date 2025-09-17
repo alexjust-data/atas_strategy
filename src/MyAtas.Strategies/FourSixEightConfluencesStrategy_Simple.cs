@@ -631,7 +631,7 @@ namespace MyAtas.Strategies
                 UpdateDiagnostics();
 
                 // INIT flags (Capa 0) ya existente en tu código
-                MyAtas.Shared.DebugLog.W("468/RISK",
+                RiskLog("468/RISK",
                     $"INIT flags EnableRiskManagement={EnableRiskManagement} RiskDryRun={RiskDryRun} effectiveDryRun={RMDryRunEffective}");
 
                 // INIT símbolo (Capa 1) + "setup" Capa 3 (solo evidencia; sin tocar ejecución)
@@ -664,13 +664,13 @@ namespace MyAtas.Strategies
                     if (!string.IsNullOrWhiteSpace(sym))
                         hasOverride = ovMap.ContainsKey(sym);
 
-                    DebugLog.W("468/RISK",
+                    RiskLog("468/RISK",
                         $"INIT C3 sym={sym} currency={qc} tickSizePref=Security→InstrInfo " +
                         $"tickValuePriority=Override→TickCost overridesPresent={(hasOverride ? "YES" : "NO")}");
                 }
                 catch (Exception ex)
                 {
-                    DebugLog.W("468/RISK", $"INIT C3 error: {ex.Message}");
+                    RiskLog("468/RISK", $"INIT C3 error: {ex.Message}");
                 }
                 // ===============================================
             }
@@ -723,11 +723,11 @@ namespace MyAtas.Strategies
                                 var qc  = Security?.QuoteCurrency ?? "USD";
                                 var mode = PositionSizingMode;
 
-                                // Snapshot siempre que haya cálculo (para auditoría)
+                                // Snapshot consolidado del calculation engine
                                 CalcLog("468/CALC",
-                                    $"SNAPSHOT [{sym}] mode={mode} qty={qty} slTicks={LastStopDistance:F1} " +
-                                    $"rpc={LastRiskPerContract:F2}{qc} equity={EffectiveAccountEquity:F2}USD " +
-                                    $"tickValue={EffectiveTickValue:F2}{qc}/t");
+                                    $"SNAPSHOT sym={sym} bars={bar} mode={mode} qty={qty} slTicks={LastStopDistance:F1} " +
+                                    $"rpc={LastRiskPerContract:F2}{qc} tickValue={EffectiveTickValue:F2}{qc}/t " +
+                                    $"equity={EffectiveAccountEquity:F2}USD DRYRUN={(RMDryRunEffective ? "ON" : "OFF")}");
 
                                 // Pulso mínimo cuando el log detallado está OFF (ritmo visible sin inundar)
                                 if (!EnableDetailedRiskLogging)
@@ -758,14 +758,14 @@ namespace MyAtas.Strategies
                         var tickValue = GetEffectiveTickValue();
                         var equity = GetEffectiveAccountEquity();
                         // Capa 0: en RM OFF no emitir 468/RISK de rutina para no contaminar baseline
-                        DebugLog.W("468/STR", $"RISK-REFRESH sym={securityCode} bar={bar} tickValue={tickValue:F2} equity={equity:F2}");
+                        RiskLog("468/RISK", $"REFRESH sym={securityCode} bar={bar} tickValue={tickValue:F2} equity={equity:F2}");
                         _lastDiagnosticRefreshBar = bar;
                     }
                 }
             }
             catch (Exception ex)
             {
-                DebugLog.W("468/RISK", $"Pulse logging error: {ex.Message}");
+                RiskLog("468/RISK", $"Pulse logging error: {ex.Message}");
             }
 
             // *** THROTTLED DEBUG: Only log first tick of each bar to prevent spam ***
@@ -2083,7 +2083,7 @@ namespace MyAtas.Strategies
                 {
                     var quoteCurrency = Security?.QuoteCurrency ?? "USD";
                     var accountCurrency = "USD"; // Portfolio balance is typically in account base currency
-                    DebugLog.W("468/CALC", $"Starting calculation: mode={mode} " +
+                    CalcLog("468/CALC", $"Starting calculation: mode={mode} " +
                                           $"tickValue={tickValue:F2}{quoteCurrency}/t tickSize={tickSize:F4}pts/t " +
                                           $"SLticks={slDistanceInTicks:F1} equity={accountEquity:F2}{accountCurrency}");
                     _lastCalcInputsHash = currentInputsHash;
@@ -2140,7 +2140,7 @@ namespace MyAtas.Strategies
                 {
                     if (finalQuantity == 0)
                     {
-                        DebugLog.W("468/CALC", $"ABORT_UNDERFUNDED: qty=0 -> entry would be skipped");
+                        CalcLog("468/CALC", $"ABORT_UNDERFUNDED: qty=0 -> entry would be skipped");
                     }
                     else
                     {
@@ -2204,7 +2204,7 @@ namespace MyAtas.Strategies
             if (slDistanceInTicks <= 0 || tickValue <= 0 || RiskPerTradeUsd <= 0)
             {
                 if (shouldLog)
-                    DebugLog.W("468/CALC", $"Invalid inputs for FixedRisk: SL={slDistanceInTicks}t tickVal={tickValue} risk={RiskPerTradeUsd}");
+                    CalcLog("468/CALC", $"Invalid inputs for FixedRisk: SL={slDistanceInTicks}t tickVal={tickValue} risk={RiskPerTradeUsd}");
                 return Quantity; // Fallback to manual
             }
 
@@ -2219,7 +2219,7 @@ namespace MyAtas.Strategies
                 if (SkipIfUnderfunded)
                 {
                     if (shouldLog)
-                        DebugLog.W("468/CALC", $"ABORT_UNDERFUNDED: riskPerContract={riskPerContract:F2}{quoteCurrency} > " +
+                        CalcLog("468/CALC", $"ABORT_UNDERFUNDED: riskPerContract={riskPerContract:F2}{quoteCurrency} > " +
                                               $"targetRisk={targetRisk:F2}{quoteCurrency} -> qty=0 (entry will be skipped)");
                     return 0; // Return 0 to signal ABORT
                 }
@@ -2228,7 +2228,7 @@ namespace MyAtas.Strategies
                     decimal minQty = MinQtyIfUnderfunded;
                     decimal actualRisk = riskPerContract * minQty;
                     if (shouldLog)
-                        DebugLog.W("468/CALC", $"WARNING_UNDERFUNDED: forcing minQty={minQty} " +
+                        CalcLog("468/CALC", $"WARNING_UNDERFUNDED: forcing minQty={minQty} " +
                                               $"(actualRisk={actualRisk:F2}{quoteCurrency} > targetRisk={targetRisk:F2}{quoteCurrency})");
                     return minQty;
                 }
@@ -2239,7 +2239,7 @@ namespace MyAtas.Strategies
             if (shouldLog)
             {
                 decimal actualRisk = calculatedQty * riskPerContract;
-                DebugLog.W("468/CALC", $"FixedRiskUSD: targetRisk={targetRisk:F2}{quoteCurrency} " +
+                CalcLog("468/CALC", $"FixedRiskUSD: targetRisk={targetRisk:F2}{quoteCurrency} " +
                                       $"riskPerContract={riskPerContract:F2}{quoteCurrency} " +
                                       $"-> rawQty={calculatedQty} actualRisk={actualRisk:F2}{quoteCurrency}");
             }
@@ -2256,7 +2256,7 @@ namespace MyAtas.Strategies
             if (slDistanceInTicks <= 0 || tickValue <= 0 || accountEquity <= 0 || RiskPercentOfAccount <= 0)
             {
                 if (shouldLog)
-                    DebugLog.W("468/CALC", $"Invalid inputs for PercentRisk: SL={slDistanceInTicks}t tickVal={tickValue} " +
+                    CalcLog("468/CALC", $"Invalid inputs for PercentRisk: SL={slDistanceInTicks}t tickVal={tickValue} " +
                                           $"equity={accountEquity} risk%={RiskPercentOfAccount}");
                 return Quantity; // Fallback to manual
             }
@@ -2273,7 +2273,7 @@ namespace MyAtas.Strategies
                 if (SkipIfUnderfunded)
                 {
                     if (shouldLog)
-                        DebugLog.W("468/CALC", $"ABORT_UNDERFUNDED: riskPerContract={riskPerContract:F2}{quoteCurrency} > " +
+                        CalcLog("468/CALC", $"ABORT_UNDERFUNDED: riskPerContract={riskPerContract:F2}{quoteCurrency} > " +
                                               $"targetRisk={targetRisk:F2}{accountCurrency} ({RiskPercentOfAccount:F1}% of {accountEquity:F2}{accountCurrency}) " +
                                               $"-> qty=0 (entry will be skipped)");
                     return 0; // Return 0 to signal ABORT
@@ -2283,7 +2283,7 @@ namespace MyAtas.Strategies
                     decimal minQty = MinQtyIfUnderfunded;
                     decimal actualRisk = riskPerContract * minQty;
                     if (shouldLog)
-                        DebugLog.W("468/CALC", $"WARNING_UNDERFUNDED: forcing minQty={minQty} " +
+                        CalcLog("468/CALC", $"WARNING_UNDERFUNDED: forcing minQty={minQty} " +
                                               $"(actualRisk={actualRisk:F2}{quoteCurrency} > targetRisk={targetRisk:F2}{accountCurrency})");
                     return minQty;
                 }
@@ -2294,7 +2294,7 @@ namespace MyAtas.Strategies
             if (shouldLog)
             {
                 decimal actualRisk = calculatedQty * riskPerContract;
-                DebugLog.W("468/CALC", $"PercentOfAccount: equity={accountEquity:F2}{accountCurrency} risk%={RiskPercentOfAccount:F1}% " +
+                CalcLog("468/CALC", $"PercentOfAccount: equity={accountEquity:F2}{accountCurrency} risk%={RiskPercentOfAccount:F1}% " +
                                       $"targetRisk={targetRisk:F2}{accountCurrency} riskPerContract={riskPerContract:F2}{quoteCurrency} " +
                                       $"-> rawQty={calculatedQty} actualRisk={actualRisk:F2}{quoteCurrency}");
             }
@@ -2330,7 +2330,7 @@ namespace MyAtas.Strategies
 
                 if (shouldLog && (finalQty != rawQuantity || lotSize != 1))
                 {
-                    DebugLog.W("468/CALC", $"Lot quantization: raw={rawQuantity:F2} lotStep={lotSize} " +
+                    CalcLog("468/CALC", $"Lot quantization: raw={rawQuantity:F2} lotStep={lotSize} " +
                                           $"min={lotMinSize} max={lotMaxSize} -> final={finalQty}");
                 }
 
@@ -2338,7 +2338,7 @@ namespace MyAtas.Strategies
             }
             catch (Exception ex)
             {
-                DebugLog.W("468/CALC", $"QuantizeToLotStep error: {ex.Message}, using raw quantity as int");
+                CalcLog("468/CALC", $"QuantizeToLotStep error: {ex.Message}, using raw quantity as int");
                 return Math.Max(1, Math.Min(1000, (int)rawQuantity)); // Fallback to simple clamp
             }
         }
@@ -2370,7 +2370,7 @@ namespace MyAtas.Strategies
             }
             catch (Exception ex)
             {
-                DebugLog.W("468/CALC", $"GetStopLossDistanceInTicks error: {ex.Message}, using fallback 10 ticks");
+                CalcLog("468/CALC", $"GetStopLossDistanceInTicks error: {ex.Message}, using fallback 10 ticks");
                 return 10; // Conservative fallback
             }
         }
