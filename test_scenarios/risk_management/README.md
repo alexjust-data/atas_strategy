@@ -1,8 +1,120 @@
-# 📊 Risk Management Log Formats
+# 🧪 CAPA 5 SOFT-ENGAGE - Testing Strategy
 
-## Overview
+## Progressive Flag Rollout Protocol
 
-This directory contains documentation for Risk Management log formats, analysis patterns, and monitoring procedures specific to the FourSixEight Confluences Strategy.
+**Objetivo**: Activar progresivamente las funcionalidades de Risk Management sin romper el baseline establecido.
+
+### 🎯 FASES DE ACTIVACIÓN SECUENCIAL
+
+#### FASE 0: Baseline Protection (Estado Actual ✅)
+```
+EnableRiskManagement = FALSE
+RiskDryRun = TRUE
+UseAutoQuantityForLiveOrders = FALSE
+```
+**Comportamiento**: Sistema funciona exactamente como antes (manual qty=3)
+**Evidencia esperada**: Solo logs de strategy `468/STR`, sin `468/RISK` ni `468/CALC`
+
+#### FASE 1: Enable Risk Management Engine
+```
+EnableRiskManagement = TRUE
+RiskDryRun = TRUE
+UseAutoQuantityForLiveOrders = FALSE
+```
+**Comportamiento**: Engine cálcula en paralelo pero NO afecta órdenes
+**Evidencia esperada**: Aparecen logs `468/RISK` + `468/CALC` + órdenes siguen con qty=3
+
+#### FASE 2: Production Calculation Mode
+```
+EnableRiskManagement = TRUE
+RiskDryRun = FALSE
+UseAutoQuantityForLiveOrders = FALSE
+```
+**Comportamiento**: Cálculos "en vivo" pero aún usa manual qty=3
+**Evidencia esperada**: `effectiveDryRun=False` + cálculos completos + órdenes manual
+
+#### FASE 3: Full Integration (CAPA 5 TARGET)
+```
+EnableRiskManagement = TRUE
+RiskDryRun = FALSE
+UseAutoQuantityForLiveOrders = TRUE
+```
+**Comportamiento**: Usa quantities calculadas automáticamente
+**Evidencia esperada**: `qty source=AUTO qty=28` + órdenes con autoQty
+
+## 🔧 TESTING TOOLKIT INTEGRATION
+
+### Deploy & Capture Tool
+```bash
+# Deploy con captura automática de logs
+powershell -ExecutionPolicy Bypass -File "tools\deploy_risk_management.ps1" -TailSeconds 60
+
+# Output locations:
+# - out\logs\risk\YYYYMMDD\full_risk_TIMESTAMP.log
+# - out\logs\risk\YYYYMMDD\risk_calc_TIMESTAMP.log
+# - out\logs\risk\YYYYMMDD\risk_diag_TIMESTAMP.log
+```
+
+### Real-time Monitoring
+```bash
+# Monitor flags rollout en tiempo real
+powershell -ExecutionPolicy Bypass -File "tools\tail_risk.ps1" -Path "logs\current\ATAS_SESSION_LOG.txt"
+
+# Filtered views para debugging
+powershell -ExecutionPolicy Bypass -File "tools\filter_risk.ps1" -Path "logs\current\ATAS_SESSION_LOG.txt"
+```
+
+### Critical Health Checks
+```bash
+# Verificar estado actual de flags
+grep -n "RISK.*flags.*EnableRiskManagement.*RiskDryRun.*effectiveDryRun" logs/current/ATAS_SESSION_LOG.txt | tail -1
+
+# Revisar calculation results recientes
+grep -n "468/CALC OUT.*qtyFinal=" logs/current/ATAS_SESSION_LOG.txt | tail -5
+
+# Check for underfunded protection
+grep -n "ABORT ENTRY.*autoQty<=0.*underfunded" logs/current/ATAS_SESSION_LOG.txt
+```
+
+## 📊 EXPECTED LOG PROGRESSIONS
+
+### Fase 0 → Fase 1 Transition Log
+```
+[TIME] WARNING 468/RISK INIT flags EnableRiskManagement=True RiskDryRun=True effectiveDryRun=True
+[TIME] WARNING 468/RISK INIT C3 sym=MNQ currency=USD tickSize=0.25 tickValue=0.50USD/t equity=10000USD mode=Manual
+[TIME] WARNING 468/CALC IN uid=abc123 mode=Manual qty=3 bar=17526
+[TIME] WARNING 468/CALC MANUAL uid=abc123 qty=3 note="manual mode unchanged"
+[TIME] WARNING 468/CALC OUT uid=abc123 mode=Manual qtyFinal=3 note="orders use manual Quantity=3"
+[TIME] WARNING 468/STR ENTRY uid=abc123 qty source=MANUAL qty=3
+```
+
+### Fase 1 → Fase 2 Transition Log
+```
+[TIME] WARNING 468/RISK INIT flags EnableRiskManagement=True RiskDryRun=False effectiveDryRun=False
+[TIME] WARNING 468/CALC IN uid=def456 mode=FixedRiskUSD riskUsd=100.00 slTicks=7 tickCost=0.50USD/t equity=10000USD
+[TIME] WARNING 468/CALC FIXED uid=def456 targetRisk=100.00USD rpc=3.50USD qtyFinal=28
+[TIME] WARNING 468/CALC OUT uid=def456 mode=FixedRiskUSD qtyFinal=28 note="orders still use manual Quantity=3"
+[TIME] WARNING 468/STR ENTRY uid=def456 qty source=MANUAL qty=3
+```
+
+### Fase 2 → Fase 3 Integration Log (CAPA 5 TARGET)
+```
+[TIME] WARNING 468/CALC OUT uid=ghi789 mode=FixedRiskUSD qtyFinal=28 rpc=3.50USD slTicks=7
+[TIME] WARNING 468/STR ENTRY uid=ghi789 qty source=AUTO qty=28
+[TIME] WARNING 468/STR ENTRY submitMarket(dir=-1, qty=28, bar=17527)
+```
+
+### Underfunded Protection Test Log
+```
+[TIME] WARNING 468/CALC IN uid=jkl012 mode=FixedRiskUSD riskUsd=20.00 slTicks=50 tickCost=0.50USD/t
+[TIME] WARNING 468/CALC UNDERFUNDED uid=jkl012 action=ABORT rpc=25.00USD target=20.00USD
+[TIME] WARNING 468/CALC OUT uid=jkl012 qtyFinal=0 note="underfunded protection triggered"
+[TIME] WARNING 468/STR ENTRY ABORTED: autoQty<=0 (underfunded policy)
+```
+
+## 📋 Risk Management Testing Documentation
+
+Esta sección integra con la documentación existente del proyecto para análisis y testing de logs específicos del Risk Management system.
 
 ## Log Location
 

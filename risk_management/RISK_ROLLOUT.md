@@ -1,141 +1,4 @@
-# 📋 PLAN DETALLADO DE IMPLEMENTACIÓN - RISK MANAGEMENT
-
-**Sistema completo de gestión de riesgo para estrategias de trading**: Implementación incremental de position sizing automático (Manual/FixedUSD/%), breakeven system, y diagnósticos en tiempo real. Plan de 6 pasos priorizando la **seguridad del código base**.
-
-## 🎯 **PASO 1: FOUNDATION - Enums y Properties Básicos**
-
-## 🌳 **TARGET UI TREE - ESTRUCTURA COMPACTA**
-
-```
-▼ General
-  └─ Quantity                          2
-  └─ Allow only one position at a t... ✓
-
-▼ Risk Management                    ← SECCIÓN CONSOLIDADA
-  ├─ ▼ 🎯 Position Sizing           ← SUBCATEGORÍA COLAPSABLE
-  │   ├─ Position Sizing Mode         [FixedRiskUSD ▼]
-  │   ├─ Risk per trade (USD)         100
-  │   ├─ Risk % of account            0.5
-  │   ├─ Manual account equity over... 650
-  │   ├─ Tick value overrides (SYM=V) MNQ=0.5;NQ=5;MES=1.25;ES=12
-  │   └─ Enable detailed risk logging ✓
-  │
-  ├─ ▼ 🔒 Breakeven                 ← SUBCATEGORÍA COLAPSABLE
-  │   ├─ Breakeven mode               [OnTPFill ▼]
-  │   ├─ Breakeven offset (ticks)     4
-  │   ├─ Trigger breakeven manually   □
-  │   ├─ Trigger on TP1 touch/fill    ✓
-  │   ├─ Trigger on TP2 touch/fill    □
-  │   └─ Trigger on TP3 touch/fill    □
-  │
-  └─ ▼ 📊 Diagnostics               ← SUBCATEGORÍA COLAPSABLE
-      ├─ Effective tick value (USD/t) 0.5    (read-only)
-      ├─ Effective tick size (pts/t)  0.25   (read-only)
-      └─ Effective account equity     650    (read-only)
-
-▼ Risk/Targets
-  └─ Use SL from signal candle        ✓
-  └─ SL offset (ticks)                2
-  └─ Enable TP1                       ✓
-  └─ TP1 (R multiple)                 1,
-  └─ Enable TP2                       ✓
-  └─ TP2 (R multiple)                 2,
-  └─ Enable TP3                       □
-  └─ TP3 (R multiple)                 3,
-
-▼ Validation
-  └─ Validate GL cross on close...    ✓
-  └─ Hysteresis (ticks)               0
-
-▼ Confluences
-  └─ Require GenialLine slope...      ✓
-  └─ Require EMA8 vs Wilder8...       ✓
-
-▼ Execution
-  └─ Strict N+1 open...               ✓
-  └─ Open tolerance (ticks)           4
-```
-
-### **Explicación de íconos:**
-- 🎯 **Position Sizing**: Cálculo automático de contratos basado en riesgo objetivo
-- 🔒 **Breakeven**: Sistema que mueve SL a breakeven cuando TP1 es alcanzado
-- 📊 **Diagnostics**: Información en tiempo real sobre detecciones automáticas
-
-### **Explicación detallada del árbol de Risk Management:**
-
-```
-▼ Risk Management
-  │
-  ├─ ▼ 🎯 Position Sizing ──────────── SUBCATEGORÍA COLAPSABLE
-  │   │
-  │   ├─ Position Sizing Mode [FixedRiskUSD ▼]
-  │   │   ├─ Manual ────────────── Usa cantidad fija de General > Quantity (ej: 2 contratos)
-  │   │   ├─ FixedRiskUSD ──────── Calcula contratos para arriesgar X dólares por trade
-  │   │   │                        (Si underfunded → ABORT automáticamente)
-  │   │   └─ PercentOfAccount ──── Calcula contratos basado en % del equity total
-  │   │                            (Si underfunded → ABORT automáticamente)
-  │   │
-  │   ├─ Risk per trade (USD) [100]
-  │   │   └─ Cantidad máxima en USD a perder por trade (solo FixedRiskUSD mode)
-  │   │
-  │   ├─ Risk % of account [0.5]
-  │   │   └─ Porcentaje del equity total a arriesgar (solo PercentOfAccount mode)
-  │   │
-  │   ├─ Manual account equity override [650]
-  │   │   └─ Valor manual si detección automática falla o quieres override
-  │   │
-  │   ├─ Tick value overrides (SYM=V) [MNQ=0.5;NQ=5;MES=1.25;ES=12]
-  │   │   ├─ Format: SYMBOL=VALUE separado por ;
-  │   │   ├─ MNQ=0.5 (Micro NASDAQ $0.50/tick)
-  │   │   ├─ NQ=5 (E-mini NASDAQ $5.00/tick)
-  │   │   ├─ MES=1.25 (Micro S&P $1.25/tick)
-  │   │   └─ Si no definido: usa detección automática ATAS
-  │   │
-  │   └─ Enable detailed risk logging [✓]
-  │       └─ Activa logging detallado de cálculos para debugging
-  │
-  ├─ ▼ 🔒 Breakeven ───────────────── SUBCATEGORÍA COLAPSABLE
-  │   │
-  │   ├─ Breakeven mode [OnTPFill ▼]
-  │   │   ├─ OnTPFill ──────────── Activa automáticamente cuando TP1 se ejecuta
-  │   │   ├─ Manual ───────────── Solo activación manual
-  │   │   └─ Disabled ─────────── Sistema breakeven desactivado
-  │   │
-  │   ├─ Breakeven offset (ticks) [4]
-  │   │   └─ Ticks por encima de entrada para nuevo SL (entrada + 4 ticks)
-  │   │
-  │   ├─ Trigger breakeven manually [□]
-  │   │   └─ Botón para activar breakeven manualmente sin esperar TP1
-  │   │
-  │   ├─ Trigger on TP1 touch/fill [✓]
-  │   │   └─ Activa breakeven cuando TP1 se ejecuta (configuración principal)
-  │   │
-  │   ├─ Trigger on TP2 touch/fill [□]
-  │   │   └─ Activa breakeven cuando TP2 se ejecuta (configuración avanzada)
-  │   │
-  │   └─ Trigger on TP3 touch/fill [□]
-  │       └─ Activa breakeven cuando TP3 se ejecuta (configuración avanzada)
-  │
-  └─ ▼ 📊 Diagnostics ─────────────── SUBCATEGORÍA COLAPSABLE
-      │
-      ├─ Effective tick value (USD/tick) [0.5] (read-only)
-      │   ├─ Valor real por tick que usa el sistema
-      │   ├─ Resultado de: override manual → detección ATAS → fallback
-      │   └─ Ejemplo: 0.5 (MNQ), 5.0 (NQ), 1.25 (MES)
-      │
-      ├─ Effective tick size (points/tick) [0.25] (read-only)
-      │   ├─ Tamaño del tick en puntos del instrumento
-      │   ├─ Usado para convertir distancias SL/TP a ticks
-      │   └─ Ejemplo: 0.25 puntos/tick para MNQ
-      │
-      └─ Effective account equity (USD) [650] (read-only)
-          ├─ Equity real usado para cálculos % de cuenta
-          ├─ Detección: Portfolio API → manual override → fallback
-          └─ Base para PercentOfAccount mode
-```
-
----
-
+me gusta mucho cómo lo estás llevando: ya tienes la base estable (confluencias + guards) y los replays confirman que va fino. Para meter el Risk Management sin romper nada, yo lo haría con una **estrategia de capas + “feature flags”** y mini-checks después de cada capa. Te dejo el itinerario exacto, los archivos a crear y qué verificar en cada paso.
 
 # Plan incremental (seguro y reversible)
 
@@ -144,6 +7,15 @@
 * **Objetivo:** asegurar que todo lo actual sigue igual mientras añadimos piezas alrededor.
 * **Acción:** añadir un flag global (propiedad en la estrategia) `EnableRiskManagement` (por defecto **OFF**) y un sub-flag `RiskDryRun` (por defecto **ON** cuando `EnableRiskManagement=ON`).
 * **Evidencia a revisar:** los logs actuales (prefijo `468/STR`) siguen sin variación, no aparece ningún `468/RISK` salvo mensajes de init. Tu baseline de replays se mantiene tal cual (ya vimos que hoy estaba perfecto).&#x20;
+
+Qué comprobar tras aplicar la Capa 0
+* Build sin cambios de warnings/errores respecto a tu baseline.
+* En el log de la sesión, verás solo una línea nueva al inicio:
+
+```sh
+468/RISK INIT flags EnableRiskManagement=False RiskDryRun=True effectiveDryRun=True
+```
+* No deben aparecer otras líneas 468/RISK o 468/CALC nuevas que no existieran ya (no hemos tocado nada más).
 
 ## Capa 1 — Detección robusta de símbolo + migraciones sin comportamiento
 
@@ -193,6 +65,7 @@
   * `468/RISK ACCOUNT ... detected ...`
   * Desaparece el error de compilación **CS1061** de `.HasValue/.Value` en `decimal` (el error te salía en línea \~1927; esta capa lo elimina).
 
+
 ## Capa 4 — Validación offline por escenarios (sin tocar trading)
 
 * **Objetivo:** probar exhaustivamente el motor de cálculo con tus “replays” y escenarios.
@@ -240,17 +113,14 @@
 
 ---
 
-# Qué haría **ahora mismo** (tu siguiente commit)
+# Estructura de archivos sugerida
 
-1. **Arreglar definitivamente el bug de `decimal.HasValue`**
-   — Centraliza `GetEffectiveAccountEquity()` con el patrón correcto (nullable para `BalanceAvailable`, no-nullable para `Balance`), y añade logs de tipos (opcional, con `GetType().Name`) para detectarlo rápido la próxima vez.
-   *(Esto te elimina el CS1061 y estabiliza la Capa 3.)*
+* `docs/RISK_ROLLOUT.md` → guía por capas (lo de arriba, conciso, con lista de verificación).
+* `docs/RISK_LOGGING.md` → prefijos, formato de mensajes, comandos `grep` habituales.
+* `docs/RISK_API_NOTES.md` → notas de API ATAS que ya has descubierto (p. ej., `Portfolio.BalanceAvailable` es `decimal?`, `Portfolio.Balance` es `decimal`, no existe `Equity`; `Security.TickSize`/`QuoteCurrency`; evitar miembros obsoletos).
+* `tools/deploy_risk_management.ps1` → build + copia + seteo de flags (dry-run por defecto).
+* `test_scenarios/risk_management/scenarios/...` → ya lo tienes; añade “expected logs” por escenario.
+* `logs/current/` y `logs/emergency/` → ya existen (mantén).
 
-2. **Meter `GetEffectiveSecurityCode()` + RISK INIT log**
-   — Así desbloqueas `TickValueOverrides` por símbolo y verás el símbolo correcto en diagnósticos.
-
-3. **Encender `CalculateQuantity()` en dry-run con throttle + SNAPSHOT**
-   — Ya lo tienes; solo asegúrate de que está **siempre** en dry-run (no toca `Quantity` real) y que el snapshot imprime todo lo necesario para comparar en los replays.
-
-Con esas 3 cosas, el **riesgo de regresión es cero** y ya tendrás trazas `468/RISK`/`468/CALC` en los replays, que hoy **no existen** (tu propio informe decía `grep -c "468/RISK|468/CALC" → 0`).&#x20;
+Tu **mapa de ruta** (`map_rute.md`) ya marca la UI/propiedades y el plan por pasos; úsalo de contrato para decidir cuándo subir cada flag.&#x20;
 
