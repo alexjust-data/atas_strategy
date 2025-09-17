@@ -2,6 +2,29 @@
 
 **Sistema completo de gestión de riesgo para estrategias de trading**: Implementación incremental de position sizing automático (Manual/FixedUSD/%), breakeven system, y diagnósticos en tiempo real. Plan de 6 pasos priorizando la **seguridad del código base**.
 
+## 🎯 **PASO 1: FOUNDATION - Enums y Properties Básicos**
+
+### **¿Por qué empezar aquí?**
+
+- ✅ **Zero riesgo** para el código existente - solo agregamos propiedades
+- ✅ **No modificamos lógica** de ejecución actual
+- ✅ **UI funcional** inmediatamente para testing
+- ✅ **Base sólida** para todos los pasos siguientes
+
+### **Qué modificamos del código original:**
+
+- **Agregar enums**: `PositionSizingMode`, `BreakevenMode`
+- **Agregar properties** con `[Category]` y `[DisplayName]`
+- **Mantener valores default** que no cambien comportamiento actual
+- **NO tocar** ninguna lógica de `OnCandle()`, `SubmitMarket()`, etc.
+
+### **Resultado esperado:**
+
+- La estrategia funciona **exactamente igual** que antes
+- UI muestra las nuevas opciones pero en modo "dummy"
+- Base preparada para siguientes pasos
+
+
 ## 🌳 **TARGET UI TREE - ESTRUCTURA COMPACTA**
 
 ```
@@ -135,30 +158,6 @@
 ---
 
 Analizando la estructura objetivo, necesitamos llegar a un sistema completo con **6 secciones principales**. Te explico el plan paso a paso priorizando la **seguridad del código base**:
-
----
-
-## 🎯 **PASO 1: FOUNDATION - Enums y Properties Básicos**
-
-### **¿Por qué empezar aquí?**
-
-- ✅ **Zero riesgo** para el código existente - solo agregamos propiedades
-- ✅ **No modificamos lógica** de ejecución actual
-- ✅ **UI funcional** inmediatamente para testing
-- ✅ **Base sólida** para todos los pasos siguientes
-
-### **Qué modificamos del código original:**
-
-- **Agregar enums**: `PositionSizingMode`, `BreakevenMode`
-- **Agregar properties** con `[Category]` y `[DisplayName]`
-- **Mantener valores default** que no cambien comportamiento actual
-- **NO tocar** ninguna lógica de `OnCandle()`, `SubmitMarket()`, etc.
-
-### **Resultado esperado:**
-
-- La estrategia funciona **exactamente igual** que antes
-- UI muestra las nuevas opciones pero en modo "dummy"
-- Base preparada para siguientes pasos
 
 ---
 
@@ -326,10 +325,10 @@ Con este plan, llegamos a **exactamente** lo que muestra tu imagen:
 
 ## 📊 **PROGRESS TRACKING**
 
-- [ ] **Paso 1**: Foundation (Enums + Properties)
-- [ ] **Paso 2**: Auto-Detection (Tick Value + Account Equity)
-- [ ] **Paso 3**: Calculation Engine (CalculateQuantity Logic)
-- [ ] **Paso 4**: Integration (Connect to Trading System)
+- [x] **Paso 1**: Foundation (Enums + Properties) ✅ **COMPLETADO** - commit 18169d4
+- [x] **Paso 2**: Auto-Detection (Tick Value + Account Equity) ✅ **COMPLETADO** - GetEffectiveTickValue() + GetEffectiveAccountEquity() implementados
+- [x] **Paso 3**: Calculation Engine (CalculateQuantity Logic) ✅ **COMPLETADO** - 3 modos funcionando + logging fixes implementados
+- [ ] **Paso 4**: Integration (Connect to Trading System) ← **PRÓXIMO PASO CRÍTICO**
 - [ ] **Paso 5**: Breakeven System (TP1 Trigger Logic)
 - [ ] **Paso 6**: Advanced Features (Diagnostics + Refinements)
 

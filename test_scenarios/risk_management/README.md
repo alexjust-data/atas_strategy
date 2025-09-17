@@ -1,178 +1,269 @@
-# Risk Management Testing - Version 2.2
+# 📊 Risk Management Log Formats
 
-Framework de testing para el sistema avanzado de gestión de riesgo económico de la estrategia ATAS 468.
+## Overview
 
-## 🎯 Objetivo
+This directory contains documentation for Risk Management log formats, analysis patterns, and monitoring procedures specific to the FourSixEight Confluences Strategy.
 
-Validar el sistema completo de position sizing automático que incluye:
-- **Riesgo fijo en USD** por operación con protección underfunded
-- **Porcentaje de cuenta** a arriesgar con auto-detección de equity
-- **Auto-detección robusta de tick values** via MinStepPrice + fallbacks
-- **Sistema de overrides** con parser mejorado (SYM=VAL y SYM,VAL)
-- **Diagnósticos en tiempo real** con refresh manual y echo automático
-- **Protección inteligente** contra entradas forzadas cuando underfunded
+## Log Location
 
-## 📋 Funcionalidades a Probar
+### Primary Log Files
+- **Current Session**: `logs/current/ATAS_SESSION_LOG.txt`
+- **Emergency Backup**: `logs/current/EMERGENCY_ATAS_LOG.txt`
+- **Session ID**: `logs/current/ATAS_SESSION_ID.tmp`
 
-### 1. Position Sizing Modes
-- **Manual**: Cantidad fija definida por usuario
-- **FixedRiskUSD**: Cantidad calculada por riesgo fijo en dólares
-- **PercentOfAccount**: Cantidad calculada por % de equity de cuenta
+### Generated Analysis Files
+- **Filtered Views**: `*_468_CALC_*.log`, `*_468_RISK_*.log`, etc.
+- **UID Timelines**: `uid_*_*.log`
+- **Combined Views**: `*_combined_calc_*.log`
 
-### 2. Enhanced Tick Value Detection (v2.2)
-- **Priority 1**: MinStepPrice (ATAS standard $/tick property)
-- **Priority 2**: Auto-detección via reflexión de Security/InstrumentInfo
-- **Priority 3**: CSV overrides con parser mejorado (acepta = y ,)
-- **Priority 4**: Fallback con warnings críticos
-- **Preset incluido**: `MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10`
+## Official Risk Management Tags
 
-### 3. Advanced Account Equity Detection
-- Auto-detección de saldo via Portfolio API con error handling
-- Override manual cuando auto-detección falla
-- Avisos de mismatch cuando difieren auto vs override
-- Logging detallado del proceso con fuente identificada
+### Primary Tags
+| Tag | Purpose | Frequency | Critical |
+|-----|---------|-----------|----------|
+| `468/RISK` | Risk detection, overrides, diagnostics | Startup + changes | Yes |
+| `468/CALC` | Position sizing calculations | Every 10 bars | Yes |
+| `468/SL` | Stop loss calculations | Per signal | Yes |
+| `468/STR` | Strategy context and guards | Per entry | Yes |
+| `468/ORD` | Order management and brackets | Per order | No |
+| `468/POS` | Position tracking and snapshots | Per change | No |
 
-### 4. Underfunded Protection System (NEW v2.2)
-- **Skip if Underfunded**: Aborta trade cuando risk/contract > target risk
-- **Min Qty if Underfunded**: Cantidad mínima si fuerza entrada
-- **Early Abort**: Validación en OnCalculate antes de SubmitMarket
-- **Comprehensive Logging**: Detalle completo de por qué se aborta
+### Calculation Subtypes
+| Subtype | Purpose | Example |
+|---------|---------|---------|
+| `CALC IN` | Calculation inputs | `mode=FixedRiskUSD slTicks=7 tickCost=0.50USD/t` |
+| `CALC MANUAL` | Manual mode results | `qty=2 rpc=3.50USD totalRisk=7.00USD` |
+| `CALC FIXED` | Fixed USD mode results | `targetRisk=100USD qtyFinal=28` |
+| `CALC PCT` | Percent mode results | `equity=25000USD pct=0.50% qtyFinal=35` |
+| `CALC UNDERFUNDED` | Protection triggered | `action=ABORT rpc=25.00USD target=10.00USD` |
+| `CALC OUT` | Final calculation result | `qtyFinal=28 rpc=3.50USD` |
+| `CALC PING` | Throttled monitoring | `bar=17620 lastQty=28` |
 
-### 5. Real-time Diagnostics UI (NEW v2.2)
-- **Read-only Properties**: Effective tick value, equity, last auto qty, etc.
-- **Refresh Diagnostics Button**: Log instantáneo de valores actuales
-- **Auto Echo**: Log automático al inicio de sesión una sola vez
-- **Live Updates**: Valores se actualizan en tiempo real
+## Message Format Standards
 
-## 🧪 Enhanced Test Scenarios (v2.2)
+### Core Rules
+1. **One line = one event** - No multi-line entries
+2. **Key=value format** - All parameters as `key=value` pairs
+3. **UID mandatory** - Every risk-related event must include `uid={uid}`
+4. **Currency suffixes** - All monetary values include currency (`USD`, etc.)
+5. **No spaces in values** - Use underscores or concatenation
 
-### G1 - Fixed Risk USD with Auto-detection
-- **Config**: PositionSizing = FixedRiskUSD, RiskPerTradeUsd = $50
-- **Instrumento**: MNQ (Micro NASDAQ) - tick value auto-detected via MinStepPrice
-- **Objetivo**: Validar nueva prioridad MinStepPrice y cálculo automático de qty
-- **Expected**: tick value = $0.50, qty calculado basado en SL distance
+### Standard Pattern
+```
+[timestamp] LEVEL tag uid={uid} key1=value1 key2=value2 ... note="optional free text"
+```
 
-### G2 - Percent of Account with Equity Detection
-- **Config**: PositionSizing = PercentOfAccount, RiskPercentOfAccount = 0.5%
-- **Instrumento**: ES (E-mini S&P)
-- **Objetivo**: Validar detección automática de equity y avisos de mismatch
-- **Expected**: Auto-detected equity vs manual override comparison
+### Example Messages
+```
+[13:45:01.125] WARNING 468/CALC IN uid=abc123 mode=FixedRiskUSD slTicks=7 tickCost=0.50USD/t equity=25000USD note="equity in USD, tickCost in USD; no currency conversion at step3"
 
-### G3 - Enhanced Override System
-- **Config**: Tick value overrides con formato `MNQ=0.5;NQ=5`
-- **Objetivo**: Validar parser mejorado que acepta = y ,
-- **Test Cases**: `SYM=VAL`, `SYM,VAL`, mixed formats, InvariantCulture
+[13:45:01.126] WARNING 468/CALC FIXED uid=abc123 targetRisk=100USD rpc=3.50USD underfunded=false qtyRaw=28.57 qtySnap=28 qtyClamp=28 qtyFinal=28
 
-### G4 - Underfunded Protection
-- **Config**: SkipIfUnderfunded = true, low risk amount vs high SL distance
-- **Objetivo**: Validar abort inteligente cuando risk/contract > target
-- **Expected**: `ABORT ENTRY: Underfunded` en logs + qty = 0 en diagnostics
+[13:45:01.127] WARNING 468/CALC OUT uid=abc123 mode=FixedRiskUSD qtyFinal=28 rpc=3.50USD slTicks=7 note="orders still use manual Quantity=2 until STEP4"
+```
 
-### G5 - Real-time Diagnostics Testing
-- **Objetivo**: Validar UI diagnostics y refresh functionality
-- **Test Cases**:
-  - Effective values display correctamente
-  - Refresh button loguea `DIAG [manual-refresh]`
-  - Auto echo `DIAG [init]` al inicio
-  - Valores se actualizan después de cada cálculo
+## Key Placeholders Reference
 
-### G6 - Multi-Instrument with Preset (NEW)
-- **Config**: Testing con preset completo pre-configurado
-- **Instrumentos**: MNQ, NQ, MES, ES, MGC, GC
-- **Objetivo**: Validar preset completo y override vs auto detection
+### Identifiers
+- `{uid}` - Unique operation identifier (GUID format)
+- `{ts}` - Local timestamp (HH:mm:ss.fff)
+- `{bar}` - Bar index (integer)
 
-## 📊 Métricas a Validar
+### Risk Parameters
+- `{mode}` - Position sizing mode (Manual/FixedRiskUSD/PercentOfAccount)
+- `{riskUsd}` - Risk amount in USD (decimal)
+- `{riskPct}` - Risk percentage (decimal with % suffix)
+- `{slTicks}` - SL distance in ticks (decimal)
 
-1. **Precisión de Cálculos**
-   - Qty calculada vs esperada
-   - Risk por contrato vs configurado
-   - Tick value detectado vs real
+### Calculation Results
+- `{qty}` - Final quantity (integer/decimal)
+- `{qtyRaw}` - Raw calculation before rounding (decimal)
+- `{qtySnap}` - After lot step snapping (decimal)
+- `{qtyClamp}` - After min/max limits (decimal)
+- `{rpc}` - Risk per contract (decimal with currency)
+- `{target}` - Target risk amount (decimal with currency)
 
-2. **Robustez del Sistema**
-   - Manejo de errores en auto-detección
-   - Warnings apropiados cuando usa fallbacks
-   - Validación de inputs del usuario
+### Instrument Data
+- `{tickCost}` - Cost per tick (decimal with currency/t suffix)
+- `{tickSize}` - Points per tick (decimal)
+- `{equity}` - Account equity (decimal with currency)
+- `{instr}` - Instrument name (string)
 
-3. **Performance**
-   - Tiempo de cálculo
-   - Caching de valores detectados
-   - Impacto en latencia de ejecución
+### Flags and States
+- `{uf}` - Underfunded flag (true/false)
+- `{ovApplied}` - Override applied (true/false)
+- `{hit}` - CSV override hit (true/false)
 
-## 🛠️ Enhanced Analysis Tools (v2.2)
+## Analysis Patterns
 
-### Log Analysis Commands
+### Health Check Commands
 ```bash
-# View all risk diagnostics (NEW)
-grep -n "DIAG \[" ATAS_SESSION_LOG.txt
+# Recent calculation results
+grep -n "468/CALC OUT.*qtyFinal=" logs/current/ATAS_SESSION_LOG.txt | tail -5
 
-# View tick value detection and mismatches
-grep -nE "TICK-VALUE|MinStepPrice|override|auto-detected|MISMATCH" ATAS_SESSION_LOG.txt
+# Error detection
+grep -nE "(ERROR|WARNING.*CALC)" logs/current/ATAS_SESSION_LOG.txt | tail -10
 
-# View account equity detection
-grep -nE "ACCOUNT EQUITY|auto-detected|override" ATAS_SESSION_LOG.txt
+# Configuration status
+grep -n "468/RISK SNAPSHOT" logs/current/ATAS_SESSION_LOG.txt | tail -1
 
-# View auto-qty calculations and underfunded protection
-grep -n "AUTOQTY\|ABORT ENTRY\|Underfunded" ATAS_SESSION_LOG.txt
-
-# View parser issues
-grep -n "GetTickValueFromOverrides\|failed" ATAS_SESSION_LOG.txt
+# Underfunded protection events
+grep -n "468/CALC UNDERFUNDED" logs/current/ATAS_SESSION_LOG.txt
 ```
 
-### Real-time Validation
-- **UI Diagnostics Panel**: Real-time view of effective values
-- **Refresh Diagnostics Button**: Manual echo for immediate validation
-- **Live Calculation Tracking**: Updated after each position size calculation
-- **Emergency Logs**: Persistent logging across ATAS restarts
+### UID Timeline Analysis
+```bash
+# Extract complete operation timeline
+grep -n "uid=abc123" logs/current/ATAS_SESSION_LOG.txt
 
-## 📁 Estructura
+# With context lines
+grep -B 2 -A 2 "uid=abc123" logs/current/ATAS_SESSION_LOG.txt
 
-```
-risk_management/
-├── README.md (este archivo)
-├── scenarios/
-│   ├── G1_fixed_usd_50/
-│   ├── G2_percent_account_0.5/
-│   ├── G3_tick_value_override/
-│   └── G4_multi_instrument/
-├── logs/
-│   └── analysis_results/
-└── validation/
-    ├── calculation_tests.md
-    └── edge_cases.md
+# Using PowerShell tool
+powershell -ExecutionPolicy Bypass -File "tools\extract_uid.ps1" -Path "logs\current\ATAS_SESSION_LOG.txt" -Uid "abc123" -ShowTimeline
 ```
 
-## 🚀 Getting Started (v2.2)
+### Performance Monitoring
+```bash
+# Calculation frequency (should be ~every 10 bars)
+grep -n "468/CALC PING.*bar=" logs/current/ATAS_SESSION_LOG.txt | tail -20
 
-### Quick Setup
-1. **Deploy v2.2** - `tools/deploy_all.ps1` (ya incluye todas las mejoras)
-2. **Verify Preset** - Confirm tick value overrides: `MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10`
-3. **Test Diagnostics** - Click "Refresh diagnostics" button y verificar `DIAG [manual-refresh]` en logs
-4. **Configure Mode** - Set position sizing mode (Manual/Fixed USD/% Account)
-5. **Execute Test Scenario** - Elegir G1-G6 basado en objetivo
+# API health check
+grep -n "auto-detected.*via" logs/current/ATAS_SESSION_LOG.txt | tail -5
 
-### Validation Checklist
-- [ ] **UI Diagnostics Display**: Effective tick value, equity, last qty values showing
-- [ ] **Auto Echo**: `DIAG [init]` aparece al inicio de sesión
-- [ ] **Override Parser**: Preset MNQ=0.5 etc. funcionando correctamente
-- [ ] **MinStepPrice Detection**: Priority on ATAS standard $/tick property
-- [ ] **Underfunded Protection**: Abort when risk/contract > target (if enabled)
-- [ ] **Live Updates**: Diagnostics update after each calculation
+# Fallback usage frequency
+grep -c "RISK_FALLBACK" logs/current/ATAS_SESSION_LOG.txt
+```
 
-## ⚠️ Enhanced Considerations (v2.2)
+## Expected Log Sequences
 
-### Before Testing
-- **Demo/Paper First**: Always test new risk management in safe environment
-- **Validate Preset**: Confirm included instruments match your broker's tick values
-- **Check Auto-detection**: Verify MinStepPrice is available for your instruments
-- **Monitor Logs**: Watch for `CRITICAL` warnings about fallback usage
+### Successful Entry Flow
+1. **Signal Capture**: `CAPTURE.*uid=` (strategy detects signal)
+2. **Risk Snapshot**: `RISK SNAPSHOT` (system state at entry)
+3. **Calculation Input**: `CALC IN` (inputs to calculation engine)
+4. **Mode Calculation**: `CALC FIXED|PCT|MANUAL` (position sizing)
+5. **Calculation Output**: `CALC OUT` (final calculated quantity)
+6. **Strategy Context**: `STR CONTEXT` (guards and context)
+7. **Order Submission**: Market order execution
 
-### During Testing
-- **Monitor Diagnostics**: Use UI panel and refresh button frequently
-- **Check Underfunded**: Test with low risk amounts to trigger protection
-- **Validate Calculations**: Math should match expectations per scenario
-- **Log Analysis**: Use provided grep commands for detailed analysis
+### Underfunded Protection Flow
+1. **Calculation Input**: `CALC IN` (normal calculation start)
+2. **Underfunded Detection**: `CALC UNDERFUNDED action=ABORT` (protection triggered)
+3. **Zero Quantity Output**: `CALC OUT.*qtyFinal=0` (entry skipped)
+4. **Entry Abort**: No order submission occurs
 
-### Production Deployment
-- **Backup Configs**: Save current settings before enabling auto position sizing
-- **Gradual Rollout**: Start with small risk amounts and monitor behavior
-- **Monitor Mismatches**: Watch for tick value or equity detection discrepancies
+### Auto-Detection Flow
+1. **System Startup**: Initial auto-detection attempts
+2. **Tick Value Detection**: `auto-detected.*tickCost.*via Security.TickCost`
+3. **Account Equity Detection**: `auto-detected.*equity.*via Portfolio.BalanceAvailable`
+4. **Override Application**: `OVERRIDE.*hit=true` (if CSV overrides exist)
+5. **Risk Snapshot**: Complete configuration logged
+
+## Error Patterns
+
+### Critical Errors
+```
+ERROR 468/CALC FATAL uid=abc123 exception=DivideByZeroException
+ERROR Portfolio object is null, cannot determine account equity
+```
+
+### Warning Patterns
+```
+WARNING 468/RISK RISK_FALLBACK used=tickCost value=0.5
+WARNING 468/CALC UNDERFUNDED action=ABORT qty=0
+```
+
+### Common Issues
+- **Zero tick values**: `tickCost=0` or `RISK_FALLBACK.*tickCost`
+- **Missing equity**: `equity=0` or `Portfolio.*null`
+- **Calculation failures**: `qtyFinal=0` with normal inputs
+- **API disconnections**: Frequent fallback usage
+
+## Monitoring Thresholds
+
+### Normal Operation
+- **Calculation frequency**: Every 10 bars (±2)
+- **Fallback usage**: <5% of operations
+- **Underfunded events**: <10% of signals
+- **API response time**: <100ms
+
+### Warning Conditions
+- **High fallback usage**: >20% of operations
+- **Frequent underfunded**: >50% of signals
+- **Calculation errors**: Any ERROR level events
+- **API failures**: >5% null responses
+
+### Critical Conditions
+- **No calculations**: No CALC events for >100 bars
+- **Fatal errors**: Any FATAL level events
+- **Complete API failure**: 100% fallback usage
+- **Memory issues**: OutOfMemory exceptions
+
+## File Management
+
+### Log Rotation
+- **Daily rotation**: Archive previous day's logs
+- **Size limits**: Rotate when files exceed 50MB
+- **Retention**: Keep 30 days of archived logs
+
+### Backup Procedures
+- **Emergency backup**: Automatic copy to EMERGENCY_ATAS_LOG.txt
+- **Pre-deployment**: Save current logs before new deployments
+- **Critical events**: Immediate backup after fatal errors
+
+### Cleanup Commands
+```bash
+# Archive old logs
+mkdir logs/archive/$(date +%Y%m%d)
+cp logs/current/*.txt logs/archive/$(date +%Y%m%d)/
+
+# Clean filtered views older than 7 days
+find logs/current -name "*_468_*_*.log" -mtime +7 -delete
+
+# Compress archived logs
+gzip logs/archive/*/*.txt
+```
+
+## Integration with Tools
+
+### PowerShell Tools
+```bash
+# Real-time monitoring
+powershell -ExecutionPolicy Bypass -File "tools\tail_risk.ps1" -Path "logs\current\ATAS_SESSION_LOG.txt"
+
+# Create filtered views
+powershell -ExecutionPolicy Bypass -File "tools\filter_risk.ps1" -Path "logs\current\ATAS_SESSION_LOG.txt"
+
+# Extract UID timeline
+powershell -ExecutionPolicy Bypass -File "tools\extract_uid.ps1" -Path "logs\current\ATAS_SESSION_LOG.txt" -Uid "abc123"
+```
+
+### Grep Integration
+- Use `docs/grep-cheatsheet/risk-grep.md` for command reference
+- Combine grep with PowerShell for advanced filtering
+- Pipe results to analysis scripts for automation
+
+## Troubleshooting Guide
+
+### No Risk Events
+1. Check strategy loading: `grep -n "INIT.*attached" logs/current/ATAS_SESSION_LOG.txt`
+2. Verify deployment: Check DLL timestamps in ATAS directory
+3. Check for exceptions: `grep -n "ERROR\|EXCEPTION" logs/current/ATAS_SESSION_LOG.txt`
+
+### Incorrect Calculations
+1. Extract calculation inputs: `grep -n "CALC IN" logs/current/ATAS_SESSION_LOG.txt | tail -5`
+2. Check auto-detection: `grep -n "auto-detected\|fallback" logs/current/ATAS_SESSION_LOG.txt`
+3. Verify configuration: `grep -n "RISK SNAPSHOT" logs/current/ATAS_SESSION_LOG.txt | tail -1`
+
+### Performance Issues
+1. Check calculation frequency: `grep -n "CALC PING" logs/current/ATAS_SESSION_LOG.txt | tail -20`
+2. Monitor API responses: `grep -n "Portfolio\|Security" logs/current/ATAS_SESSION_LOG.txt`
+3. Look for memory issues: `grep -n "OutOfMemory\|StackOverflow" logs/current/ATAS_SESSION_LOG.txt`
+
+---
+
+**Related Documentation**:
+- `docs/RiskManagement/01_LOG_CONVENTIONS.md` - Complete logging standards
+- `docs/RiskManagement/02_PLACEHOLDERS.md` - Placeholder dictionary
+- `docs/RiskManagement/05_TROUBLESHOOTING.md` - Troubleshooting procedures
+- `docs/grep-cheatsheet/risk-grep.md` - Grep command reference

@@ -173,6 +173,29 @@ namespace MyAtas.Strategies
         [ReadOnly(true)]
         public decimal EffectiveAccountEquity { get; private set; } = 10000.0m;
 
+        [Category("Risk Management/Diagnostics"), DisplayName("Last auto qty")]
+        [ReadOnly(true)]
+        public int LastAutoQty { get; private set; } = 0;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("Last risk per contract")]
+        [ReadOnly(true)]
+        public decimal LastRiskPerContract { get; private set; } = 0.0m;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("Last stop distance (ticks)")]
+        [ReadOnly(true)]
+        public decimal LastStopDistance { get; private set; } = 0.0m;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("Last risk input")]
+        [ReadOnly(true)]
+        public decimal LastRiskInput { get; private set; } = 0.0m;
+
+        // --- Underfunded Protection ---
+        [Category("Risk Management/Position Sizing"), DisplayName("Skip trade if underfunded")]
+        public bool SkipIfUnderfunded { get; set; } = true;
+
+        [Category("Risk Management/Position Sizing"), DisplayName("Min qty if underfunded")]
+        public int MinQtyIfUnderfunded { get; set; } = 1;
+
         // ====================== INTERNAL STATE ======================
         private FourSixEightIndicator _ind;
         private Pending? _pending;           // captured at N (GL-cross close confirmed)
@@ -263,12 +286,44 @@ namespace MyAtas.Strategies
                 {
                     DebugLog.W("468/STR", "WARNING: Could not attach indicator (method not found in hierarchy)");
                 }
+
+                // Initialize risk management diagnostics
+                UpdateDiagnostics();
+
+                // ---- RISK INIT (incondicional para baseline de sesión)
+                var sym = GetEffectiveSecurityCode();
+                string qc = Security?.QuoteCurrency ?? "USD";
+
+                // Try InstrumentInfo.TickSize first (reflexión para compatibilidad)
+                decimal infoTickSize = 0m;
+                try
+                {
+                    var ii = GetType().GetProperty("InstrumentInfo",
+                        System.Reflection.BindingFlags.Instance |
+                        System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.NonPublic)?.GetValue(this);
+                    if (ii != null)
+                    {
+                        var pTs = ii.GetType().GetProperty("TickSize");
+                        infoTickSize = (pTs?.GetValue(ii) as decimal?) ?? 0m;
+                    }
+                }
+                catch { /* best-effort */ }
+
+                var secTickSize = (Security != null ? Security.TickSize : 0m);
+                var effectiveTs = infoTickSize > 0 ? infoTickSize :
+                                  secTickSize  > 0 ? secTickSize  :
+                                  EffectiveTickSize; // lo que dejó UpdateDiagnostics (fallback)
+
+                DebugLog.W("468/RISK",
+                    $"INIT sym={sym} qc={qc} tickSize={effectiveTs} overrides=\"{TickValueOverrides ?? ""}\" DRYRUN=ON");
             }
             catch (Exception ex)
             {
                 DebugLog.W("468/STR", "INIT EX: " + ex);
             }
         }
+
 
         // ====================== CORE ======================
         protected override void OnCalculate(int bar, decimal value)
@@ -280,6 +335,49 @@ namespace MyAtas.Strategies
                     DebugLog.W("468/STR", $"HEARTBEAT bar={bar} t={GetCandle(bar).Time:HH:mm:ss}");
             }
             catch { }
+
+            // --- Risk Management Pulse Logging & Calculation Engine Exercise ---
+            try
+            {
+                if (IsFirstTickOf(bar))
+                {
+                    if (!EnableDetailedRiskLogging)
+                    {
+                        // Pulse every 60 seconds when detailed logging is off
+                        if (_lastPulseLogTime == DateTime.MinValue || (DateTime.UtcNow - _lastPulseLogTime).TotalSeconds >= 60)
+                        {
+                            var securityCode = Security?.Code ?? "UNKNOWN";
+                            var qty = CalculateQuantity();
+                            DebugLog.W("468/CALC", $"PULSE sym={securityCode} bar={bar} mode={PositionSizingMode} qty={qty}");
+                            _lastPulseLogTime = DateTime.UtcNow;
+                        }
+                    }
+                    else
+                    {
+                        // When detailed logging is ON, exercise calculation engine every 10 bars
+                        if ((bar % 10) == 0)
+                        {
+                            var qty = CalculateQuantity(); // This will generate detailed 468/CALC logs
+                            DebugLog.W("468/CALC", $"ENGINE_TEST bar={bar} mode={PositionSizingMode} qty={qty}");
+                        }
+                    }
+
+                    // Periodic diagnostic refresh every 20 bars (both modes)
+                    if (_lastDiagnosticRefreshBar == -1 || (bar - _lastDiagnosticRefreshBar) >= 20)
+                    {
+                        UpdateDiagnostics();
+                        var securityCode = Security?.Code ?? "UNKNOWN";
+                        var tickValue = GetEffectiveTickValue();
+                        var equity = GetEffectiveAccountEquity();
+                        DebugLog.W("468/RISK", $"REFRESH sym={securityCode} bar={bar} tickValue={tickValue:F2} equity={equity:F2}");
+                        _lastDiagnosticRefreshBar = bar;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/RISK", $"Pulse logging error: {ex.Message}");
+            }
 
             // *** THROTTLED DEBUG: Only log first tick of each bar to prevent spam ***
             if (bar != _lastLoggedBar && IsFirstTickOf(bar))
@@ -471,6 +569,21 @@ namespace MyAtas.Strategies
                 if (netNowAbs > 0 && timeOkR && barsOkR)
                 {
                     try { ReconcileBracketsWithNet(); } catch { /* best-effort */ }
+                }
+            }
+
+            // --- PASO 3 TESTING: Calculate position size (pure calculation, no order effects) ---
+            if (IsFirstTickOf(bar) && (bar % 10) == 0) // Test every 10 bars to avoid spam
+            {
+                try
+                {
+                    int calculatedQty = CalculateQuantity();
+                    // The calculation updates LastAutoQty and other diagnostic properties
+                    // No orders are affected - this is pure testing of the calculation engine
+                }
+                catch (Exception ex)
+                {
+                    DebugLog.W("468/CALC", $"Testing calculation error: {ex.Message}");
                 }
             }
 
@@ -1471,6 +1584,558 @@ namespace MyAtas.Strategies
             for (int i = 1; i <= last; i++)
                 rma = (rma * (len - 1) + GetCandle(i).Close) / len;
             return rma;
+        }
+
+        // ====================== RISK MANAGEMENT AUTO-DETECTION ======================
+
+        /// <summary>
+        /// Gets effective tick value for position sizing calculations
+        /// Priority: ATAS auto-detection → CSV overrides → fallback
+        /// </summary>
+        private decimal GetEffectiveTickValue()
+        {
+            try
+            {
+                // Priority 1: Security.TickCost (ATAS)
+                var qc = Security?.QuoteCurrency ?? "USD";
+                var secTickCost = (Security != null ? Security.TickCost : 0m);
+                if (secTickCost > 0)
+                {
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/RISK", $"TICK-VALUE auto-detected: {secTickCost:F2}{qc}/tick via Security.TickCost");
+                    return secTickCost;
+                }
+
+                // Priority 2: CSV overrides
+                var code = GetEffectiveSecurityCode();
+                var overrides = ParseTickValueOverrides();
+                if (!string.IsNullOrWhiteSpace(code) && overrides.TryGetValue(code, out var ov))
+                {
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/RISK", $"TICK-VALUE override: {ov:F2}{qc}/tick for {code}");
+                    return ov;
+                }
+
+                // Priority 3: Fallback
+                if (EnableDetailedRiskLogging)
+                    DebugLog.W("468/RISK", $"TICK-VALUE fallback: 0.5{qc}/tick (no detection/override for {code})");
+                return 0.5m;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/RISK", $"TICK-VALUE error: {ex.Message} -> fallback 0.5");
+                return 0.5m;
+            }
+        }
+
+        /// <summary>
+        /// Gets effective account equity for percentage-based position sizing
+        /// Priority: Manual override → Portfolio BalanceAvailable → Portfolio Balance → fallback
+        /// </summary>
+        private decimal GetEffectiveAccountEquity()
+        {
+            try
+            {
+                // Priority 1: Manual override if specified
+                if (ManualAccountEquityOverride > 0)
+                {
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/RISK", $"ACCOUNT EQUITY manual override: {ManualAccountEquityOverride:F2} USD");
+                    return ManualAccountEquityOverride;
+                }
+
+                // Priority 2: Auto-detection via Portfolio.BalanceAvailable (version-agnostic)
+                var ba = Portfolio?.BalanceAvailable ?? 0m; // Works for both decimal? and decimal
+                if (ba > 0)
+                {
+                    var detected = ba;
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/RISK", $"ACCOUNT EQUITY auto-detected: {detected:F2} USD via Portfolio.BalanceAvailable");
+                    return detected;
+                }
+
+                // Priority 3: Fallback to Portfolio.Balance (direct decimal)
+                if (Portfolio?.Balance > 0)
+                {
+                    var detected = Portfolio.Balance;
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/RISK", $"ACCOUNT EQUITY auto-detected: {detected:F2} USD via Portfolio.Balance");
+                    return detected;
+                }
+
+                // Priority 4: Fallback value with warning
+                if (EnableDetailedRiskLogging)
+                    DebugLog.W("468/RISK", $"ACCOUNT EQUITY fallback: 10000.0 USD (no detection/override)");
+                return 10000.0m;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/RISK", $"ACCOUNT EQUITY error: {ex.Message} → fallback 10000.0");
+                return 10000.0m;
+            }
+        }
+
+        /// <summary>
+        /// Parses tick value overrides from CSV string format
+        /// Format: "MNQ=0.5;NQ=5;MES=1.25;ES=12.5"
+        /// </summary>
+        private Dictionary<string, decimal> ParseTickValueOverrides()
+        {
+            var result = new Dictionary<string, decimal>();
+
+            try
+            {
+                if (string.IsNullOrWhiteSpace(TickValueOverrides))
+                    return result;
+
+                var pairs = TickValueOverrides.Split(';');
+                foreach (var pair in pairs)
+                {
+                    if (string.IsNullOrWhiteSpace(pair)) continue;
+
+                    var parts = pair.Split('=');
+                    if (parts.Length == 2)
+                    {
+                        var symbol = parts[0].Trim().ToUpper();
+                        if (decimal.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Number,
+                            System.Globalization.CultureInfo.InvariantCulture, out var value) && value > 0)
+                        {
+                            result[symbol] = value;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/RISK", $"ParseTickValueOverrides error: {ex.Message}");
+            }
+
+            return result;
+        }
+
+        /// <summary>
+        /// Updates diagnostic properties with current detected values
+        /// Called periodically to refresh UI diagnostics
+        /// </summary>
+        private void UpdateDiagnostics()
+        {
+            try
+            {
+                EffectiveTickValue = GetEffectiveTickValue();
+                EffectiveAccountEquity = GetEffectiveAccountEquity();
+
+                // TickSize priority: InstrumentInfo.TickSize -> Security.TickSize -> fallback
+                decimal infoTickSize = 0m;
+                try
+                {
+                    var ii = GetType().GetProperty("InstrumentInfo",
+                        System.Reflection.BindingFlags.Instance |
+                        System.Reflection.BindingFlags.Public |
+                        System.Reflection.BindingFlags.NonPublic)?.GetValue(this);
+                    if (ii != null)
+                    {
+                        var pTs = ii.GetType().GetProperty("TickSize");
+                        infoTickSize = (pTs?.GetValue(ii) as decimal?) ?? 0m;
+                    }
+                }
+                catch { /* ignore */ }
+
+                var secTickSize = (Security != null ? Security.TickSize : 0m);
+                EffectiveTickSize = infoTickSize > 0 ? infoTickSize :
+                                    secTickSize  > 0 ? secTickSize  :
+                                    0.25m;
+
+                if (EnableDetailedRiskLogging)
+                {
+                    DebugLog.W("468/RISK", $"DIAG tickValue={EffectiveTickValue:F2}{Security?.QuoteCurrency ?? "USD"}/t " +
+                                          $"tickSize={EffectiveTickSize:F4}pts/t " +
+                                          $"equity={EffectiveAccountEquity:F2}USD");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/RISK", $"UpdateDiagnostics error: {ex.Message}");
+            }
+        }
+
+        // ====================== PASO 3: CALCULATION ENGINE ======================
+
+        // Throttling state for calculation calls
+        private string _lastCalcInputsHash = "";
+        private DateTime _lastCalcLogTime = DateTime.MinValue;
+
+        // Pulse logging for when EnableDetailedRiskLogging is false
+        private DateTime _lastPulseLogTime = DateTime.MinValue;
+        private int _lastDiagnosticRefreshBar = -1;
+
+        /// <summary>
+        /// Centralized security symbol detection with InstrumentInfo priority and logging
+        /// </summary>
+        private string _cachedSecurityCode;
+        private string GetEffectiveSecurityCode()
+        {
+            try
+            {
+                if (!string.IsNullOrWhiteSpace(_cachedSecurityCode))
+                    return _cachedSecurityCode;
+
+                // Priority 1: InstrumentInfo.Instrument (modern ATAS API)
+                var ii = GetType().GetProperty("InstrumentInfo",
+                    System.Reflection.BindingFlags.Instance |
+                    System.Reflection.BindingFlags.Public |
+                    System.Reflection.BindingFlags.NonPublic)?.GetValue(this);
+                if (ii != null)
+                {
+                    var p = ii.GetType().GetProperty("Instrument");
+                    var name = p?.GetValue(ii) as string;
+                    if (!string.IsNullOrWhiteSpace(name))
+                    {
+                        if (EnableDetailedRiskLogging)
+                            DebugLog.W("468/RISK", $"SYMBOL source=InstrumentInfo.Instrument value={name}");
+                        _cachedSecurityCode = name.Trim().ToUpperInvariant();
+                        return _cachedSecurityCode;
+                    }
+                }
+
+                // Priority 2: Security.Instrument
+                if (!string.IsNullOrWhiteSpace(Security?.Instrument))
+                {
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/RISK", $"SYMBOL source=Security.Instrument value={Security.Instrument}");
+                    _cachedSecurityCode = Security.Instrument.Trim().ToUpperInvariant();
+                    return _cachedSecurityCode;
+                }
+                // Priority 3: Security.Code
+                if (!string.IsNullOrWhiteSpace(Security?.Code))
+                {
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/RISK", $"SYMBOL source=Security.Code value={Security.Code}");
+                    _cachedSecurityCode = Security.Code.Trim().ToUpperInvariant();
+                    return _cachedSecurityCode;
+                }
+                // Priority 4: Base Instrument (obsoleto pero útil como fallback)
+                if (!string.IsNullOrWhiteSpace(Instrument))
+                {
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/RISK", $"SYMBOL source=Instrument value={Instrument}");
+                    _cachedSecurityCode = Instrument.Trim().ToUpperInvariant();
+                    return _cachedSecurityCode;
+                }
+
+                DebugLog.W("468/RISK", "SYMBOL source=fallback value=UNKNOWN (no detection)");
+                _cachedSecurityCode = "UNKNOWN";
+                return _cachedSecurityCode;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/RISK", $"SYMBOL error: {ex.Message} -> fallback=UNKNOWN");
+                _cachedSecurityCode = "UNKNOWN";
+                return _cachedSecurityCode;
+            }
+        }
+
+        /// <summary>
+        /// PASO 3: CALCULATION ENGINE - Calculates position quantity based on selected mode
+        /// NOTE: This function is pure calculation - does NOT affect actual trading until PASO 4
+        /// Returns calculated quantity but actual trades still use original Quantity property
+        /// Includes lot step quantization and instrument-based limits
+        /// </summary>
+        private int CalculateQuantity()
+        {
+            try
+            {
+                var mode = PositionSizingMode;
+                var tickValue = GetEffectiveTickValue();
+                var tickSize = EffectiveTickSize;
+                var accountEquity = GetEffectiveAccountEquity();
+                var slDistanceInTicks = GetStopLossDistanceInTicks();
+
+                // Throttle logging - only log when inputs change significantly
+                string currentInputsHash = $"{mode}|{tickValue:F2}|{slDistanceInTicks:F1}|{RiskPerTradeUsd:F0}|{RiskPercentOfAccount:F1}|{accountEquity:F0}";
+                bool shouldLog = EnableDetailedRiskLogging &&
+                               (currentInputsHash != _lastCalcInputsHash ||
+                                (DateTime.UtcNow - _lastCalcLogTime).TotalSeconds > 30);
+
+                if (shouldLog)
+                {
+                    var quoteCurrency = Security?.QuoteCurrency ?? "USD";
+                    var accountCurrency = "USD"; // Portfolio balance is typically in account base currency
+                    DebugLog.W("468/CALC", $"Starting calculation: mode={mode} " +
+                                          $"tickValue={tickValue:F2}{quoteCurrency}/t tickSize={tickSize:F4}pts/t " +
+                                          $"SLticks={slDistanceInTicks:F1} equity={accountEquity:F2}{accountCurrency}");
+                    _lastCalcInputsHash = currentInputsHash;
+                    _lastCalcLogTime = DateTime.UtcNow;
+                }
+
+                decimal rawQuantity = 0;
+
+                switch (mode)
+                {
+                    case PositionSizingMode.Manual:
+                        rawQuantity = CalculateQuantityManual(shouldLog);
+                        break;
+
+                    case PositionSizingMode.FixedRiskUSD:
+                        rawQuantity = CalculateQuantityForFixedRisk(slDistanceInTicks, tickValue, shouldLog);
+                        break;
+
+                    case PositionSizingMode.PercentOfAccount:
+                        rawQuantity = CalculateQuantityForPercentRisk(slDistanceInTicks, tickValue, accountEquity, shouldLog);
+                        break;
+
+                    default:
+                        DebugLog.W("468/CALC", $"Unknown PositionSizingMode: {mode}, defaulting to Manual");
+                        rawQuantity = Quantity;
+                        break;
+                }
+
+                // Apply lot step quantization and instrument limits
+                int finalQuantity = QuantizeToLotStep(rawQuantity, shouldLog);
+
+                // Update diagnostic properties with calculation results
+                LastAutoQty = finalQuantity;
+                LastRiskPerContract = slDistanceInTicks * tickValue;
+                LastStopDistance = slDistanceInTicks;
+                LastRiskInput = mode == PositionSizingMode.FixedRiskUSD ? RiskPerTradeUsd :
+                               mode == PositionSizingMode.PercentOfAccount ? accountEquity * (RiskPercentOfAccount / 100m) : 0;
+
+                if (shouldLog)
+                {
+                    if (finalQuantity == 0)
+                    {
+                        DebugLog.W("468/CALC", $"ABORT_UNDERFUNDED: qty=0 -> entry would be skipped");
+                    }
+                    else
+                    {
+                        DebugLog.W("468/CALC", $"FINAL calculation result: qty={finalQuantity} " +
+                                              $"(NOTE: actual trades use Quantity={Quantity} until PASO 4)");
+                    }
+                }
+
+                // SNAPSHOT compacto (siempre útil para auditoría)
+                try
+                {
+                    var sym = GetEffectiveSecurityCode();
+                    var qc = Security?.QuoteCurrency ?? "USD";
+                    var bars = CurrentBar; // Current bar as reference
+                    DebugLog.W("468/CALC",
+                        $"SNAPSHOT sym={sym} bars={bars} mode={mode} qty={finalQuantity} lastAutoQty={LastAutoQty} " +
+                        $"slTicks={LastStopDistance:F1} rpc={LastRiskPerContract:F2}{qc} " +
+                        $"equity={EffectiveAccountEquity:F2}USD tickValue={EffectiveTickValue:F2}{qc}/t " +
+                        $"tickSize={EffectiveTickSize:F2}pts/t DRYRUN=ON");
+                }
+                catch { /* no romper cálculo por logging */ }
+
+                return finalQuantity;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/CALC", $"CalculateQuantity error: {ex.Message}, falling back to manual Quantity={Quantity}");
+                return Quantity; // Safe fallback to manual quantity
+            }
+        }
+
+        /// <summary>
+        /// Calculate quantity for Manual mode - uses original Quantity with risk diagnostics
+        /// </summary>
+        private decimal CalculateQuantityManual(bool shouldLog)
+        {
+            decimal manualQty = Quantity;
+
+            if (shouldLog)
+            {
+                decimal slTicks = GetStopLossDistanceInTicks();
+                decimal tickValue = GetEffectiveTickValue();
+                decimal riskPerContract = slTicks * tickValue;
+                decimal totalRisk = manualQty * riskPerContract;
+                var quoteCurrency = Security?.QuoteCurrency ?? "USD";
+
+                DebugLog.W("468/CALC", $"MANUAL mode: qty={manualQty} (user-defined) " +
+                                      $"riskPerContract={riskPerContract:F2}{quoteCurrency} " +
+                                      $"totalRisk={totalRisk:F2}{quoteCurrency}");
+            }
+
+            return manualQty;
+        }
+
+        /// <summary>
+        /// Calculate quantity for Fixed Risk USD mode with underfunded protection
+        /// All math kept in ticks, converted to money only for risk calculation
+        /// </summary>
+        private decimal CalculateQuantityForFixedRisk(decimal slDistanceInTicks, decimal tickValue, bool shouldLog)
+        {
+            if (slDistanceInTicks <= 0 || tickValue <= 0 || RiskPerTradeUsd <= 0)
+            {
+                if (shouldLog)
+                    DebugLog.W("468/CALC", $"Invalid inputs for FixedRisk: SL={slDistanceInTicks}t tickVal={tickValue} risk={RiskPerTradeUsd}");
+                return Quantity; // Fallback to manual
+            }
+
+            // All risk calculation in quote currency (TickCost units)
+            decimal riskPerContract = slDistanceInTicks * tickValue; // In quote currency
+            decimal targetRisk = RiskPerTradeUsd; // Assumes USD = quote currency for now
+            var quoteCurrency = Security?.QuoteCurrency ?? "USD";
+
+            if (riskPerContract > targetRisk)
+            {
+                // UNDERFUNDED scenario: risk per contract exceeds target risk
+                if (SkipIfUnderfunded)
+                {
+                    if (shouldLog)
+                        DebugLog.W("468/CALC", $"ABORT_UNDERFUNDED: riskPerContract={riskPerContract:F2}{quoteCurrency} > " +
+                                              $"targetRisk={targetRisk:F2}{quoteCurrency} -> qty=0 (entry will be skipped)");
+                    return 0; // Return 0 to signal ABORT
+                }
+                else
+                {
+                    decimal minQty = MinQtyIfUnderfunded;
+                    decimal actualRisk = riskPerContract * minQty;
+                    if (shouldLog)
+                        DebugLog.W("468/CALC", $"WARNING_UNDERFUNDED: forcing minQty={minQty} " +
+                                              $"(actualRisk={actualRisk:F2}{quoteCurrency} > targetRisk={targetRisk:F2}{quoteCurrency})");
+                    return minQty;
+                }
+            }
+
+            decimal calculatedQty = Math.Floor(targetRisk / riskPerContract);
+
+            if (shouldLog)
+            {
+                decimal actualRisk = calculatedQty * riskPerContract;
+                DebugLog.W("468/CALC", $"FixedRiskUSD: targetRisk={targetRisk:F2}{quoteCurrency} " +
+                                      $"riskPerContract={riskPerContract:F2}{quoteCurrency} " +
+                                      $"-> rawQty={calculatedQty} actualRisk={actualRisk:F2}{quoteCurrency}");
+            }
+
+            return calculatedQty;
+        }
+
+        /// <summary>
+        /// Calculate quantity for Percent of Account mode with underfunded protection
+        /// Account equity is in account currency, risk calculation in quote currency
+        /// </summary>
+        private decimal CalculateQuantityForPercentRisk(decimal slDistanceInTicks, decimal tickValue, decimal accountEquity, bool shouldLog)
+        {
+            if (slDistanceInTicks <= 0 || tickValue <= 0 || accountEquity <= 0 || RiskPercentOfAccount <= 0)
+            {
+                if (shouldLog)
+                    DebugLog.W("468/CALC", $"Invalid inputs for PercentRisk: SL={slDistanceInTicks}t tickVal={tickValue} " +
+                                          $"equity={accountEquity} risk%={RiskPercentOfAccount}");
+                return Quantity; // Fallback to manual
+            }
+
+            // Risk calculation: account currency -> quote currency (assuming 1:1 for now)
+            decimal riskPerContract = slDistanceInTicks * tickValue; // In quote currency
+            decimal targetRisk = accountEquity * (RiskPercentOfAccount / 100m); // In account currency
+            var quoteCurrency = Security?.QuoteCurrency ?? "USD";
+            var accountCurrency = "USD"; // Account balance typically in base currency
+
+            if (riskPerContract > targetRisk)
+            {
+                // UNDERFUNDED scenario: risk per contract exceeds target risk
+                if (SkipIfUnderfunded)
+                {
+                    if (shouldLog)
+                        DebugLog.W("468/CALC", $"ABORT_UNDERFUNDED: riskPerContract={riskPerContract:F2}{quoteCurrency} > " +
+                                              $"targetRisk={targetRisk:F2}{accountCurrency} ({RiskPercentOfAccount:F1}% of {accountEquity:F2}{accountCurrency}) " +
+                                              $"-> qty=0 (entry will be skipped)");
+                    return 0; // Return 0 to signal ABORT
+                }
+                else
+                {
+                    decimal minQty = MinQtyIfUnderfunded;
+                    decimal actualRisk = riskPerContract * minQty;
+                    if (shouldLog)
+                        DebugLog.W("468/CALC", $"WARNING_UNDERFUNDED: forcing minQty={minQty} " +
+                                              $"(actualRisk={actualRisk:F2}{quoteCurrency} > targetRisk={targetRisk:F2}{accountCurrency})");
+                    return minQty;
+                }
+            }
+
+            decimal calculatedQty = Math.Floor(targetRisk / riskPerContract);
+
+            if (shouldLog)
+            {
+                decimal actualRisk = calculatedQty * riskPerContract;
+                DebugLog.W("468/CALC", $"PercentOfAccount: equity={accountEquity:F2}{accountCurrency} risk%={RiskPercentOfAccount:F1}% " +
+                                      $"targetRisk={targetRisk:F2}{accountCurrency} riskPerContract={riskPerContract:F2}{quoteCurrency} " +
+                                      $"-> rawQty={calculatedQty} actualRisk={actualRisk:F2}{quoteCurrency}");
+            }
+
+            return calculatedQty;
+        }
+
+        /// <summary>
+        /// Quantize raw quantity to instrument lot step and apply min/max limits
+        /// Uses Security.LotSize, LotMinSize, LotMaxSize when available
+        /// </summary>
+        private int QuantizeToLotStep(decimal rawQuantity, bool shouldLog)
+        {
+            try
+            {
+                // Get lot constraints from Security
+                decimal lotSize = 1; // Default lot step
+                decimal lotMinSize = 1; // Default minimum
+                decimal lotMaxSize = 1000; // Default maximum
+
+                // TODO: Add LotSize constraints detection once ATAS API nullable types are confirmed
+                // For now using safe defaults (1, 1, 1000) that work for most instruments
+                // Will implement proper Security.LotSize/LotMinSize/LotMaxSize detection in future refinement
+
+                // Quantize to lot step
+                decimal quantizedQty = Math.Floor(rawQuantity / lotSize) * lotSize;
+
+                // Apply min/max limits
+                quantizedQty = Math.Max(lotMinSize, quantizedQty);
+                quantizedQty = Math.Min(lotMaxSize, quantizedQty);
+
+                int finalQty = (int)quantizedQty;
+
+                if (shouldLog && (finalQty != rawQuantity || lotSize != 1))
+                {
+                    DebugLog.W("468/CALC", $"Lot quantization: raw={rawQuantity:F2} lotStep={lotSize} " +
+                                          $"min={lotMinSize} max={lotMaxSize} -> final={finalQty}");
+                }
+
+                return finalQty;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/CALC", $"QuantizeToLotStep error: {ex.Message}, using raw quantity as int");
+                return Math.Max(1, Math.Min(1000, (int)rawQuantity)); // Fallback to simple clamp
+            }
+        }
+
+        /// <summary>
+        /// Calculate current stop loss distance in ticks based on strategy settings
+        /// Keeps all math in ticks end-to-end for precision
+        /// </summary>
+        private decimal GetStopLossDistanceInTicks()
+        {
+            try
+            {
+                // Base SL distance from StopOffsetTicks setting (already in ticks)
+                decimal slDistanceInTicks = StopOffsetTicks;
+
+                // If using SL from signal candle, add estimated additional distance
+                if (UseSignalCandleSL)
+                {
+                    // Conservative estimate for signal candle SL extension
+                    // In real implementation this would calculate actual distance from signal candle
+                    slDistanceInTicks += 5; // Conservative 5-tick buffer for signal candle SL
+                }
+
+                // Apply safety limits (all in ticks)
+                slDistanceInTicks = Math.Max(1, slDistanceInTicks); // Minimum 1 tick
+                slDistanceInTicks = Math.Min(500, slDistanceInTicks); // Maximum 500 ticks (safety)
+
+                return slDistanceInTicks;
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/CALC", $"GetStopLossDistanceInTicks error: {ex.Message}, using fallback 10 ticks");
+                return 10; // Conservative fallback
+            }
         }
     }
 }

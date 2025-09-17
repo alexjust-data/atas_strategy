@@ -1,272 +1,337 @@
-# 🔍 ANÁLISIS DETECTIVESCO EXHAUSTIVO - ESCENARIO A
+# 🔍 ANÁLISIS FORENSE - Risk Management Session A_baseline
 
 **Fecha**: 2025-09-17
-**Escenario**: A - Baseline (ambas confluencias activas)
+**Sesión**: ATAS_SESSION_LOG_A_Risk_results.txt
+**Analista**: Claude Code
+**Framework**: Test Scenarios Risk Management v2.2
 
 ---
 
-## 🚨 BUG CRÍTICO IDENTIFICADO: Inconsistencia en CONF#1 Slope Calculation
+## 🎯 **OBJETIVO DEL ANÁLISIS**
 
-### PATRÓN DETECTADO:
-```
-Señal CAPTURE → CROSS DETECTED → CONF#1 calcula slope OPUESTA → ABORT ENTRY
-```
-
-### EVIDENCIA IRREFUTABLE:
-
-#### 🔍 CASO 1 - BUY N=17545 (09:41:23): FALSO NEGATIVO DETECTADO
-```
-CAPTURE: N=17545 BUY uid=32b6d1f3 ✅ (señal válida)
-GENIAL CROSS detected: Up at bar=17545 ✅ (cross correcto)
-CONF#1 (GL slope @N+1) trend=DOWN -> FAIL ❌ (CONTRADICCIÓN)
-ABORT ENTRY: Conf#1 failed
-```
-**CONTRADICCIÓN**: Cross dice "UP" pero slope calcula "DOWN"
-
-#### 🔍 CASO 2 - SELL N=17582 (09:42:18): OTRO FALSO NEGATIVO
-```
-CAPTURE: N=17582 SELL uid=29262bbb ✅ (señal válida)
-GENIAL CROSS detected: Down at bar=17582 ✅ (cross correcto)
-CONF#1 (GL slope @N+1) trend=UP -> FAIL ❌ (CONTRADICCIÓN)
-ABORT ENTRY: Conf#1 failed
-```
-**CONTRADICCIÓN**: Cross dice "DOWN" pero slope calcula "UP"
-
-#### 🔍 CASOS ADICIONALES CONFIRMADOS:
-- **Caso SELL N=17593**: Cross DOWN → CONF#1 trend=UP → FAIL ❌
-- **Caso BUY N=17620**: Cross UP → CONF#1 trend=DOWN → FAIL ❌
-- **Caso SELL N=17605**: Cross DOWN → CONF#1 trend=UP → FAIL ❌
+Validar el **PASO 3 - Risk Management Calculation Engine** implementado según la documentación completa:
+- Position Sizing: 3 modos (Manual/FixedRiskUSD/PercentOfAccount)
+- Auto-Detection: Tick values + Account equity
+- Underfunded Protection: Skip/Force logic
+- Comprehensive Logging: Tags 468/RISK, 468/CALC, etc.
 
 ---
 
-## 🔬 ANÁLISIS TÉCNICO DEL BUG
+## 🚨 **RESUMEN EJECUTIVO**
 
-### RAÍZ DEL PROBLEMA
-El sistema muestra **inconsistencia sistemática** entre:
-1. **Cross Detection** (sistema de señales) - Funciona correctamente
-2. **CONF#1 Slope Calculation** (validación de confluencias) - Calcula slope opuesta
+### ❌ **FALLO CRÍTICO: Sistema Risk Management NO Ejecutado**
 
-### EVIDENCIA TÉCNICA
-```
-Log pattern: "CONF#1 (GL slope) using N/N-1 (series not ready at N+1)"
-```
+**Diagnóstico Principal**: El sistema de Risk Management **no se inicializó** durante la sesión debido a **Indicator Attachment Failure**.
 
-**HIPÓTESIS**:
-- Cross Detection usa valores en tiempo real
-- CONF#1 usa datos históricos N/N-1 por "series not ready at N+1"
-- Esto causa **desfase temporal** y cálculo de slope **invertida**
+**Impacto**:
+- ❌ No hay eventos 468/RISK o 468/CALC
+- ❌ No hay cálculos de position sizing
+- ❌ No hay validación de underfunded protection
+- ❌ No hay diagnósticos en tiempo real
 
-### PATRÓN CONSISTENTE
-**100% de los falsos negativos siguen este patrón**:
-```
-Cross UP → CONF#1 calcula DOWN → FAIL
-Cross DOWN → CONF#1 calcula UP → FAIL
-```
+**Status PASO 3**: ❌ **NO VALIDADO** - Requiere re-deploy y re-test
 
 ---
 
-## 📊 ESTADÍSTICAS DE FALSOS NEGATIVOS
+## 📊 **ANÁLISIS DETALLADO**
 
-**Total CAPTUREs**: 14 señales
-- **Ejecutadas**: 1 (7.1%) ✅ Correcto
-- **Bloqueadas por Guard**: 7 (50.0%) ✅ Correcto
-- **Falsos Negativos por CONF#1**: 4 (28.6%) ❌ **BUG CRÍTICO**
-- **Otros fallos**: 2 (14.3%) ⚪ Investigar
+### 1. **INICIALIZACIÓN DEL SISTEMA**
 
----
-
-## 🎯 IMPACTO Y CONCLUSIONES
-
-### IMPACTO DEL BUG
-- **28.6% de señales válidas se pierden** por inconsistencia en CONF#1
-- El sistema funciona a **menos del 35%** de su capacidad real
-- **OnlyOnePosition guard funciona perfectamente**
-- **CONF#2 (EMA8 vs Wilder8) funciona correctamente**
-
-### VERIFICACIÓN POSITIVA
-La única ejecución exitosa confirma que **cuando ambas confluencias están alineadas correctamente, el sistema ejecuta perfectamente**:
+#### ✅ **Assembly Loading - CORRECTO**
 ```
-09:37:32: CONF#1 trend=DOWN -> OK + CONF#2 SELL -> OK → MARKET SENT ✅
-- Timing correcto
-- Brackets correctos
-- TP ejecutado exitosamente
+[14:18:50.236] WARNING  468/STR-ASM: Loaded DLL= v=1.0.0.0 | Strategies found=1
+[14:18:50.245] WARNING  468/STR-ASM: Strategy type: MyAtas.Strategies.FourSixEightSimpleStrategy
+[14:19:21.022] WARNING  468/IND-ASM: Loaded DLL= v=1.0.0.0 | Indicators found=1
+[14:19:21.023] WARNING  468/IND-ASM: Indicator type: MyAtas.Indicators.FourSixEightIndicator
 ```
 
-### ELEMENTOS QUE FUNCIONAN CORRECTAMENTE
-1. ✅ **Sistema de captura de señales**
-2. ✅ **Cross detection de GenialLine**
-3. ✅ **CONF#2 (EMA8 vs Wilder8)**
-4. ✅ **OnlyOnePosition guard** (bloqueo perfecto)
-5. ✅ **Sistema de brackets** (TP ejecutado correctamente)
-6. ✅ **Timing y tolerancias**
-7. ✅ **Order management**
+**✅ Validación**:
+- Strategy Assembly: ✅ Cargada (FourSixEightSimpleStrategy)
+- Indicator Assembly: ✅ Cargada (FourSixEightIndicator)
+- Versión: ✅ v=1.0.0.0
 
----
-
-## 🔧 ACCIÓN CRÍTICA REQUERIDA
-
-**FIX URGENTE**: Revisar y corregir el código de `CONF#1` slope calculation en `FourSixEightConfluencesStrategy_Simple.cs` para:
-
-1. **Sincronizar** con el sistema de cross detection
-2. **Eliminar** el uso de N/N-1 cuando "series not ready at N+1"
-3. **Usar** los mismos datos que el cross detection
-4. **Verificar** que slope calculation sea consistente con cross direction
-
----
-
-## 🏆 VEREDICTO FINAL
-
-**El Escenario A confirma que la arquitectura general es sólida, pero hay un bug específico en CONF#1 que reduce significativamente la efectividad del sistema.**
-
-**ARQUITECTURA SÓLIDA con BUG CRÍTICO localizado**
-
----
-
-# 💰 ANÁLISIS FORENSE - SISTEMA DE RISK MANAGEMENT
-
-**Sistema**: Risk Management v2.2 (FixedRiskUSD + Breakeven System)
-**Trade Analizado**: SELL N=17526 (única ejecución exitosa)
-
----
-
-## ✅ SISTEMA RISK MANAGEMENT - FUNCIONAMIENTO PERFECTO
-
-### CONFIGURACIÓN VERIFICADA:
+#### ❌ **Indicator Attachment - FALLO CRÍTICO**
 ```
-Position Sizing Mode: FixedRiskUSD
-Risk per trade (USD): 100.00
-Account Equity Override: 650.00
-Tick Value Override (MNQ): 0.50
-Skip if underfunded: ✅
-Enable detailed risk logging: ✅
+[14:19:21.028] WARNING  468/STR: WARNING: Could not attach indicator (method not found in hierarchy)
 ```
 
-### EJECUCIÓN DETALLADA DEL TRADE:
-```
-[09:37:32.001] MARKET ORDER SENT: SELL 7 at N+1 (bar=17527)
+**❌ Problema**:
+- **Reflection hierarchy traversal failed**
+- **Patrón repetitivo**: Se repite 3 veces en la sesión (líneas 20, 11454, 75098)
+- **Consequence**: Sin indicador GenialLine → No signals → No Risk Management
 
-CÁLCULO AUTOMÁTICO:
-- Target risk: $100.00
-- SL distance: 13 ticks @ $0.25/tick = $6.50 risk per contract
-- Quantity calculada: 15 contratos
-- Quantity ejecutada: 7 contratos (ajuste interno)
-- Risk efectivo: $45.50 (dentro del target $100)
+#### ❌ **Risk Management Initialization - NO ENCONTRADA**
 
-PRECIOS:
-- Entry: ~19893.75 (precio real de mercado)
-- SL: 19900.25 (+6.5 pts, +13 ticks)
-- TP1: 19887.25 (-6.25 pts, 1R)
-- TP2: 19880.75 (-12.5 pts, 2R)
-```
+**Eventos Esperados pero AUSENTES**:
+```bash
+# Esperado:
+468/RISK SNAPSHOT uid=... ts=... instr=... mode=... tickCost=... equity=...
+468/CALC IN uid=... mode=FixedRiskUSD slTicks=... tickCost=... equity=...
+DIAG [init] sym=... tickSize=... tickVal=... equity=...
 
-### BRACKETS POST-FILL:
-```
-[09:37:32.005] STOP submitted: Buy 4 @19900,25 OCO=eaae30
-[09:37:32.006] LIMIT submitted: Buy 4 @19887,25 (468TP1)
-[09:37:32.006] STOP submitted: Buy 3 @19900,25 OCO=18b862
-[09:37:32.007] LIMIT submitted: Buy 3 @19880,75 (468TP2)
-[09:37:32.007] BRACKETS: SL=19900,25 | TPs=19887,25,19880,75 | Split=[4,3] | Total=7
-```
-
-### RESULTADO TRADE:
-```
-✅ Entry: Exitosa a precio de mercado
-✅ Risk Management: Perfecto (risk real < target)
-✅ Brackets: Creados correctamente
-✅ TP1 FILL: 09:40:41.659 - 4 contratos cerrados
-✅ Position Sizing: Automático y preciso
+# Encontrado:
+grep -n "468/RISK\|468/CALC\|DIAG" → No matches found
 ```
 
 ---
 
-## 🚨 BUG BREAKEVEN IDENTIFICADO
+### 2. **ANÁLISIS DE HERRAMIENTAS DE DEPLOY**
 
-### PROBLEMA ESPECÍFICO: Entry Price = 0.00
+#### 📦 **deploy_risk_management.ps1 - Análisis**
 
-```
-[09:37:32.009] Entry price tracked: 0,00 (source: fill) ❌
+**Funcionalidad Implementada**:
+- ✅ Build process (Debug/Release)
+- ✅ Auto-deploy via deploy_all.ps1
+- ✅ Auto-detect runtime log paths
+- ✅ Filtered views creation (CALC, DIAG, POS/ORD)
+- ✅ Real-time tailing capability
 
-DIAGNÓSTICO:
-- TP1 fill detectado correctamente: ✅
-- Breakeven trigger activado: ✅
-- Entry price = 0.00 impide ejecución: ❌
-```
+**Proceso Esperado**:
+1. Build → Deploy → Process logs → Create filtered views
+2. Output: `risk_calc_*.log`, `risk_diag_*.log`, `risk_pos_ord_*.log`
 
-### CAUSA RAÍZ:
-```
-Función GetOrderFillPrice() busca estas propiedades:
-["AvgFillPrice", "AveragePrice", "AvgPrice", "FillPrice", "ExecutedPrice", "LastFillPrice", "Price"]
+**Problema Identificado**:
+- El script **NO ejecutó** durante esta sesión
+- **Evidence**: No filtered log files in session
+- **Probable Cause**: Usuario usó deploy_all.ps1 en lugar de deploy_risk_management.ps1
 
-PROBLEMA: En órdenes MARKET, estas propiedades no están disponibles
-inmediatamente post-fill en ATAS, devolviendo 0.00
-```
+#### 🔧 **tail_risk.ps1 - Análisis**
 
-### EVIDENCIA:
-```
-[09:40:41.660] TP1 fill detected (468TP1:073732:eaae30), triggering breakeven ✅
-CONDICIÓN FALLIDA: if (_entryPrice <= 0) return;
-RESULTADO: Breakeven NO ejecutado
-```
+**Capacidades**:
+- ✅ Real-time monitoring con color coding
+- ✅ Tag filtering (468/CALC, 468/RISK, etc.)
+- ✅ Output file creation
+- ✅ Duration control
 
-### IMPACTO:
-- ✅ **Trade execution**: No afectada
-- ✅ **Risk management**: No afectada
-- ✅ **Brackets**: No afectados
-- ❌ **Breakeven automático**: No funciona
+**Estado**: **NO UTILIZADO** durante la sesión
 
 ---
 
-## 🎯 VALIDACIÓN COMPLETA DEL SISTEMA
+### 3. **ANÁLISIS DE SIGNALS Y CONFLUENCIAS**
 
-### ELEMENTOS 100% FUNCIONALES:
-1. ✅ **Position Sizing Automático**: FixedRiskUSD mode perfecto
-2. ✅ **Risk Calculation**: Preciso y confiable
-3. ✅ **Account Detection**: Manual override + auto-detection
-4. ✅ **Tick Value Detection**: Override system + fallbacks
-5. ✅ **Underfunded Protection**: Funcionando correctamente
-6. ✅ **Quantity Calculation**: Automático y ajustado al risk
-7. ✅ **Trade Execution**: Market orders perfectas
-8. ✅ **Bracket Management**: OCO groups correctos
-9. ✅ **TP Detection**: Labels 468TP1/TP2 funcionando
-10. ✅ **Risk Diagnostics**: Logging detallado operativo
+#### ❌ **Signal Detection - COMPLETAMENTE AUSENTE**
 
-### BUG MENOR LOCALIZADO:
-❌ **Entry Price Capture**: Requiere fallback para órdenes MARKET
-
-### COMPARACIÓN CON BASELINE:
-- **Baseline**: 3 contratos fijos, sin risk management
-- **Risk Management**: 7 contratos calculados, risk controlado
-- **Resultado**: MISMO trade, mejor gestión de riesgo
-
----
-
-## 🔧 FIX REQUERIDO PARA BREAKEVEN
-
-### SOLUCIÓN SIMPLE (1 línea):
-```csharp
-// En OnOrderChanged(), después de GetOrderFillPrice():
-if (_entryPrice <= 0) {
-    _entryPrice = GetCandle(CurrentBar).Close;
-    DebugLog.W("468/BREAKEVEN", $"Entry price tracked: {_entryPrice:F2} (source: market fallback)");
-}
+```bash
+# Búsqueda de eventos esperados:
+grep -n "CAPTURE\|SIGNAL_CHECK\|CONF" → No matches found
 ```
 
-### VALIDACIÓN POST-FIX:
-- Breakeven se ejecutará correctamente en TP1 fill
-- Entry price será el precio real de mercado
-- Sistema 100% operacional
+**Eventos Ausentes**:
+- `CAPTURE: N=... uid=...` (Signal detection)
+- `SIGNAL_CHECK uid=...` (Signal validation)
+- `CONF#1 ... -> (OK|FAIL)` (GenialLine slope validation)
+- `CONF#2 ... -> (OK|FAIL)` (EMA8 vs Wilder8 validation)
+
+**Root Cause**: **Indicator attachment failure** → No GenialLine data → No signals
 
 ---
 
-## 🏆 VEREDICTO RISK MANAGEMENT
+### 4. **VALIDACIÓN SEGÚN FRAMEWORK v2.2**
 
-**El sistema de Risk Management está 95% funcional con performance excelente. Solo requiere un fix menor de 1 línea para el breakeven.**
+#### **G1 - Fixed Risk USD with Auto-detection**
+**Status**: ❌ **NO EJECUTADO**
+- **Esperado**: `468/CALC FIXED uid=... targetRisk=100USD qtyFinal=28`
+- **Encontrado**: No calculation events
+- **Reason**: System not initialized
 
-### RESUMEN EJECUTIVO:
-- ✅ **Sistema Principal**: 100% funcional y preciso
-- ✅ **Cálculos**: Automáticos y correctos
-- ✅ **Trade Management**: Perfecto
-- ✅ **Risk Control**: Excelente
-- ❌ **Breakeven**: Fix menor de entry price capture
+#### **G2 - Percent of Account with Equity Detection**
+**Status**: ❌ **NO EJECUTADO**
+- **Esperado**: `468/CALC PCT uid=... equity=25000USD pct=0.50% qtyFinal=35`
+- **Encontrado**: No auto-detection events
+- **Reason**: No risk management initialization
 
-**SISTEMA RISK MANAGEMENT EXCELENTE con fix menor pendiente**
+#### **G3 - Enhanced Override System**
+**Status**: ❌ **NO TESTEABLE**
+- **Esperado**: `468/RISK OVERRIDE uid=... raw="MNQ=0.5;NQ=5" hit=true`
+- **Encontrado**: No override parsing
+- **Reason**: CSV parser never invoked
+
+#### **G4 - Underfunded Protection**
+**Status**: ❌ **NO TESTEABLE**
+- **Esperado**: `468/CALC UNDERFUNDED action=ABORT` (if triggered)
+- **Encontrado**: No protection logic executed
+- **Reason**: No risk calculations performed
+
+#### **G5 - Real-time Diagnostics**
+**Status**: ❌ **NO EJECUTADO**
+- **Esperado**: `DIAG [init]` o `DIAG [manual-refresh]`
+- **Encontrado**: No diagnostic events
+- **Reason**: Diagnostic system not triggered
+
+#### **G6 - Multi-Instrument with Preset**
+**Status**: ❌ **NO TESTEABLE**
+- **Reason**: No instrument processing occurred
+
+---
+
+### 5. **STRATEGY LOOP ANALYSIS**
+
+#### ✅ **Basic Strategy Execution - FUNCIONANDO**
+```
+[14:19:21.034] WARNING  468/STR: OnCalculate: bar=0 t=22:00:00 pending=NO tradeActive=False
+[14:19:21.037] WARNING  468/STR: OnCalculate: bar=1 t=22:00:00 pending=NO tradeActive=False
+```
+
+**✅ Observaciones**:
+- OnCalculate: ✅ Ejecutándose correctamente
+- Bar progression: ✅ Normal (bar=0, 1, 2, 3...)
+- State tracking: ✅ pending=NO, tradeActive=False
+
+#### ⚠️ **Position Detection Issues**
+```
+[14:19:21.036] WARNING  468/POS: GetNetPosition: all strategies failed, returning 0
+```
+
+**⚠️ Warning**: Indica potential issues en position detection, pero net=0 es correcto para inicio
+
+---
+
+### 6. **ROOT CAUSE ANALYSIS**
+
+#### **Primary Failure Chain**:
+```
+1. Indicator Assembly ✅ Loaded
+2. Indicator Attachment ❌ FAILED (reflection hierarchy)
+3. GenialLine Connection ❌ NO DATA
+4. Signal Detection ❌ NO SIGNALS
+5. Risk Management Trigger ❌ NEVER CALLED
+6. Position Sizing Calculations ❌ NOT EXECUTED
+```
+
+#### **Critical Dependencies**:
+- **GenialLine Indicator** → Required for price/MA crossover signals
+- **Signal Detection** → Triggers Risk Management initialization
+- **Risk Management** → Depends on signal events to start calculations
+
+#### **Reflection Hierarchy Issue**:
+- **Error**: "method not found in hierarchy"
+- **Impact**: Strategy cannot access indicator methods
+- **Pattern**: Consistent failure across multiple restarts
+- **Solution**: Deploy issue or indicator method signature mismatch
+
+---
+
+## 🛠️ **DIAGNÓSTICO Y SOLUCIONES**
+
+### **Problema Inmediato**: Deployment Issue
+
+#### **Probable Causes**:
+1. **Incorrect deployment tool used**: `deploy_all.ps1` instead of `deploy_risk_management.ps1`
+2. **Indicator/Strategy version mismatch**: Reflection signatures don't match
+3. **ATAS cache issue**: Old DLLs cached, new ones not loaded
+4. **Missing dependencies**: Risk Management components not deployed
+
+#### **Recommended Solutions**:
+
+1. **Re-deploy with correct tool**:
+   ```bash
+   tools/deploy_risk_management.ps1 -RuntimeLogPath "logs/current/ATAS_SESSION_LOG.txt"
+   ```
+
+2. **Verify deployment**:
+   ```bash
+   # Check DLL timestamps in ATAS directory
+   ls -la "C:\Users\AlexJ\AppData\Roaming\ATAS\Strategies\"
+   ```
+
+3. **Clear ATAS cache**:
+   - Complete ATAS restart
+   - Clear strategy cache if available
+
+4. **Validate post-deploy**:
+   ```bash
+   # Must see in logs after restart:
+   grep -n "INIT OK.*attached via reflection" logs/current/ATAS_SESSION_LOG.txt
+   grep -n "468/RISK SNAPSHOT" logs/current/ATAS_SESSION_LOG.txt
+   ```
+
+---
+
+### **Testing Protocol Post-Fix**:
+
+#### **Phase 1: Validation**
+- [ ] Deploy using `deploy_risk_management.ps1`
+- [ ] Restart ATAS completely
+- [ ] Verify "INIT OK" in logs
+- [ ] Verify "468/RISK SNAPSHOT" appears
+
+#### **Phase 2: Basic Risk Management Test**
+- [ ] Set `PositionSizingMode = FixedRiskUSD`
+- [ ] Set `RiskPerTradeUsd = 50`
+- [ ] Trigger `RefreshDiagnostics = true`
+- [ ] Expect: `DIAG [manual-refresh]` in logs
+
+#### **Phase 3: Signal + Calculation Test**
+- [ ] Wait for market signal
+- [ ] Expect: `CAPTURE → 468/CALC IN → 468/CALC FIXED → 468/CALC OUT`
+- [ ] Verify calculated quantities are reasonable
+
+---
+
+## 📈 **MÉTRICAS DE VALIDACIÓN**
+
+### **Expected vs Actual**:
+
+| Metric | Expected | Actual | Status |
+|--------|----------|---------|---------|
+| Assembly Load | ✅ Strategy + Indicator | ✅ Both loaded | ✅ PASS |
+| Indicator Attachment | ✅ Reflection success | ❌ Method not found | ❌ FAIL |
+| Risk Management Init | ✅ 468/RISK SNAPSHOT | ❌ No events | ❌ FAIL |
+| Position Sizing Calcs | ✅ 468/CALC events | ❌ No events | ❌ FAIL |
+| Signal Detection | ✅ CAPTURE/CONF events | ❌ No events | ❌ FAIL |
+| Diagnostics | ✅ DIAG events | ❌ No events | ❌ FAIL |
+
+### **Overall System Health**: ❌ **0% Functional**
+
+---
+
+## 🎯 **CONCLUSIONES Y RECOMENDACIONES**
+
+### **Conclusión Principal**:
+**PASO 3 Risk Management System NO VALIDADO** debido a fallo en deployment/indicator attachment.
+
+### **Acciones Inmediatas Requeridas**:
+
+1. **🚀 CRITICAL**: Re-deploy using `deploy_risk_management.ps1`
+2. **🔍 VERIFY**: Confirm indicator attachment success in logs
+3. **🧪 TEST**: Execute basic risk management validation protocol
+4. **📊 VALIDATE**: Confirm all 6 test scenarios (G1-G6) before PASO 4
+
+### **Blockers para PASO 4**:
+- ❌ Indicator attachment must be resolved
+- ❌ Risk Management initialization must be confirmed
+- ❌ Position sizing calculations must be validated
+- ❌ Basic signal flow must be working
+
+### **Next Session Requirements**:
+1. Use `deploy_risk_management.ps1` (NOT deploy_all.ps1)
+2. Verify "INIT OK" and "468/RISK SNAPSHOT" in logs
+3. Test all 3 position sizing modes
+4. Validate underfunded protection
+5. Confirm diagnostic system functionality
+
+---
+
+## 📋 **ANEXOS**
+
+### **Commands Used for Analysis**:
+```bash
+# Main analysis commands
+grep -n "468/" ATAS_SESSION_LOG_A_Risk_results.txt
+grep -n "Could not attach" ATAS_SESSION_LOG_A_Risk_results.txt
+grep -n "ASM" ATAS_SESSION_LOG_A_Risk_results.txt
+grep -n "CAPTURE\|SIGNAL_CHECK\|CONF" ATAS_SESSION_LOG_A_Risk_results.txt
+grep -n "DIAG\|manual-refresh\|init" ATAS_SESSION_LOG_A_Risk_results.txt
+```
+
+### **Tools Available for Next Session**:
+- `tools/deploy_risk_management.ps1` - Proper deployment tool
+- `tools/tail_risk.ps1` - Real-time monitoring
+- `tools/filter_risk.ps1` - Log filtering
+- `tools/extract_uid.ps1` - UID timeline extraction
+
+---
+
+**Análisis completado por Claude Code según Test Scenarios Risk Management Framework v2.2**
+**Status**: ❌ **RE-DEPLOY REQUIRED**
+**Next Milestone**: Successful PASO 3 validation before PASO 4 Integration
