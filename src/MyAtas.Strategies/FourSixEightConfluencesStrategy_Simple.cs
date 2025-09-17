@@ -4,8 +4,6 @@ using System.ComponentModel;
 using System.Linq;
 using System.Reflection;
 using System.Collections;
-using System.Text.RegularExpressions;
-using System.Threading.Tasks;
 using ATAS.Strategies.Chart;
 using ATAS.Types;
 using ATAS.DataFeedsCore;
@@ -16,8 +14,10 @@ namespace MyAtas.Strategies
 {
     public enum EmaWilderRule { Strict, Inclusive, Window }
     public enum AntiFlatMode { TimeOnly, BarsOnly, Hybrid }
-    public enum SizingMode { Manual = 0, FixedRiskUSD = 1, PercentOfAccount = 2 }
-    public enum BreakEvenMode { Off = 0, Manual = 1, OnTPFill = 2, OnTPTouch = 3 }
+
+    // ====================== RISK MANAGEMENT ENUMS ======================
+    public enum PositionSizingMode { Manual, FixedRiskUSD, PercentOfAccount }
+    public enum BreakevenMode { Disabled, Manual, OnTPFill }
 
     [DisplayName("468 – Simple Strategy (GL close + 2 confluences) - FIXED")]
     public class FourSixEightSimpleStrategy : ChartStrategy
@@ -25,31 +25,6 @@ namespace MyAtas.Strategies
         // ====================== USER PARAMETERS ======================
         [Category("General"), DisplayName("Quantity")]
         public int Quantity { get; set; } = 1;
-
-        // ====================== RISK / POSITION SIZING (NEW) ======================
-        [Category("Risk/Position Sizing"), DisplayName("Position Sizing Mode")]
-        public SizingMode PositionSizingMode { get; set; } = SizingMode.Manual;
-
-        [Category("Risk/Position Sizing"), DisplayName("Risk per trade (USD)")]
-        public decimal RiskPerTradeUsd { get; set; } = 50m;
-
-        [Category("Risk/Position Sizing"), DisplayName("Risk % of account")]
-        public decimal RiskPercentOfAccount { get; set; } = 0.5m;
-
-        [Category("Risk/Position Sizing"), DisplayName("Manual account equity override")]
-        public decimal ManualAccountEquity { get; set; } = 0m;
-
-        [Category("Risk/Position Sizing"), DisplayName("Tick value overrides (SYM=VAL;SYM=VAL or SYM,VAL;...)")]
-        public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10";
-
-        [Category("Risk/Position Sizing"), DisplayName("Skip trade if underfunded")]
-        public bool SkipIfUnderfunded { get; set; } = true;
-
-        [Category("Risk/Position Sizing"), DisplayName("Min qty if underfunded")]
-        public int MinQtyIfUnderfunded { get; set; } = 1;
-
-        [Category("Risk/Position Sizing"), DisplayName("Enable detailed risk logging")]
-        public bool EnableRiskLogging { get; set; } = true;
 
         [Category("Validation"), DisplayName("Validate GL cross on close (N)")]
         public bool ValidateGenialCrossLocally { get; set; } = true;
@@ -105,25 +80,6 @@ namespace MyAtas.Strategies
         [Category("Risk/Targets"), DisplayName("TP3 (R multiple)")]
         public decimal TP3_R { get; set; } = 3.0m;
 
-        // ====================== BREAKEVEN ======================
-        [Category("Breakeven"), DisplayName("Breakeven mode")]
-        public BreakEvenMode BreakevenMode { get; set; } = BreakEvenMode.Off;
-
-        [Category("Breakeven"), DisplayName("Breakeven offset (ticks)")]
-        public int BreakevenOffsetTicks { get; set; } = 1;
-
-        [Category("Breakeven"), DisplayName("Trigger breakeven manually")]
-        public bool TriggerBreakevenManually { get; set; } = false;
-
-        [Category("Breakeven"), DisplayName("Trigger on TP1 touch/fill")]
-        public bool BreakevenOnTP1 { get; set; } = false;
-
-        [Category("Breakeven"), DisplayName("Trigger on TP2 touch/fill")]
-        public bool BreakevenOnTP2 { get; set; } = false;
-
-        [Category("Breakeven"), DisplayName("Trigger on TP3 touch/fill")]
-        public bool BreakevenOnTP3 { get; set; } = true;
-
         // --- Execution Control ---
         [Category("Execution"), DisplayName("Attach brackets from actual net fill")]
         public bool AttachBracketsFromNet { get; set; } = true;
@@ -164,17 +120,61 @@ namespace MyAtas.Strategies
         [Category("Risk/Timing"), DisplayName("Enable flat watchdog failsafe")]
         public bool EnableFlatWatchdog { get; set; } = true;
 
+        // ====================== RISK MANAGEMENT PARAMETERS ======================
+
+        // --- Position Sizing ---
+        [Category("Risk Management/Position Sizing"), DisplayName("Position Sizing Mode")]
+        public PositionSizingMode PositionSizingMode { get; set; } = PositionSizingMode.Manual;
+
+        [Category("Risk Management/Position Sizing"), DisplayName("Risk per trade (USD)")]
+        public decimal RiskPerTradeUsd { get; set; } = 100.0m;
+
+        [Category("Risk Management/Position Sizing"), DisplayName("Risk % of account")]
+        public decimal RiskPercentOfAccount { get; set; } = 0.5m;
+
+        [Category("Risk Management/Position Sizing"), DisplayName("Manual account equity override")]
+        public decimal ManualAccountEquityOverride { get; set; } = 0.0m;
+
+        [Category("Risk Management/Position Sizing"), DisplayName("Tick value overrides (SYM=V)")]
+        public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5";
+
+        [Category("Risk Management/Position Sizing"), DisplayName("Enable detailed risk logging")]
+        public bool EnableDetailedRiskLogging { get; set; } = false;
+
+        // --- Breakeven ---
+        [Category("Risk Management/Breakeven"), DisplayName("Breakeven mode")]
+        public BreakevenMode BreakevenMode { get; set; } = BreakevenMode.Disabled;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Breakeven offset (ticks)")]
+        public int BreakevenOffsetTicks { get; set; } = 4;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Trigger breakeven manually")]
+        public bool TriggerBreakevenManually { get; set; } = false;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Trigger on TP1 touch/fill")]
+        public bool TriggerOnTP1TouchFill { get; set; } = true;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Trigger on TP2 touch/fill")]
+        public bool TriggerOnTP2TouchFill { get; set; } = false;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Trigger on TP3 touch/fill")]
+        public bool TriggerOnTP3TouchFill { get; set; } = false;
+
+        // --- Diagnostics (Read-only) ---
+        [Category("Risk Management/Diagnostics"), DisplayName("Effective tick value (USD/tick)")]
+        [ReadOnly(true)]
+        public decimal EffectiveTickValue { get; private set; } = 0.5m;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("Effective tick size (points/tick)")]
+        [ReadOnly(true)]
+        public decimal EffectiveTickSize { get; private set; } = 0.25m;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("Effective account equity (USD)")]
+        [ReadOnly(true)]
+        public decimal EffectiveAccountEquity { get; private set; } = 10000.0m;
+
         // ====================== INTERNAL STATE ======================
         private FourSixEightIndicator _ind;
-
-        // ====================== RISK MANAGEMENT STATE ======================
-        private decimal _cachedTickValue = 0m;
-        private DateTime _lastTickValueUpdate = DateTime.MinValue;
-        private decimal _cachedAccountEquity = 0m;
-        private DateTime _lastEquityUpdate = DateTime.MinValue;
-        private readonly Dictionary<string, decimal> _tickValueCache = new();
-        private string _cachedSymbol = "";
-        private bool _warnedTickFallback = false;
         private Pending? _pending;           // captured at N (GL-cross close confirmed)
         private Guid _lastUid;               // last indicator UID observed
         private Guid _lastExecUid = Guid.Empty; // last UID executed (true anti-dup)
@@ -215,59 +215,6 @@ namespace MyAtas.Strategies
             return false;
         }
 
-        // ==== Diagnostics (último cálculo auto-qty) ====
-        private int _lastAutoQty = 0;
-        private int _lastStopTicks = 0;
-        private decimal _lastRiskPerContractUsd = 0m;
-        private decimal _lastTickValueUsed = 0m;
-        private decimal _lastRiskInputUsd = 0m;
-        private bool _diagEchoLoggedInit = false;
-        private bool _refreshDiagnostics = false;
-
-        // ==== Breakeven state ====
-        private bool _breakevenApplied = false;
-        private decimal _entryPrice = 0m;
-        private decimal _plannedEntryPrice = 0m;
-        private bool _lastTriggerManualState = false;
-        private bool _configDumped = false;
-
-        [Category("Risk/Diagnostics"), DisplayName("Effective tick value (USD/tick)"), ReadOnly(true)]
-        public decimal EffectiveTickValueUsd => GetTickValue();
-
-        [Category("Risk/Diagnostics"), DisplayName("Effective tick size (points/tick)"), ReadOnly(true)]
-        public decimal EffectiveTickSize => InternalTickSize;
-
-        [Category("Risk/Diagnostics"), DisplayName("Effective account equity (USD)"), ReadOnly(true)]
-        public decimal EffectiveAccountEquityUsd => GetAccountEquity();
-
-        [Category("Risk/Diagnostics"), DisplayName("Last auto qty (contracts)"), ReadOnly(true)]
-        public int LastAutoQty => _lastAutoQty;
-
-        [Category("Risk/Diagnostics"), DisplayName("Last risk/contract (USD)"), ReadOnly(true)]
-        public decimal LastRiskPerContractUsd => _lastRiskPerContractUsd;
-
-        [Category("Risk/Diagnostics"), DisplayName("Last stop distance (ticks)"), ReadOnly(true)]
-        public int LastStopDistanceTicks => _lastStopTicks;
-
-        [Category("Risk/Diagnostics"), DisplayName("Last risk input (USD)"), ReadOnly(true)]
-        public decimal LastRiskInputUsd => _lastRiskInputUsd;
-
-        // "Botón" de refresco: al marcar True en la UI, loguea y se auto-resetea a False.
-        [Category("Risk/Diagnostics"), DisplayName("Refresh diagnostics (log echo)")]
-        [Description("Marca True para imprimir en el log los valores efectivos (tick value, equity, último auto-qty...). Se auto-resetea a False.")]
-        public bool RefreshDiagnostics
-        {
-            get => _refreshDiagnostics;
-            set
-            {
-                if (value)
-                {
-                    _refreshDiagnostics = false; // auto-reset
-                    try { EchoDiagnostics("manual-refresh"); } catch { /* ignore */ }
-                }
-            }
-        }
-
         // ====================== LIFECYCLE ======================
         protected override void OnInitialize()
         {
@@ -275,8 +222,6 @@ namespace MyAtas.Strategies
             try
             {
                 DebugLog.Separator("STRATEGY INITIALIZATION");
-                LogAllConfig("468/CFG");       // ← VOLCADO COMPLETO de configuración
-                _configDumped = true;
                 _ind = new FourSixEightIndicator();
                 // Force indicator to publish only GenialLine cross signals
                 _ind.TriggerSource = FourSixEightIndicator.TriggerKind.GenialLine;
@@ -345,12 +290,6 @@ namespace MyAtas.Strategies
                 DebugLog.W("468/STR", $"STATE PING: net={GetNetPosition()} activeOrders={CountActiveOrders()} " +
                                        $"antiFlatUntil={_antiFlatUntilBar} cooldownUntil={_cooldownUntilBar} " +
                                        $"brkPlaced={_bracketsPlaced}");
-                // Echo inicial de diagnóstico, una sola vez
-                if (!_diagEchoLoggedInit)
-                {
-                    _diagEchoLoggedInit = true;
-                    try { EchoDiagnostics("init"); } catch { /* ignore */ }
-                }
             }
 
             // --- DEBUG: Estado del pending ---
@@ -430,14 +369,7 @@ namespace MyAtas.Strategies
                 }
 
                 int dir = s.Dir;
-                int qty = CalculatePositionSize(dir, s.BarId);
-
-                if (qty <= 0)
-                {
-                    _pending = null;
-                    DebugLog.W("468/STR", "ABORT ENTRY: Underfunded (auto-qty=0)");
-                    return;
-                }
+                int qty = Math.Max(1, Quantity);
 
                 // 1) Apertura N+1: estricta (primer tick) con tolerancia por precio
                 if (StrictN1Open)
@@ -471,20 +403,9 @@ namespace MyAtas.Strategies
                 // --- Confluence #1: Pendiente de GenialLine A FAVOR en N+1 (vela de ejecución)
                 if (RequireGenialSlope)
                 {
-                    // Asegura que el valor de GenialLine@N+1 esté disponible. Si no, posponemos la entrada.
-                    if (!TryGetSeries("GENIAL LINE (c9)", bar, out _))
-                    {
-                        DebugLog.W("468/STR", "DEFER CONF#1: GenialLine@N+1 not ready yet — keep pending");
-                        return; // ← seguimos pendientes; se reevaluará en el próximo tick
-                    }
-                    // Ahora sí, evaluamos la pendiente real N→N+1
+                    // CheckGenialSlope ya imprime prev/curr y trend real con la misma serie que usa para decidir
                     bool glOk = CheckGenialSlope(dir, bar);
-                    if (!glOk)
-                    {
-                        _pending = null;
-                        DebugLog.W("468/STR", "ABORT ENTRY: Conf#1 failed");
-                        return;
-                    }
+                    if (!glOk) { _pending = null; DebugLog.W("468/STR", "ABORT ENTRY: Conf#1 failed"); return; }
                 }
 
                 // --- Confluencia #2: EMA8 vs Wilder8 en N+1, con reglas granulares
@@ -599,11 +520,6 @@ namespace MyAtas.Strategies
                 }
                 DebugLog.W("468/ORD", "Trade lock RELEASED by heartbeat (flat & no active orders)");
             }
-
-            // ================ BREAKEVEN CHECK ================
-            // Check breakeven triggers on each calculation (for manual/touch modes)
-            CheckBreakevenTriggers();
-            // =================================================
         }
 
         // Mantén sincronizado el estado de órdenes (evita que queden "invisibles")
@@ -745,71 +661,6 @@ namespace MyAtas.Strategies
                     DebugLog.W("468/ORD", "Trade lock RELEASED by OnOrderChanged (final)");
                 }
 
-                // ================ BREAKEVEN TRIGGER LOGIC ================
-
-                // Track entry price for breakeven calculations
-                if ((comment?.StartsWith("468ENTRY:") ?? false) && status == OrderStatus.Filled)
-                {
-                    _entryPrice = GetOrderFillPrice(order);
-                    if (_entryPrice <= 0m && _plannedEntryPrice > 0m)
-                    {
-                        _entryPrice = _plannedEntryPrice;
-                        DebugLog.W("468/BREAKEVEN", $"Fallback entry price set from plan: {_entryPrice:F2}");
-                    }
-                    else
-                    {
-                        DebugLog.W("468/BREAKEVEN", $"Entry price tracked: {_entryPrice:F2} (source: fill)");
-                    }
-                    ResetBreakevenState(); // Reset state for new position
-                }
-
-                // Check for TP fills to trigger breakeven
-                if (BreakevenMode == BreakEvenMode.OnTPFill && !_breakevenApplied)
-                {
-                    // Check if this was a TP order fill and if it's one we want to trigger on
-                    if ((comment?.StartsWith("468TP") ?? false) && status == OrderStatus.Filled)
-                    {
-                        bool shouldTrigger = false;
-                        string tpType = "";
-
-                        // Check which specific TP filled and if it's enabled for breakeven
-                        if (comment.Contains("TP1") && BreakevenOnTP1)
-                        {
-                            shouldTrigger = true;
-                            tpType = "TP1";
-                        }
-                        else if (comment.Contains("TP2") && BreakevenOnTP2)
-                        {
-                            shouldTrigger = true;
-                            tpType = "TP2";
-                        }
-                        else if (comment.Contains("TP3") && BreakevenOnTP3)
-                        {
-                            shouldTrigger = true;
-                            tpType = "TP3";
-                        }
-
-                        if (shouldTrigger)
-                        {
-                            DebugLog.W("468/BREAKEVEN", $"{tpType} fill detected ({comment}), triggering breakeven");
-                            TryMoveStopToBreakeven();
-                        }
-                        else
-                        {
-                            DebugLog.W("468/BREAKEVEN", $"TP fill detected ({comment}) but not configured for breakeven trigger");
-                        }
-                    }
-                }
-
-                // Reset breakeven state when position is closed
-                if (netNow == 0 && _breakevenApplied)
-                {
-                    ResetBreakevenState();
-                    DebugLog.W("468/BREAKEVEN", "Position closed, breakeven state reset");
-                }
-
-                // =======================================================
-
                 // Self-heal eliminado aquí. El re-attach sólo se gestiona en OnCalculate (1x/bar, fuera de anti-flat).
             }
             catch (Exception ex)
@@ -903,7 +754,7 @@ namespace MyAtas.Strategies
                 int legQty = Math.Max(1, qtySplit[i]);
                 var oco = Guid.NewGuid().ToString("N");
                 SubmitStop(oco, coverSide, legQty, slPx);
-                SubmitLimit(oco, coverSide, legQty, tpList[i], i + 1); // << TP index (1..3)
+                SubmitLimit(oco, coverSide, legQty, tpList[i]);
             }
 
             DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))} | Split=[{string.Join(",", qtySplit)}] | Total={totalQty}");
@@ -973,7 +824,6 @@ namespace MyAtas.Strategies
         private void SubmitMarket(int dir, int qty, int bar, int signalBar)
         {
             // *** CRITICAL DEBUG ***
-            _plannedEntryPrice = GetCandle(bar).Open; // fallback por si el fill reporta tarde
             DebugLog.Critical("468/STR", $"SubmitMarket CALLED: dir={dir} qty={qty} bar={bar} t={GetCandle(bar).Time:HH:mm:ss} - THIS IS OUR N+1 EXECUTION");
 
             var order = new Order
@@ -997,7 +847,7 @@ namespace MyAtas.Strategies
             DebugLog.Critical("468/STR", $"MARKET ORDER SENT: {(dir>0?"BUY":"SELL")} {qty} at N+1 (bar={bar}) - OpenOrder() called successfully");
         }
 
-        private void SubmitLimit(string oco, OrderDirections side, int qty, decimal px, int tpIndex)
+        private void SubmitLimit(string oco, OrderDirections side, int qty, decimal px)
         {
             var order = new Order
             {
@@ -1010,7 +860,7 @@ namespace MyAtas.Strategies
                 OCOGroup  = oco,
                 AutoCancel = EnableAutoCancel,
                 IsAttached = true,
-                Comment   = $"468TP{tpIndex}:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
+                Comment   = $"468TP:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
             };
             OpenOrder(order);
             _liveOrders.Add(order);
@@ -1093,48 +943,6 @@ namespace MyAtas.Strategies
         private int SafeBarIndex(int i)
         {
             return Math.Max(0, Math.Min(i, CurrentBar));
-        }
-
-        // ===== Log de diagnóstico centralizado =====
-        private void EchoDiagnostics(string reason)
-        {
-            string sym = GetSymbolCode();
-            decimal tickSize = InternalTickSize;
-            decimal tickVal = GetTickValue();
-            decimal eqAuto = AutoDetectAccountEquity();
-            decimal eqEff = eqAuto > 0m ? eqAuto : ManualAccountEquity;
-            string eqSrc = (eqAuto > 0m) ? "auto" : "override";
-
-            DebugLog.W("468/RISK",
-                $"DIAG [{reason}] sym={sym} tickSize={tickSize} tickVal={tickVal:F2}USD/t " +
-                $"equity({eqSrc})={eqEff:F2}USD lastAutoQty={_lastAutoQty} " +
-                $"stopTicks={_lastStopTicks} risk/ct={_lastRiskPerContractUsd:F2} " +
-                $"riskInput={_lastRiskInputUsd:F2}");
-        }
-
-        private string GetSymbolCode()
-        {
-            try
-            {
-                var security = GetType().GetProperty("Security", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(this);
-                if (security == null) return "UNKNOWN";
-
-                // Try multiple property names for symbol
-                foreach (var propName in new[] { "Symbol", "Name", "Code", "Ticker" })
-                {
-                    var prop = security.GetType().GetProperty(propName);
-                    if (prop != null)
-                    {
-                        var value = prop.GetValue(security)?.ToString();
-                        if (!string.IsNullOrEmpty(value)) return value;
-                    }
-                }
-                return "UNKNOWN";
-            }
-            catch
-            {
-                return "UNKNOWN";
-            }
         }
 
         private int GetNetPosition()
@@ -1470,14 +1278,24 @@ namespace MyAtas.Strategies
 
         private bool CheckGenialSlope(int dir, int i)
         {
-            if (i < 1) return true; // al principio, permisivo
-            // Leemos GenialLine estrictamente en N (i-1) y N+1 (i). Si N+1 no está, esta función no decide.
-            bool hasN1 = TryGetSeries("GENIAL LINE (c9)", i,     out var gN1);
+            if (i < 1) return true; // muy al principio, sé permisivo
+
+            // Leer SIEMPRE de la serie de GenialLine; si N+1 aún no está, usa N.
+            bool hasN1 = TryGetSeries("GENIAL LINE (c9)", i, out var gN1);
             bool hasN  = TryGetSeries("GENIAL LINE (c9)", i - 1, out var gN);
-            if (!hasN1 || !hasN)
+
+            // Fallback coherente: si falta N+1, compara N vs N-1; si falta N, aborta con true (no bloquear al inicio)
+            if (!hasN1 && hasN)
             {
-                DebugLog.W("468/STR", "CONF#1 (GL slope) not ready at N+1 -> defer at caller");
-                return true; // devolvemos 'true' aquí porque el gating lo hace el caller (no abortar por esto)
+                // Mueve la ventana una vela atrás: usa N como "actual" y N-1 como "anterior"
+                bool hasNm1 = TryGetSeries("GENIAL LINE (c9)", i - 2, out var gNm1);
+                if (!hasNm1) return true;
+                gN1 = gN; gN = gNm1;  // gN1=actual(N), gN=anterior(N-1)
+                DebugLog.W("468/STR", $"CONF#1 (GL slope) using N/N-1 (series not ready at N+1)");
+            }
+            else if (!hasN1 && !hasN)
+            {
+                return true;
             }
 
             bool up   = gN1 > gN;
@@ -1653,787 +1471,6 @@ namespace MyAtas.Strategies
             for (int i = 1; i <= last; i++)
                 rma = (rma * (len - 1) + GetCandle(i).Close) / len;
             return rma;
-        }
-
-        // ====================== RISK MANAGEMENT / POSITION SIZING ======================
-        private int CalculatePositionSize(int dir, int signalBar)
-        {
-            try
-            {
-                if (PositionSizingMode == SizingMode.Manual)
-                {
-                    int qty = Math.Max(1, Quantity);
-
-                    // Actualizar diagnósticos aún en modo manual para mostrar el valor efectivo
-                    decimal slDistancePtsManual = CalculateStopLossDistance(dir, signalBar);
-                    int stopTicksManual = (int)Math.Ceiling(slDistancePtsManual / InternalTickSize); // ticks (redondeo conservador)
-                    decimal tickValueManual = GetTickValue();
-                    decimal riskPerContractManual = stopTicksManual * tickValueManual; // FIXED: usar ticks, no puntos
-
-                    _lastAutoQty = qty;
-                    _lastStopTicks = stopTicksManual;
-                    _lastRiskPerContractUsd = riskPerContractManual;
-                    _lastTickValueUsed = tickValueManual;
-                    _lastRiskInputUsd = riskPerContractManual * qty; // riesgo total con qty manual
-
-                    if (EnableRiskLogging)
-                    {
-                        DebugLog.W("468/RISK", $"Position sizing: Manual mode");
-                        DebugLog.W("468/RISK", $"AUTOQTY: {qty} contracts (manual override)");
-                    }
-                    return qty;
-                }
-
-                // Calculate SL distance for risk calculation - FIXED: convert points to ticks
-                decimal slDistancePts = CalculateStopLossDistance(dir, signalBar);
-                if (slDistancePts <= 0)
-                {
-                    DebugLog.W("468/RISK", "WARNING: SL distance <= 0, falling back to manual quantity");
-                    return Math.Max(1, Quantity);
-                }
-
-                int stopTicks = (int)Math.Ceiling(slDistancePts / InternalTickSize); // ticks (redondeo conservador)
-                decimal tickValue = GetTickValue();
-                if (tickValue <= 0)
-                {
-                    DebugLog.W("468/RISK", "WARNING: tick value <= 0, falling back to manual quantity");
-                    return Math.Max(1, Quantity);
-                }
-
-                decimal riskPerContract = stopTicks * tickValue; // FIXED: usar ticks, no puntos
-                int calculatedQty;
-
-                decimal riskUsd;
-                if (PositionSizingMode == SizingMode.FixedRiskUSD)
-                {
-                    riskUsd = RiskPerTradeUsd;
-                    calculatedQty = (int)Math.Floor(RiskPerTradeUsd / riskPerContract);
-                    if (EnableRiskLogging)
-                    {
-                        DebugLog.W("468/RISK", $"FixedRiskUSD: target=${RiskPerTradeUsd:F2}, slDistPts={slDistancePts:F4} (~{stopTicks}t @{InternalTickSize:F4}/t), tickVal=${tickValue:F2}/t, riskPerContract=${riskPerContract:F2}");
-                        DebugLog.W("468/RISK", $"AUTOQTY: {calculatedQty} contracts (${RiskPerTradeUsd:F2} risk / ${riskPerContract:F2} per contract)");
-                    }
-                }
-                else if (PositionSizingMode == SizingMode.PercentOfAccount)
-                {
-                    decimal accountEquity = GetAccountEquity();
-                    if (accountEquity <= 0)
-                    {
-                        DebugLog.W("468/RISK", "WARNING: account equity <= 0, falling back to manual quantity");
-                        return Math.Max(1, Quantity);
-                    }
-
-                    decimal targetRisk = accountEquity * (RiskPercentOfAccount / 100m);
-                    riskUsd = targetRisk;
-                    calculatedQty = (int)Math.Floor(targetRisk / riskPerContract);
-                    if (EnableRiskLogging)
-                    {
-                        DebugLog.W("468/RISK", $"PercentOfAccount: equity=${accountEquity:F2}, risk%={RiskPercentOfAccount:F2}%, targetRisk=${targetRisk:F2}");
-                        DebugLog.W("468/RISK", $"slDistPts={slDistancePts:F4} (~{stopTicks}t @{InternalTickSize:F4}/t), tickVal=${tickValue:F2}/t, riskPerContract=${riskPerContract:F2}");
-                        DebugLog.W("468/RISK", $"AUTOQTY: {calculatedQty} contracts (${targetRisk:F2} risk / ${riskPerContract:F2} per contract)");
-                    }
-                }
-                else
-                {
-                    DebugLog.W("468/RISK", "Unknown sizing mode, falling back to manual");
-                    return Math.Max(1, Quantity);
-                }
-
-                if (calculatedQty <= 0)
-                {
-                    if (SkipIfUnderfunded)
-                    {
-                        // guardar diagnóstico para UI
-                        _lastAutoQty = 0;
-                        _lastStopTicks = stopTicks; // FIXED: usar ticks calculados correctamente
-                        _lastRiskPerContractUsd = riskPerContract;
-                        _lastTickValueUsed = tickValue;
-                        _lastRiskInputUsd = riskUsd;
-
-                        if (EnableRiskLogging)
-                            DebugLog.W("468/RISK", $"ABORT ENTRY: Underfunded (risk/ct=${riskPerContract:F2} > target=${riskUsd:F2})");
-
-                        return 0; // ← señal de aborto limpio
-                    }
-                    calculatedQty = Math.Max(1, MinQtyIfUnderfunded);
-                }
-
-                // guardar diagnóstico para UI
-                _lastAutoQty = calculatedQty;
-                _lastStopTicks = stopTicks; // FIXED: usar ticks calculados correctamente
-                _lastRiskPerContractUsd = riskPerContract;
-                _lastTickValueUsed = tickValue;
-                _lastRiskInputUsd = riskUsd;
-
-                if (EnableRiskLogging)
-                    DebugLog.W("468/RISK", $"Final position size: {calculatedQty} contracts (mode: {PositionSizingMode})");
-
-                return calculatedQty;
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/RISK", $"Position sizing calculation failed: {ex.Message}, falling back to manual quantity");
-                return Math.Max(1, Quantity);
-            }
-        }
-
-        private decimal CalculateStopLossDistance(int dir, int signalBar)
-        {
-            try
-            {
-                // Use the same logic as BuildBracketPrices but only calculate SL distance
-                var refCandle = UseSignalCandleSL ? GetCandle(signalBar) : GetCandle(signalBar + 1);
-
-                decimal sl = dir > 0 ? refCandle.Low - Ticks(Math.Max(0, StopOffsetTicks))
-                                     : refCandle.High + Ticks(Math.Max(0, StopOffsetTicks));
-
-                // Entry reference (same logic as BuildBracketPrices)
-                decimal entryPx;
-                try
-                {
-                    int execBar = signalBar + 1;
-                    if (execBar <= CurrentBar)
-                        entryPx = GetCandle(execBar).Open;
-                    else
-                        entryPx = GetCandle(signalBar).Close; // fallback
-                }
-                catch
-                {
-                    entryPx = GetCandle(signalBar).Close;
-                }
-
-                if (entryPx <= 0) entryPx = GetCandle(signalBar).Close;
-
-                decimal distance = Math.Abs(entryPx - sl);
-                return distance;
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/RISK", $"SL distance calculation failed: {ex.Message}");
-                return 0m;
-            }
-        }
-
-        // ================== BREAKEVEN HELPERS ==================
-
-        private void CheckBreakevenTriggers()
-        {
-            if (BreakevenMode == BreakEvenMode.Off) return;
-            if (_breakevenApplied) return; // Already applied
-            if (GetNetPosition() == 0) return; // No position
-
-            bool shouldTrigger = false;
-
-            switch (BreakevenMode)
-            {
-                case BreakEvenMode.Manual:
-                    shouldTrigger = TriggerBreakevenManually && !_lastTriggerManualState;
-                    break;
-
-                case BreakEvenMode.OnTPFill:
-                    // This will be triggered from OnOrderChanged when TP gets filled
-                    break;
-
-                case BreakEvenMode.OnTPTouch:
-                    shouldTrigger = HasAnyTPBeenTouched();
-                    break;
-            }
-
-            if (shouldTrigger)
-            {
-                TryMoveStopToBreakeven();
-            }
-
-            // Reset manual trigger
-            if (TriggerBreakevenManually && !_lastTriggerManualState)
-            {
-                _lastTriggerManualState = true;
-                // Auto-reset the boolean after triggering
-                Task.Run(async () =>
-                {
-                    await Task.Delay(100);
-                    TriggerBreakevenManually = false;
-                    _lastTriggerManualState = false;
-                });
-            }
-        }
-
-        private bool HasAnyTPBeenTouched()
-        {
-            if (GetNetPosition() == 0 || _entryPrice <= 0) return false;
-
-            try
-            {
-                decimal currentPrice = GetCandle(CurrentBar).Close;
-                bool isLong = GetNetPosition() > 0;
-
-                // Calculate TP levels based on R multiples
-                decimal stopDistance = Math.Abs(_entryPrice - GetCurrentStopPrice());
-
-                // Check only the TPs that are enabled AND selected for breakeven
-                if (EnableTP1 && BreakevenOnTP1)
-                {
-                    decimal tp1Level = isLong ? _entryPrice + (stopDistance * TP1_R) : _entryPrice - (stopDistance * TP1_R);
-                    if ((isLong && currentPrice >= tp1Level) || (!isLong && currentPrice <= tp1Level))
-                    {
-                        DebugLog.W("468/BREAKEVEN", $"TP1 touched at {currentPrice:F2} (target: {tp1Level:F2})");
-                        return true;
-                    }
-                }
-
-                if (EnableTP2 && BreakevenOnTP2)
-                {
-                    decimal tp2Level = isLong ? _entryPrice + (stopDistance * TP2_R) : _entryPrice - (stopDistance * TP2_R);
-                    if ((isLong && currentPrice >= tp2Level) || (!isLong && currentPrice <= tp2Level))
-                    {
-                        DebugLog.W("468/BREAKEVEN", $"TP2 touched at {currentPrice:F2} (target: {tp2Level:F2})");
-                        return true;
-                    }
-                }
-
-                if (EnableTP3 && BreakevenOnTP3)
-                {
-                    decimal tp3Level = isLong ? _entryPrice + (stopDistance * TP3_R) : _entryPrice - (stopDistance * TP3_R);
-                    if ((isLong && currentPrice >= tp3Level) || (!isLong && currentPrice <= tp3Level))
-                    {
-                        DebugLog.W("468/BREAKEVEN", $"TP3 touched at {currentPrice:F2} (target: {tp3Level:F2})");
-                        return true;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/BREAKEVEN", $"Error checking TP touch: {ex.Message}");
-            }
-
-            return false;
-        }
-
-        private decimal GetCurrentStopPrice()
-        {
-            // Find the current stop loss order
-            foreach (var order in Orders.Where(o => o.State == OrderStates.Active && o.Type == OrderTypes.Stop))
-            {
-                // En ATAS los Stop usan TriggerPrice
-                var tp = order.GetType().GetProperty("TriggerPrice")?.GetValue(order);
-                if (tp != null && decimal.TryParse(tp.ToString(), out var trig))
-                    return trig;
-                return order.Price; // fallback
-            }
-            return 0m;
-        }
-
-        private void TryMoveStopToBreakeven()
-        {
-            if (GetNetPosition() == 0 || _entryPrice <= 0 || _breakevenApplied) return;
-
-            try
-            {
-                bool isLong = GetNetPosition() > 0;
-                decimal breakevenPrice = _entryPrice + (isLong ? Ticks(BreakevenOffsetTicks) : -Ticks(BreakevenOffsetTicks));
-
-                // Find and modify current stop orders
-                var stopOrders = Orders.Where(o => o.State == OrderStates.Active && o.Type == OrderTypes.Stop).ToList();
-
-                foreach (var stopOrder in stopOrders)
-                {
-                    // Leer TriggerPrice actual
-                    var curObj = stopOrder.GetType().GetProperty("TriggerPrice")?.GetValue(stopOrder);
-                    var cur = (curObj != null && decimal.TryParse(curObj.ToString(), out var v)) ? v : stopOrder.Price;
-                    // ¿mejora el stop?
-                    bool shouldMove = isLong ? breakevenPrice > cur : breakevenPrice < cur;
-
-                    if (shouldMove)
-                    {
-                        try
-                        {
-                            // Cancel old stop and create new one at breakeven price
-                            CancelOrder(stopOrder);
-
-                            var newStop = new Order
-                            {
-                                Type = OrderTypes.Stop,
-                                Direction = isLong ? OrderDirections.Sell : OrderDirections.Buy,
-                                TriggerPrice = breakevenPrice, // << usar TriggerPrice
-                                QuantityToFill = stopOrder.QuantityToFill,
-                                IsAttached = true,
-                                Comment = $"468SL:BE{DateTime.UtcNow:HHmmss}"
-                            };
-                            OpenOrder(newStop);
-                            _liveOrders.Add(newStop);
-
-                            DebugLog.W("468/BREAKEVEN", $"Moving SL to breakeven: {cur:F2} -> {breakevenPrice:F2} (offset: {BreakevenOffsetTicks} ticks)");
-                        }
-                        catch (Exception modEx)
-                        {
-                            DebugLog.W("468/BREAKEVEN", $"Error modifying stop order: {modEx.Message}");
-                        }
-                    }
-                }
-
-                _breakevenApplied = true;
-                DebugLog.W("468/BREAKEVEN", $"Breakeven applied at {breakevenPrice:F2} with {BreakevenOffsetTicks} ticks offset");
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/BREAKEVEN", $"Error moving stop to breakeven: {ex.Message}");
-            }
-        }
-
-        private void ResetBreakevenState()
-        {
-            _breakevenApplied = false;
-            _entryPrice = 0m;
-            _plannedEntryPrice = 0m;
-            _lastTriggerManualState = false;
-        }
-
-        // Tomar precio de fill (AvgFillPrice / AveragePrice / … / Price)
-        private decimal GetOrderFillPrice(Order order)
-        {
-            foreach (var name in new[] { "AvgFillPrice", "AveragePrice", "AvgPrice", "FillPrice", "ExecutedPrice", "LastFillPrice", "Price" })
-            {
-                var p = order.GetType().GetProperty(name);
-                if (p == null) continue;
-                var vObj = p.GetValue(order);
-                if (vObj == null) continue;
-                if (decimal.TryParse(vObj.ToString(), out var v) && v > 0)
-                    return v;
-            }
-            return 0m;
-        }
-
-        // ========================================================
-
-        private decimal GetTickValue()
-        {
-            try
-            {
-                string symbol = GetCurrentSymbol();
-                if (string.IsNullOrEmpty(symbol))
-                {
-                    DebugLog.W("468/RISK", "Could not determine current symbol");
-                    return 5.0m;
-                }
-
-                // Check cache first (valid for 5 minutes and same symbol)
-                if (_cachedTickValue > 0 && _cachedSymbol == symbol && (DateTime.UtcNow - _lastTickValueUpdate).TotalMinutes < 5)
-                {
-                    return _cachedTickValue;
-                }
-
-                // a) Read override if it exists
-                decimal overrideVal = GetTickValueFromOverrides(symbol); // 0 if not found
-
-                // b) Try auto-detection via reflection
-                decimal autoVal = AutoDetectTickValue();
-
-                // c) Check for mismatch between override and auto-detected
-                if (overrideVal > 0m && autoVal > 0m && Math.Abs(overrideVal - autoVal) > 0.01m)
-                {
-                    DebugLog.W("468/RISK", $"TICK-VALUE MISMATCH for {symbol}: override={overrideVal:F2} vs auto={autoVal:F2} (using override)");
-                }
-
-                // d) Precedence: override > auto > fallback
-                decimal finalValue;
-                string source;
-
-                if (overrideVal > 0m)
-                {
-                    finalValue = overrideVal;
-                    source = "override";
-                    DebugLog.W("468/RISK", $"TICK-VALUE: override for {symbol} -> {overrideVal:F2} USD/tick");
-                }
-                else if (autoVal > 0m)
-                {
-                    finalValue = autoVal;
-                    source = "auto-detected";
-                    DebugLog.W("468/RISK", $"TICK-VALUE: auto-detected for {symbol} -> {autoVal:F2} USD/tick");
-                }
-                else
-                {
-                    finalValue = GetFallbackTickValue(symbol);
-                    source = "fallback";
-
-                    // Critical warning for fallback (only once per symbol)
-                    if (!_warnedTickFallback || _cachedSymbol != symbol)
-                    {
-                        DebugLog.Critical("468/RISK", $"TICK-VALUE: using FALLBACK {finalValue:F2} USD/tick for {symbol} (configure overrides or enable auto-detect)");
-                        _warnedTickFallback = true;
-                    }
-                }
-
-                // Update cache
-                _cachedTickValue = finalValue;
-                _cachedSymbol = symbol;
-                _lastTickValueUpdate = DateTime.UtcNow;
-
-                return finalValue;
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/RISK", $"GetTickValue failed: {ex.Message}");
-                return 5.0m; // conservative fallback
-            }
-        }
-
-        private string GetCurrentSymbol()
-        {
-            try
-            {
-                var security = GetType().GetProperty("Security", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(this);
-                if (security == null) return "";
-
-                // Try multiple property names for symbol
-                foreach (var propName in new[] { "Symbol", "Name", "Code", "Ticker" })
-                {
-                    var prop = security.GetType().GetProperty(propName);
-                    if (prop != null)
-                    {
-                        var value = prop.GetValue(security)?.ToString();
-                        if (!string.IsNullOrEmpty(value)) return value;
-                    }
-                }
-                return "";
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/RISK", $"GetCurrentSymbol failed: {ex.Message}");
-                return "";
-            }
-        }
-
-        private decimal GetTickValueFromOverrides(string symbol)
-        {
-            try
-            {
-                if (string.IsNullOrWhiteSpace(TickValueOverrides) || string.IsNullOrWhiteSpace(symbol))
-                    return 0m;
-
-                if (_tickValueCache.TryGetValue(symbol, out var cached))
-                    return cached;
-
-                var entries = TickValueOverrides.Split(new[] { ';' }, StringSplitOptions.RemoveEmptyEntries);
-                foreach (var entry in entries)
-                {
-                    // Acepta "SYM=VAL" o "SYM,VAL"
-                    var parts = entry.Split(new[] { '=', ',' }, 2, StringSplitOptions.RemoveEmptyEntries);
-                    if (parts.Length != 2) continue;
-
-                    var key = parts[0].Trim();
-                    var valStr = parts[1].Trim();
-
-                    if (!key.Equals(symbol, StringComparison.OrdinalIgnoreCase))
-                        continue;
-
-                    if (decimal.TryParse(valStr, System.Globalization.NumberStyles.Any,
-                                         System.Globalization.CultureInfo.InvariantCulture, out var tickValue)
-                        && tickValue > 0m)
-                    {
-                        _tickValueCache[symbol] = tickValue;
-                        return tickValue;
-                    }
-                }
-                return 0m;
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/RISK", $"GetTickValueFromOverrides failed: {ex.Message}");
-                return 0m;
-            }
-        }
-
-        private decimal AutoDetectTickValue()
-        {
-            try
-            {
-                var security = GetType().GetProperty("Security", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(this);
-                if (security == null) return 0m;
-
-                // Try common property names for tick value
-                foreach (var propName in new[] { "MinStepPrice", "TickValue", "PointValue", "ContractSize", "MultiplierValue", "Multiplier" })
-                {
-                    var prop = security.GetType().GetProperty(propName);
-                    if (prop != null)
-                    {
-                        var value = prop.GetValue(security);
-                        if (value != null && decimal.TryParse(value.ToString(), out decimal tickValue) && tickValue > 0)
-                        {
-                            if (EnableRiskLogging)
-                                DebugLog.W("468/RISK", $"Auto-detected tick value via {propName}: {tickValue}");
-                            return tickValue;
-                        }
-                    }
-                }
-
-                // Try nested instrument info
-                var instProp = GetType().GetProperty("InstrumentInfo", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                var instVal = instProp?.GetValue(this);
-                if (instVal != null)
-                {
-                    foreach (var propName in new[] { "MinStepPrice", "TickValue", "PointValue", "ContractSize" })
-                    {
-                        var prop = instVal.GetType().GetProperty(propName);
-                        if (prop != null)
-                        {
-                            var value = prop.GetValue(instVal);
-                            if (value != null && decimal.TryParse(value.ToString(), out decimal tickValue) && tickValue > 0)
-                            {
-                                if (EnableRiskLogging)
-                                    DebugLog.W("468/RISK", $"Auto-detected tick value via InstrumentInfo.{propName}: {tickValue}");
-                                return tickValue;
-                            }
-                        }
-                    }
-                }
-
-                return 0m;
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/RISK", $"AutoDetectTickValue failed: {ex.Message}");
-                return 0m;
-            }
-        }
-
-        private decimal GetFallbackTickValue(string symbol)
-        {
-            // Common US futures tick values
-            var fallbacks = new Dictionary<string, decimal>(StringComparer.OrdinalIgnoreCase)
-            {
-                // E-mini futures
-                { "ES", 12.50m },    { "MES", 1.25m },
-                { "NQ", 5.0m },      { "MNQ", 0.50m },
-                { "YM", 5.0m },      { "MYM", 0.50m },
-                { "RTY", 5.0m },     { "M2K", 0.50m },
-
-                // Energy
-                { "CL", 10.0m },     { "QM", 1.0m },
-                { "NG", 10.0m },     { "QG", 2.50m },
-
-                // Metals
-                { "GC", 10.0m },     { "MGC", 1.0m },
-                { "SI", 25.0m },     { "SIL", 2.50m },
-
-                // Bonds
-                { "ZB", 31.25m },    { "ZN", 15.625m },
-                { "ZF", 7.8125m },   { "ZT", 3.90625m },
-
-                // FX
-                { "6E", 6.25m },     { "M6E", 0.625m },
-                { "6B", 6.25m },     { "M6B", 0.625m },
-                { "6J", 6.25m },     { "6A", 5.0m }
-            };
-
-            if (fallbacks.TryGetValue(symbol, out decimal value))
-                return value;
-
-            return 5.0m; // Conservative default
-        }
-
-        private decimal GetAccountEquity()
-        {
-            try
-            {
-                // Check cache first (valid for 1 minute)
-                if (_cachedAccountEquity > 0 && (DateTime.UtcNow - _lastEquityUpdate).TotalMinutes < 1)
-                {
-                    return _cachedAccountEquity;
-                }
-
-                // a) Try auto-detection via Portfolio first
-                decimal eqAuto = AutoDetectAccountEquity();
-                decimal eqOverride = Math.Max(0m, ManualAccountEquity);
-
-                // b) Check for mismatch between auto and override (>2% difference)
-                if (eqAuto > 0m && eqOverride > 0m)
-                {
-                    decimal rel = Math.Abs(eqAuto - eqOverride) / Math.Max(eqAuto, 1m);
-                    if (rel > 0.02m) // >2% difference
-                    {
-                        DebugLog.W("468/RISK", $"ACCOUNT EQUITY MISMATCH: auto={eqAuto:F2} vs override={eqOverride:F2} (using auto)");
-                    }
-                }
-
-                // c) Precedence: auto > override > fail
-                decimal finalEquity;
-                if (eqAuto > 0m)
-                {
-                    finalEquity = eqAuto;
-                    if (EnableRiskLogging)
-                        DebugLog.W("468/RISK", $"ACCOUNT EQUITY: auto-detected = ${eqAuto:F2} USD");
-                }
-                else if (eqOverride > 0m)
-                {
-                    finalEquity = eqOverride;
-                    DebugLog.W("468/RISK", $"ACCOUNT EQUITY: using manual override = ${eqOverride:F2} USD (auto-detect failed)");
-                }
-                else
-                {
-                    DebugLog.W("468/RISK", "Could not detect account equity - set ManualAccountEquity parameter");
-                    return 0m;
-                }
-
-                // Update cache
-                _cachedAccountEquity = finalEquity;
-                _lastEquityUpdate = DateTime.UtcNow;
-                return finalEquity;
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/RISK", $"GetAccountEquity failed: {ex.Message}");
-                return 0m;
-            }
-        }
-
-        private decimal AutoDetectAccountEquity()
-        {
-            try
-            {
-                var portfolio = GetType().GetProperty("Portfolio", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)?.GetValue(this);
-                if (portfolio == null) return 0m;
-
-                // Try common property names for equity/balance
-                foreach (var propName in new[] { "Equity", "Balance", "TotalEquity", "NetLiquidation", "TotalBalance", "AccountValue" })
-                {
-                    var prop = portfolio.GetType().GetProperty(propName);
-                    if (prop != null)
-                    {
-                        var value = prop.GetValue(portfolio);
-                        if (value != null && decimal.TryParse(value.ToString(), out decimal equity) && equity > 0)
-                        {
-                            if (EnableRiskLogging)
-                                DebugLog.W("468/RISK", $"Auto-detected equity via Portfolio.{propName}: ${equity:F2}");
-                            return equity;
-                        }
-                    }
-                }
-
-                // Try getting all positions and summing their values
-                var getPositions = portfolio.GetType().GetMethod("GetPositions", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (getPositions != null)
-                {
-                    var positions = getPositions.Invoke(portfolio, null) as IEnumerable;
-                    if (positions != null)
-                    {
-                        decimal totalValue = 0m;
-                        foreach (var pos in positions)
-                        {
-                            // Try to get market value or unrealized PnL
-                            foreach (var propName in new[] { "MarketValue", "UnrealizedPnL", "Equity", "Value" })
-                            {
-                                var prop = pos.GetType().GetProperty(propName);
-                                if (prop != null)
-                                {
-                                    var value = prop.GetValue(pos);
-                                    if (value != null && decimal.TryParse(value.ToString(), out decimal posValue))
-                                    {
-                                        totalValue += posValue;
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        if (totalValue > 0)
-                        {
-                            if (EnableRiskLogging)
-                                DebugLog.W("468/RISK", $"Auto-detected equity via positions sum: ${totalValue:F2}");
-                            return totalValue;
-                        }
-                    }
-                }
-
-                return 0m;
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/RISK", $"AutoDetectAccountEquity failed: {ex.Message}");
-                return 0m;
-            }
-        }
-
-        // ========================
-        //  CONFIG DUMP (REFLECTION)
-        // ========================
-        private void LogAllConfig(string tag)
-        {
-            try
-            {
-                var props = GetType().GetProperties(BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic)
-                    .Where(p => p.CanRead && IsSimpleConfigType(p.PropertyType) && !IsIgnoredConfigProperty(p.Name))
-                    .Select(p => new
-                    {
-                        Prop = p,
-                        Cat  = p.GetCustomAttribute<CategoryAttribute>()?.Category ?? "Misc",
-                        Name = p.GetCustomAttribute<DisplayNameAttribute>()?.DisplayName ?? p.Name
-                    })
-                    .ToList();
-
-                // Ordenar por categoría y nombre visible
-                foreach (var grp in props.GroupBy(x => x.Cat).OrderBy(g => g.Key))
-                {
-                    DebugLog.W(tag, $"[{grp.Key}]");
-                    foreach (var x in grp.OrderBy(x => x.Name))
-                    {
-                        object val = null;
-                        string sVal;
-                        try
-                        {
-                            val  = x.Prop.GetValue(this);
-                            sVal = FormatConfigValue(val);
-                        }
-                        catch (Exception ex)
-                        {
-                            sVal = $"<error: {ex.Message}>";
-                        }
-                        DebugLog.W(tag, $"  {x.Name} = {sVal}");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W(tag, $"<config dump failed: {ex.Message}>");
-            }
-        }
-
-        private static bool IsSimpleConfigType(Type t)
-        {
-            t = Nullable.GetUnderlyingType(t) ?? t;
-            if (t.IsEnum) return true;
-            if (t == typeof(string)) return true;
-            if (t == typeof(bool)) return true;
-            if (t == typeof(int) || t == typeof(long) || t == typeof(short)) return true;
-            if (t == typeof(decimal) || t == typeof(double) || t == typeof(float)) return true;
-            if (t == typeof(TimeSpan)) return true;
-            // Excluimos colecciones/objetos complejos para no inundar el log
-            return false;
-        }
-
-        private static bool IsIgnoredConfigProperty(string name)
-        {
-            // Evita volcar objetos grandes o de runtime que no son "configurable settings"
-            // Ajusta esta lista si ves algo ruidoso en el log.
-            var ignore = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
-            {
-                "Security", "Portfolio", "Bars", "ChartInfo", "Instrument", "Source",
-                "IsActivated", "Visible", "Locked",
-                "_tradeActive", "_liveOrders", "_orderFills", "_lastSignalBar", "_entryDir",
-                "_plannedEntryPrice", "_entryPrice", "_cachedNetPosition", "_lastPositionUpdate"
-            };
-            return ignore.Contains(name) || name.StartsWith("_");
-        }
-
-        private static string FormatConfigValue(object v)
-        {
-            if (v == null) return "<null>";
-            var t = Nullable.GetUnderlyingType(v.GetType()) ?? v.GetType();
-            if (t.IsEnum) return $"{t.Name}.{v}";
-            if (v is bool b) return b ? "True" : "False";
-            if (v is decimal m) return m.ToString("0.########");
-            if (v is double d) return d.ToString("0.########");
-            if (v is float  f) return f.ToString("0.########");
-            if (v is TimeSpan ts) return ts.ToString();
-            return v.ToString();
         }
     }
 }
