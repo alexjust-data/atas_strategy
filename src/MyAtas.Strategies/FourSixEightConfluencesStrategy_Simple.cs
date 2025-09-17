@@ -120,6 +120,46 @@ namespace MyAtas.Strategies
         [Category("Risk/Timing"), DisplayName("Enable flat watchdog failsafe")]
         public bool EnableFlatWatchdog { get; set; } = true;
 
+        // ====================== CAPA 0 — FLAGS RISK MANAGEMENT ======================
+        [System.ComponentModel.DisplayName("Enable Risk Management")]
+        [System.ComponentModel.Category("Risk Management")]
+        [System.ComponentModel.Description("Activa el subsistema de Risk Management. OFF por defecto.")]
+        public bool EnableRiskManagement { get; set; } = false;
+
+        [System.ComponentModel.DisplayName("Risk Dry-Run (no effect)")]
+        [System.ComponentModel.Category("Risk Management")]
+        [System.ComponentModel.Description("Cuando RM está activo, ejecuta cálculos y logs sin afectar órdenes. ON por defecto.")]
+        public bool RiskDryRun { get; set; } = true;
+
+        // Internos efectivos (se usarán para gating/log en capas siguientes)
+        private bool RMEnabled => EnableRiskManagement;
+        private bool RMDryRunEffective => !EnableRiskManagement || RiskDryRun;
+        // ============================================================================
+
+        // ====================== Helpers de logging con gating =======================
+        //  - RiskLog/CalcLog solo escriben si EnableRiskManagement==true
+        //  - Para INIT de Capa 0 usamos DebugLog.W directo (arriba) para la evidencia
+        private void RiskLog(string tag, string message)
+        {
+            // Solo gateamos tags 468/RISK aquí
+            if (tag == "468/RISK")
+            {
+                if (!RMEnabled) return;
+            }
+            DebugLog.W(tag, message);
+        }
+
+        private void CalcLog(string tag, string message)
+        {
+            // Solo gateamos tags 468/CALC aquí
+            if (tag == "468/CALC")
+            {
+                if (!RMEnabled) return;
+            }
+            DebugLog.W(tag, message);
+        }
+        // ============================================================================
+
         // ====================== RISK MANAGEMENT PARAMETERS ======================
 
         // --- Position Sizing ---
@@ -290,33 +330,17 @@ namespace MyAtas.Strategies
                 // Initialize risk management diagnostics
                 UpdateDiagnostics();
 
-                // ---- RISK INIT (incondicional para baseline de sesión)
-                var sym = GetEffectiveSecurityCode();
-                string qc = Security?.QuoteCurrency ?? "USD";
-
-                // Try InstrumentInfo.TickSize first (reflexión para compatibilidad)
-                decimal infoTickSize = 0m;
-                try
-                {
-                    var ii = GetType().GetProperty("InstrumentInfo",
-                        System.Reflection.BindingFlags.Instance |
-                        System.Reflection.BindingFlags.Public |
-                        System.Reflection.BindingFlags.NonPublic)?.GetValue(this);
-                    if (ii != null)
-                    {
-                        var pTs = ii.GetType().GetProperty("TickSize");
-                        infoTickSize = (pTs?.GetValue(ii) as decimal?) ?? 0m;
-                    }
-                }
-                catch { /* best-effort */ }
-
-                var secTickSize = (Security != null ? Security.TickSize : 0m);
-                var effectiveTs = infoTickSize > 0 ? infoTickSize :
-                                  secTickSize  > 0 ? secTickSize  :
-                                  EffectiveTickSize; // lo que dejó UpdateDiagnostics (fallback)
-
+                // ======= CAPA 0: Log único de INIT para evidenciar estado de flags =======
+                // Requisito: que solo aparezca INIT de RISK si no tocamos nada más.
                 DebugLog.W("468/RISK",
-                    $"INIT sym={sym} qc={qc} tickSize={effectiveTs} overrides=\"{TickValueOverrides ?? ""}\" DRYRUN=ON");
+                    $"INIT flags EnableRiskManagement={EnableRiskManagement} RiskDryRun={RiskDryRun} " +
+                    $"effectiveDryRun={RMDryRunEffective}");
+                // =========================================================================
+
+                // ========== Capa 1: INIT de símbolo (no cambia comportamiento, solo evidencia) ==========
+                var sym = GetEffectiveSecurityCode();
+                var qc  = Security?.QuoteCurrency ?? "USD";
+                RiskLog("468/RISK", $"INIT SYMBOL source={_cachedSymbolSource ?? "unknown"} value={sym} qc={qc}");
             }
             catch (Exception ex)
             {
@@ -1602,7 +1626,7 @@ namespace MyAtas.Strategies
                 if (secTickCost > 0)
                 {
                     if (EnableDetailedRiskLogging)
-                        DebugLog.W("468/RISK", $"TICK-VALUE auto-detected: {secTickCost:F2}{qc}/tick via Security.TickCost");
+                        RiskLog("468/RISK", $"TICK-VALUE auto-detected: {secTickCost:F2}{qc}/tick via Security.TickCost");
                     return secTickCost;
                 }
 
@@ -1612,18 +1636,18 @@ namespace MyAtas.Strategies
                 if (!string.IsNullOrWhiteSpace(code) && overrides.TryGetValue(code, out var ov))
                 {
                     if (EnableDetailedRiskLogging)
-                        DebugLog.W("468/RISK", $"TICK-VALUE override: {ov:F2}{qc}/tick for {code}");
+                        RiskLog("468/RISK", $"TICK-VALUE override: {ov:F2}{qc}/tick for {code}");
                     return ov;
                 }
 
                 // Priority 3: Fallback
                 if (EnableDetailedRiskLogging)
-                    DebugLog.W("468/RISK", $"TICK-VALUE fallback: 0.5{qc}/tick (no detection/override for {code})");
+                    RiskLog("468/RISK", $"TICK-VALUE fallback: 0.5{qc}/tick (no detection/override for {code})");
                 return 0.5m;
             }
             catch (Exception ex)
             {
-                DebugLog.W("468/RISK", $"TICK-VALUE error: {ex.Message} -> fallback 0.5");
+                RiskLog("468/RISK", $"TICK-VALUE error: {ex.Message} -> fallback 0.5");
                 return 0.5m;
             }
         }
@@ -1747,14 +1771,14 @@ namespace MyAtas.Strategies
 
                 if (EnableDetailedRiskLogging)
                 {
-                    DebugLog.W("468/RISK", $"DIAG tickValue={EffectiveTickValue:F2}{Security?.QuoteCurrency ?? "USD"}/t " +
+                    RiskLog("468/RISK", $"DIAG tickValue={EffectiveTickValue:F2}{Security?.QuoteCurrency ?? "USD"}/t " +
                                           $"tickSize={EffectiveTickSize:F4}pts/t " +
                                           $"equity={EffectiveAccountEquity:F2}USD");
                 }
             }
             catch (Exception ex)
             {
-                DebugLog.W("468/RISK", $"UpdateDiagnostics error: {ex.Message}");
+                RiskLog("468/RISK", $"UpdateDiagnostics error: {ex.Message}");
             }
         }
 
@@ -1772,6 +1796,7 @@ namespace MyAtas.Strategies
         /// Centralized security symbol detection with InstrumentInfo priority and logging
         /// </summary>
         private string _cachedSecurityCode;
+        private string _cachedSymbolSource; // Capa 1: cachear también la fuente del símbolo
         private string GetEffectiveSecurityCode()
         {
             try
@@ -1793,6 +1818,7 @@ namespace MyAtas.Strategies
                         if (EnableDetailedRiskLogging)
                             DebugLog.W("468/RISK", $"SYMBOL source=InstrumentInfo.Instrument value={name}");
                         _cachedSecurityCode = name.Trim().ToUpperInvariant();
+                        _cachedSymbolSource = "InstrumentInfo.Instrument";
                         return _cachedSecurityCode;
                     }
                 }
@@ -1803,6 +1829,7 @@ namespace MyAtas.Strategies
                     if (EnableDetailedRiskLogging)
                         DebugLog.W("468/RISK", $"SYMBOL source=Security.Instrument value={Security.Instrument}");
                     _cachedSecurityCode = Security.Instrument.Trim().ToUpperInvariant();
+                    _cachedSymbolSource = "Security.Instrument";
                     return _cachedSecurityCode;
                 }
                 // Priority 3: Security.Code
@@ -1811,6 +1838,7 @@ namespace MyAtas.Strategies
                     if (EnableDetailedRiskLogging)
                         DebugLog.W("468/RISK", $"SYMBOL source=Security.Code value={Security.Code}");
                     _cachedSecurityCode = Security.Code.Trim().ToUpperInvariant();
+                    _cachedSymbolSource = "Security.Code";
                     return _cachedSecurityCode;
                 }
                 // Priority 4: Base Instrument (obsoleto pero útil como fallback)
@@ -1819,17 +1847,20 @@ namespace MyAtas.Strategies
                     if (EnableDetailedRiskLogging)
                         DebugLog.W("468/RISK", $"SYMBOL source=Instrument value={Instrument}");
                     _cachedSecurityCode = Instrument.Trim().ToUpperInvariant();
+                    _cachedSymbolSource = "Instrument";
                     return _cachedSecurityCode;
                 }
 
                 DebugLog.W("468/RISK", "SYMBOL source=fallback value=UNKNOWN (no detection)");
                 _cachedSecurityCode = "UNKNOWN";
+                _cachedSymbolSource = "fallback";
                 return _cachedSecurityCode;
             }
             catch (Exception ex)
             {
                 DebugLog.W("468/RISK", $"SYMBOL error: {ex.Message} -> fallback=UNKNOWN");
                 _cachedSecurityCode = "UNKNOWN";
+                _cachedSymbolSource = "error";
                 return _cachedSecurityCode;
             }
         }
@@ -1884,7 +1915,7 @@ namespace MyAtas.Strategies
                         break;
 
                     default:
-                        DebugLog.W("468/CALC", $"Unknown PositionSizingMode: {mode}, defaulting to Manual");
+                        CalcLog("468/CALC", $"Unknown PositionSizingMode: {mode}, defaulting to Manual");
                         rawQuantity = Quantity;
                         break;
                 }
@@ -1907,7 +1938,7 @@ namespace MyAtas.Strategies
                     }
                     else
                     {
-                        DebugLog.W("468/CALC", $"FINAL calculation result: qty={finalQuantity} " +
+                        CalcLog("468/CALC", $"FINAL calculation result: qty={finalQuantity} " +
                                               $"(NOTE: actual trades use Quantity={Quantity} until PASO 4)");
                     }
                 }
@@ -1918,7 +1949,7 @@ namespace MyAtas.Strategies
                     var sym = GetEffectiveSecurityCode();
                     var qc = Security?.QuoteCurrency ?? "USD";
                     var bars = CurrentBar; // Current bar as reference
-                    DebugLog.W("468/CALC",
+                    CalcLog("468/CALC",
                         $"SNAPSHOT sym={sym} bars={bars} mode={mode} qty={finalQuantity} lastAutoQty={LastAutoQty} " +
                         $"slTicks={LastStopDistance:F1} rpc={LastRiskPerContract:F2}{qc} " +
                         $"equity={EffectiveAccountEquity:F2}USD tickValue={EffectiveTickValue:F2}{qc}/t " +
@@ -1930,7 +1961,7 @@ namespace MyAtas.Strategies
             }
             catch (Exception ex)
             {
-                DebugLog.W("468/CALC", $"CalculateQuantity error: {ex.Message}, falling back to manual Quantity={Quantity}");
+                CalcLog("468/CALC", $"CalculateQuantity error: {ex.Message}, falling back to manual Quantity={Quantity}");
                 return Quantity; // Safe fallback to manual quantity
             }
         }
