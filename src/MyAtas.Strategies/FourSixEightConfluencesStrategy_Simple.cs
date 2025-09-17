@@ -418,6 +418,10 @@ namespace MyAtas.Strategies
         [Category("Execution"), DisplayName("Top-up missing qty to target")]
         public bool TopUpMissingQty { get; set; } = false;
 
+        [System.ComponentModel.DisplayName("Enable Bracket Watchdog")]
+        [Category("Execution")]
+        public bool EnableBracketWatchdog { get; set; } = true;
+
         // --- Anti-flat window (para evitar cancelaciones por net=0 fantasma justo tras colgar brackets)
         [Category("Execution"), DisplayName("Anti-flat lock (ms)")]
         public int AntiFlatMs { get; set; } = 600;
@@ -489,6 +493,10 @@ namespace MyAtas.Strategies
         [Category("Risk Management/Diagnostics"), DisplayName("AutoQty cap (0=off)")]
         [Description("Límite duro opcional para auto quantity (0=sin límite). Solo diagnóstico por ahora.")]
         public int AutoQtyCap { get; set; } = 0;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("Market watchdog seconds")]
+        [Description("Segundos de espera antes de avisar retraso en market order (típico en demo). 0=off.")]
+        public int MarketWatchdogSec { get; set; } = 60;
 
 
         // ====================== RISK MANAGEMENT PARAMETERS ======================
@@ -584,6 +592,9 @@ namespace MyAtas.Strategies
         private decimal _lastEntryPrice = 0m;
         private DateTime _lastBreakevenMoveUtc = DateTime.MinValue;
 
+        // === BRACKET WATCHDOG STATE ===
+        private bool _scheduleAttachBrackets = false;
+
         // Post-fill bracket control
         private int _targetQty = 0;          // qty solicitada en la entrada
         private int _lastSignalBar = -1;     // N de la señal que originó la entrada
@@ -610,6 +621,10 @@ namespace MyAtas.Strategies
         private int _lastCalcBar = -1;
         private string _lastInputsHash = "";
         private bool _lastEffectiveDryRun = true; // para detectar cambios intrasesión
+
+        // Market order watchdog for demo delays
+        private DateTime _lastMarketSentUtc = DateTime.MinValue;
+        private bool _marketOrderPending = false;
 
         private struct Pending { public Guid Uid; public int BarId; public int Dir; }
 
@@ -1027,6 +1042,12 @@ namespace MyAtas.Strategies
 
             // --- NOTA: PASO 3 calculation now handled by Capa 2 throttling system above ---
 
+            // --- BRACKET WATCHDOG: Re-attach missing brackets (replay stability) ---
+            if (IsFirstTickOf(bar))
+            {
+                try { BracketWatchdog(); } catch { /* best-effort */ }
+            }
+
             // --- FAILSAFE: Flat watchdog to prevent stuck _tradeActive ---
             if (EnableFlatWatchdog && IsFirstTickOf(bar))
             {
@@ -1102,16 +1123,34 @@ namespace MyAtas.Strategies
                 if ((comment?.StartsWith("468ENTRY:") ?? false)
                     && (status == OrderStatus.Placed || status == OrderStatus.PartlyFilled || status == OrderStatus.Filled))
                 {
-                    // Cacheo robusto del precio de entrada en el primer momento fiable
-                    try
+                    // A) Resolver dirección real de ejecución vs intención inicial
+                    if (status == OrderStatus.PartlyFilled || status == OrderStatus.Filled)
                     {
-                        if (status == OrderStatus.Filled && order.Price > 0)
+                        var executedDir = order.Direction == OrderDirections.Buy ? 1 : -1;
+                        if (_entryDir != executedDir)
                         {
-                            _lastEntryPrice = order.Price;
-                            DebugLog.W("468/BRK", $"ENTRY filled → cache entryPrice={_lastEntryPrice:F2}");
+                            DebugLog.Critical("468/STR", $"ENTRY SIDE RESOLVE: prev={_entryDir} -> actual={(executedDir>0?"BUY":"SELL")}");
+                            _entryDir = executedDir;
                         }
+                        if (order.Price > 0)
+                            _lastEntryPrice = order.Price;
+
+                        // C) Market order watchdog - detect demo delays
+                        if (_marketOrderPending && MarketWatchdogSec > 0)
+                        {
+                            var elapsed = (DateTime.UtcNow - _lastMarketSentUtc).TotalSeconds;
+                            if (elapsed > MarketWatchdogSec)
+                            {
+                                DebugLog.W("468/ORD", $"MARKET fill delayed {elapsed:F1}s (demo emulation?)");
+                            }
+                            _marketOrderPending = false;
+                        }
+
+                        DebugLog.W("468/STR", $"ENTRY FILL side={(executedDir>0?"BUY":"SELL")} price={_lastEntryPrice:F2}");
+
+                        // Schedule bracket attachment for watchdog
+                        _scheduleAttachBrackets = true;
                     }
-                    catch { /* best-effort */ }
 
                     _tradeActive = true;
                     if (!_bracketsPlaced)
@@ -1443,6 +1482,35 @@ namespace MyAtas.Strategies
             return (sl, tps);
         }
 
+        private void BracketWatchdog()
+        {
+            if (!EnableBracketWatchdog) return;
+
+            var net = Math.Abs(GetNetPosition());
+            if (net <= 0) { _scheduleAttachBrackets = false; return; }
+
+            bool hasActiveSL = _liveOrders.Any(o => o?.Comment?.StartsWith("468SL:") == true && o.State == OrderStates.Active);
+            bool hasActiveTP = _liveOrders.Any(o => o?.Comment?.StartsWith("468TP") == true && o.State == OrderStates.Active);
+
+            if ((!hasActiveSL || !hasActiveTP) && _scheduleAttachBrackets)
+            {
+                // Recalcular precios desde _lastEntryPrice y _entryDir
+                var (slPx, tpList) = BuildBracketPrices(_entryDir, /*signalBar*/CurrentBar, /*execBar*/CurrentBar);
+                slPx = RoundToTick(slPx);
+                for (int i=0;i<tpList.Count;i++) tpList[i] = RoundToTick(tpList[i]);
+
+                var coverSide = _entryDir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+                var oco = Guid.NewGuid().ToString("N");
+                var qtySplit = SplitQtyForTPs(net, tpList.Count);
+                SubmitStop(oco, coverSide, net, slPx);
+                for (int i=0;i<tpList.Count;i++)
+                    SubmitLimit(oco, coverSide, qtySplit[i], tpList[i], i);
+
+                DebugLog.Critical("468/BRK", $"WATCHDOG re-attached brackets net={net} sl={slPx:F2} tps=[{string.Join(",",tpList)}]");
+                _scheduleAttachBrackets = false;
+            }
+        }
+
         private List<int> SplitQtyForTPs(int totalQty, int nTps)
         {
             var q = new List<int>();
@@ -1464,6 +1532,10 @@ namespace MyAtas.Strategies
         {
             // *** CRITICAL DEBUG ***
             DebugLog.Critical("468/STR", $"SubmitMarket CALLED: dir={dir} qty={qty} bar={bar} t={GetCandle(bar).Time:HH:mm:ss} - THIS IS OUR N+1 EXECUTION");
+
+            // C) Market order watchdog - track timing for demo delay detection
+            _lastMarketSentUtc = DateTime.UtcNow;
+            _marketOrderPending = true;
 
             var order = new Order
             {
@@ -1658,8 +1730,10 @@ namespace MyAtas.Strategies
         private decimal CloseAt(int i) => GetCandle(SafeBarIndex(i)).Close;
         private decimal RoundToTick(decimal price)
         {
-            var steps = Math.Round(price / InternalTickSize, MidpointRounding.AwayFromZero);
-            return steps * InternalTickSize;
+            var ts = (EffectiveTickSize > 0m) ? EffectiveTickSize : (Security?.TickSize ?? 0.25m);
+            if (ts <= 0m) ts = 0.25m;
+            var steps = Math.Round(price / ts, MidpointRounding.AwayFromZero);
+            return steps * ts;
         }
 
         // FIXED: Add safe bar index method
