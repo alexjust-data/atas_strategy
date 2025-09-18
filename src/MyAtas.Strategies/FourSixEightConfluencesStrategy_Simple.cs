@@ -1102,8 +1102,18 @@ namespace MyAtas.Strategies
                             _entryDir = executedDir;
                         }
                         var effectivePrice = GetEffectiveFillPrice(order);
-                        if (effectivePrice > 0m)
+                        if (effectivePrice > 0)
+                        {
                             _lastEntryPrice = effectivePrice;
+                            DebugLog.W("468/STR", $"ENTRY FILL side={(_entryDir>0?"BUY":"SELL")} price={_lastEntryPrice:F2}");
+                        }
+                        else
+                        {
+                            // último recurso: usa Close del bar si no hay fill price (mejor que 0, evita saltarse BE)
+                            var fallback = GetCandle(CurrentBar).Close;
+                            _lastEntryPrice = fallback;
+                            DebugLog.W("468/STR", $"ENTRY FILL price unresolved -> fallback close={_lastEntryPrice:F2}");
+                        }
 
                         // C) Market order watchdog - detect demo delays
                         if (_marketOrderPending && MarketWatchdogSec > 0)
@@ -1115,8 +1125,6 @@ namespace MyAtas.Strategies
                             }
                             _marketOrderPending = false;
                         }
-
-                        DebugLog.W("468/STR", $"ENTRY FILL side={(executedDir>0?"BUY":"SELL")} price={_lastEntryPrice:F2}");
 
                         // Schedule bracket attachment for watchdog
                         _scheduleAttachBrackets = true;
@@ -1434,6 +1442,9 @@ namespace MyAtas.Strategies
                 // Sin TPs activos → SL único por la qty completa
                 SubmitStop(null, coverSide, totalQty, slPx);
                 DebugLog.W("468/STR", $"BRACKETS: SL-only {totalQty} @ {slPx:F2} (no TPs enabled)");
+
+                // Log consistency check after SL-only bracket
+                LogSlConsistencyIfPossible();
                 return;
             }
 
@@ -1449,6 +1460,9 @@ namespace MyAtas.Strategies
             }
 
             DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))} | Split=[{string.Join(",", qtySplit)}] | Total={totalQty}");
+
+            // Log consistency check after brackets are attached
+            LogSlConsistencyIfPossible();
         }
 
         private (decimal slPx, List<decimal> tpList) BuildBracketPrices(int dir, int signalBar, int execBar)
@@ -1764,6 +1778,27 @@ namespace MyAtas.Strategies
         }
 
         /// <summary>
+        /// Log de consistencia SL (diagnóstico)
+        /// </summary>
+        private void LogSlConsistencyIfPossible()
+        {
+            try
+            {
+                // Busca un stop activo (prefijo estándar de tus comentarios)
+                var sl = _liveOrders.FirstOrDefault(o =>
+                    o != null && (o.Comment?.StartsWith("468SL:") ?? false) && o.State == OrderStates.Active);
+
+                if (sl == null || _lastEntryPrice <= 0) return;
+
+                var actualTicks = Math.Abs(sl.Price - _lastEntryPrice) / Ticks(1);
+                DebugLog.W("468/CALC", $"CONSISTENCY SL [entry={_lastEntryPrice:F2} stop={sl.Price:F2}] " +
+                                       $"planned={LastStopDistance:F1}t actual={actualTicks:F1}t " +
+                                       $"delta={(actualTicks - LastStopDistance):F1}t rpc={LastRiskPerContract:F2}USD");
+            }
+            catch { /* best-effort */ }
+        }
+
+        /// <summary>
         /// Helper to extract OCO group ID from an order
         /// </summary>
         private string ExtractOcoId(Order order)
@@ -1813,89 +1848,24 @@ namespace MyAtas.Strategies
         // ====================== HELPERS - FIXED ======================
 
         // ===== Helpers de fills/ejecución =====
-        private decimal GetEffectiveFillPrice(Order order)
+        private decimal GetEffectiveFillPrice(object order)
         {
+            if (order == null) return 0m;
             try
             {
-                if (order == null) return 0m;
-
-                // 1) Precio "Price" si viene informado (>0)
-                if (order.Price > 0m) return order.Price;
-
-                // 2) Propiedades típicas de fill/avg (reflection)
-                decimal TryProp(object obj, string name)
+                var t = order.GetType();
+                string[] names = { "AveragePrice", "AvgFillPrice", "ExecutionPrice", "LastFillPrice", "FillPrice", "Price" };
+                foreach (var n in names)
                 {
-                    var p = obj.GetType().GetProperty(name, BindingFlags.Instance | BindingFlags.Public);
-                    if (p == null) return 0m;
-                    var v = p.GetValue(obj);
-                    if (v == null) return 0m;
-                    if (v is decimal dm) return dm;
-                    if (v is double db)  return (decimal)db;
-                    if (v is float  fl)  return (decimal)fl;
-                    if (decimal.TryParse(v.ToString(), out var d)) return d;
-                    return 0m;
-                }
-
-                string[] candidates =
-                {
-                    "AveragePrice","AvgPrice","AvgFillPrice",
-                    "ExecutionPrice","LastFillPrice","LastPrice","FillPrice","TradePrice"
-                };
-                foreach (var n in candidates)
-                {
-                    var d = TryProp(order, n);
-                    if (d > 0m) return d;
-                }
-
-                // 3) Colecciones de fills: Executions / Fills / Trades
-                var collProp =
-                    order.GetType().GetProperty("Executions") ??
-                    order.GetType().GetProperty("Fills") ??
-                    order.GetType().GetProperty("Trades");
-                var coll = collProp?.GetValue(order) as IEnumerable;
-                if (coll != null)
-                {
-                    decimal last = 0m;
-                    foreach (var it in coll)
-                    {
-                        var pd =
-                            it.GetType().GetProperty("Price") ??
-                            it.GetType().GetProperty("TradePrice") ??
-                            it.GetType().GetProperty("ExecutionPrice");
-                        if (pd != null)
-                        {
-                            var v = pd.GetValue(it);
-                            if (v is decimal dm) last = dm;
-                            else if (v is double db) last = (decimal)db;
-                            else if (v is float fl)   last = (decimal)fl;
-                            else if (decimal.TryParse(v?.ToString(), out var d)) last = d;
-                        }
-                    }
-                    if (last > 0m) return last;
-                }
-
-                // 4) Fallback último: precio medio de la posición viva (si existe)
-                var portfolio = Portfolio;
-                var security  = Security;
-                if (portfolio != null && security != null)
-                {
-                    var getPos = portfolio.GetType().GetMethod("GetPosition", new[] { security.GetType() });
-                    var pos = getPos?.Invoke(portfolio, new[] { security });
-                    if (pos != null)
-                    {
-                        var pAvg =
-                            pos.GetType().GetProperty("AveragePrice") ??
-                            pos.GetType().GetProperty("AvgPrice") ??
-                            pos.GetType().GetProperty("EntryPrice");
-                        var avg = pAvg != null ? TryProp(pos, pAvg.Name) : 0m;
-                        if (avg > 0m) return avg;
-                    }
+                    var p = t.GetProperty(n);
+                    if (p == null) continue;
+                    var v = p.GetValue(order);
+                    if (v is decimal d && d > 0) return d;
+                    if (v is double dd && dd > 0) return (decimal)dd;
+                    if (v is float ff && ff > 0) return (decimal)ff;
                 }
             }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/ORD", $"GetEffectiveFillPrice error: {ex.Message}");
-            }
+            catch { /* best-effort */ }
             return 0m;
         }
         // FIXED: Use override instead of new to properly override base property
@@ -2301,12 +2271,13 @@ namespace MyAtas.Strategies
                 return true;
             }
 
-            bool up   = gN1 > gN;
-            bool down = gN1 < gN;
-            bool ok = dir > 0 ? up : down; // BUY exige subiendo; SELL exige bajando (estricto)
+            const decimal eps = 0.0001m;
+            bool trendUp   = (gN - gN1) >  eps;
+            bool trendDown = (gN1 - gN) >  eps;
+            bool ok = dir > 0 ? trendUp : trendDown; // BUY exige subiendo; SELL exige bajando (estricto)
 
             DebugLog.W("468/STR", $"CONF#1 (GL slope @N+1) gN={gN:F5} gN1={gN1:F5} " +
-                                   $"trend={(up? "UP": (down? "DOWN":"FLAT"))} -> {(ok? "OK":"FAIL")}");
+                                   $"trend={(trendUp? "UP": (trendDown? "DOWN":"FLAT"))} -> {(ok? "OK":"FAIL")}");
             return ok;
         }
 
