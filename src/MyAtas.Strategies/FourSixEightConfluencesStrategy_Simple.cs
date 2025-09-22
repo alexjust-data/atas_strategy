@@ -20,7 +20,7 @@ namespace MyAtas.Strategies
     public enum BreakevenMode { Disabled, Manual, OnTPFill }
 
     [DisplayName("468 – Simple Strategy (GL close + 2 confluences) - FIXED")]
-    public class FourSixEightSimpleStrategy : ChartStrategy
+    public partial class FourSixEightSimpleStrategy : ChartStrategy
     {
         // ====================== USER PARAMETERS ======================
         [Category("General"), DisplayName("Quantity")]
@@ -299,166 +299,8 @@ namespace MyAtas.Strategies
             }
 
             // --- DEBUG: Check for signal availability and CAPTURE AT N ---
-            var sig = _ind?.LastSignal;
-            if (sig.HasValue)
-            {
-                DebugLog.W("468/STR", $"SIGNAL_CHECK: bar={bar} sigBar={sig.Value.BarId} dir={(sig.Value.Dir > 0 ? "BUY" : "SELL")} uid={sig.Value.Uid.ToString().Substring(0, 8)} lastUid={(_lastUid != Guid.Empty ? _lastUid.ToString().Substring(0, 8) : "NONE")} condition_barMatch={sig.Value.BarId == bar} condition_uidNew={sig.Value.Uid != _lastUid}");
-            }
-
-            // 1) CAPTURE AT N (only when the GL-cross signal is on THIS bar) + CLOSE CONFIRMATION
-            if (sig.HasValue && sig.Value.BarId == bar && sig.Value.Uid != _lastUid)
-            {
-                bool closeConfirmed = true;
-
-                if (ValidateGenialCrossLocally && bar >= 1)
-                {
-                    var cN  = GetCandle(bar).Close;
-                    var gN  = GenialAt(bar);
-                    var cN1 = GetCandle(bar - 1).Close;
-                    var gN1 = GenialAt(bar - 1);
-                    var eps = Ticks(Math.Max(0, HysteresisTicks));
-
-                    // FIXED: Proper hysteresis implementation for both current and previous bar
-                    if (sig.Value.Dir > 0) // BUY
-                        closeConfirmed = (cN > gN + eps) && (cN1 <= gN1 + eps);
-                    else                   // SELL
-                        closeConfirmed = (cN < gN - eps) && (cN1 >= gN1 - eps);
-                }
-
-                if (closeConfirmed)
-                {
-                    _lastUid = sig.Value.Uid;
-                    _pending = new Pending { Uid = sig.Value.Uid, BarId = bar, Dir = sig.Value.Dir };
-                    DebugLog.Critical("468/STR", $"CAPTURE: N={bar} {(sig.Value.Dir>0?"BUY":"SELL")} uid={sig.Value.Uid} (confirmed close)");
-                }
-                else
-                {
-                    DebugLog.W("468/STR", $"IGNORE signal at N={bar} (close did not confirm; avoids intrabar flip-flop)");
-                }
-            }
-
-            // 2) EXECUTE EXACTLY AT N+1 — windowed (armed/execute/expire)
-            if (_pending.HasValue)
-            {
-                var execBar = _pending.Value.BarId + 1;
-                if (bar < execBar)
-                {
-                    // Aún no toca; mantenemos el pending "ARMED"
-                    if ((bar % 50) == 0)
-                        DebugLog.W("468/STR", $"PENDING ARMED: now={bar}, execBar={execBar}");
-                    return;
-                }
-                if (bar > execBar)
-                {
-                    // Nos saltamos N+1 → señal caducada (nada de pendientes eternos)
-                    DebugLog.W("468/STR", $"PENDING EXPIRED: now={bar}, execBar={execBar}");
-                    _pending = null;
-                    return;
-                }
-
-                // Aquí bar == execBar → toca ejecutar en N+1
-                DebugLog.W("468/STR", $"PROCESSING PENDING @N+1: bar={bar}, execBar={execBar}");
-                var s = _pending.Value;
-
-                // hard anti-dup by UID
-                if (s.Uid == _lastExecUid)
-                {
-                    _pending = null;
-                    DebugLog.W("468/STR", "SKIP: Already executed this UID");
-                    return;
-                }
-
-                int dir = s.Dir;
-                int qty = Math.Max(1, Quantity);
-
-                // 1) Apertura N+1: estricta (primer tick) con tolerancia por precio
-                if (StrictN1Open)
-                {
-                    if (!IsFirstTickOf(bar))
-                    {
-                        var openN1 = GetCandle(bar).Open;
-                        var lastPx = GetCandle(bar).Close; // precio actual del bar N+1
-                        var tol    = Ticks(Math.Max(0, OpenToleranceTicks));
-                        if (Math.Abs(lastPx - openN1) > tol)
-                        {
-                            DebugLog.W("468/STR", $"EXPIRE: missed first tick and |{lastPx-openN1}| > {tol}");
-                            _pending = null;
-                            return;
-                        }
-                        DebugLog.W("468/STR", $"First-tick missed but within tolerance ({lastPx}~{openN1}) -> proceed");
-                    }
-                }
-
-                // 2) Dirección de la vela que cruzó (en N) debe coincidir con la señal
-                var sigCandle = GetCandle(s.BarId);
-                bool candleDirOk = dir > 0 ? (sigCandle.Close > sigCandle.Open)
-                                           : (sigCandle.Close < sigCandle.Open);
-                if (!candleDirOk)
-                {
-                    _pending = null;
-                    DebugLog.W("468/STR", "ABORT ENTRY: Candle direction at N does not match signal");
-                    return;
-                }
-
-                // --- Confluence #1: Pendiente de GenialLine A FAVOR en N+1 (vela de ejecución)
-                if (RequireGenialSlope)
-                {
-                    // CheckGenialSlope ya imprime prev/curr y trend real con la misma serie que usa para decidir
-                    bool glOk = CheckGenialSlope(dir, bar);
-                    if (!glOk) { _pending = null; DebugLog.W("468/STR", "ABORT ENTRY: Conf#1 failed"); return; }
-                }
-
-                // --- Confluencia #2: EMA8 vs Wilder8 en N+1, con reglas granulares
-                if (RequireEmaVsWilder)
-                {
-                    bool emaOk = CheckEmaVsWilderAtExec(dir, bar);
-                    if (!emaOk) { _pending = null; DebugLog.W("468/STR", "ABORT ENTRY: Conf#2 failed"); return; }
-                }
-
-                // --- Validar solo una posición abierta (opcional) ---
-                if (OnlyOnePosition)
-                {
-                    int net = GetNetPosition();
-                    bool inCooldown = EnableCooldown && CooldownBars > 0 && _cooldownUntilBar >= 0 && bar <= _cooldownUntilBar;
-                    bool busy = _tradeActive || net != 0 || HasAnyActiveOrders() || inCooldown;
-                    DebugLog.W("468/STR", $"GUARD OnlyOnePosition: active={_tradeActive} net={net} activeOrders={CountActiveOrders()} cooldown={(inCooldown ? $"YES(until={_cooldownUntilBar})" : "NO")} -> {(busy ? "BLOCK" : "PASS")}");
-
-                    // Si net=0 pero hay órdenes activas "zombie", CANCELA en broker (no sólo limpiar lista)
-                    if (net == 0 && HasAnyActiveOrders())
-                    {
-                        DebugLog.W("468/STR", "ZOMBIE CANCEL: net=0 but active orders present -> cancelling...");
-                        CancelAllLiveActiveOrders();
-                        // CRITICAL FIX: NO re-entrar en el mismo ciclo. Esperar a que OnOrderChanged limpie.
-                        DebugLog.W("468/STR", "RETRY NEXT TICK: keeping pending for re-check after zombie cancel");
-                        // Conservar señal pendiente para reevaluación en próximo tick/bar
-                        return; // ← salir y dejar que el próximo OnCalculate reevalúe
-                    }
-
-                    if (busy)
-                    {
-                        _pending = null;
-                        DebugLog.W("468/STR", "ABORT ENTRY: OnlyOnePosition guard is active");
-                        return;
-                    }
-                }
-
-                // --- Todas las confluencias OK -> solo market; los brackets se adjuntan post-fill ---
-                try
-                {
-                    SubmitMarket(dir, qty, bar, s.BarId);
-                    _lastExecUid = s.Uid;
-
-                    DebugLog.Critical("468/STR", $"ENTRY sent at N+1 bar={bar} (signal N={s.BarId}) dir={(dir>0?"BUY":"SELL")} qty={qty} - brackets will attach post-fill");
-                }
-                catch (Exception ex)
-                {
-                    DebugLog.W("468/STR", "EXEC EX: " + ex);
-                }
-                finally
-                {
-                    _pending = null;
-                }
-            }
+            // === SEÑALES: captura en N, ejecución en N+1 ===
+            ProcessSignalLogic(bar);
 
             // --- Reconciliación controlada (1x por barra y fuera de anti-flat) ---
             if (EnableReconciliation && bar != _lastReconcileBar && IsFirstTickOf(bar))
@@ -730,162 +572,20 @@ namespace MyAtas.Strategies
         }
 
         // ====================== BRACKETS (ROBUST) ======================
-        private void BuildAndSubmitBracket(int dir, int totalQty, int signalBar, int execBar)
-        {
-            if (totalQty <= 0) return;
+        // (moved to Execution.cs)
 
-            var (slPx, tpList) = BuildBracketPrices(dir, signalBar, execBar); // tpList respeta EnableTP1/2/3
-            var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+        // (BuildBracketPrices moved to Execution.cs)
 
-            int enabled = tpList.Count;
-            if (enabled <= 0)
-            {
-                // Sin TPs activos → SL único por la qty completa
-                SubmitStop(null, coverSide, totalQty, slPx);
-                DebugLog.W("468/STR", $"BRACKETS: SL-only {totalQty} @ {slPx:F2} (no TPs enabled)");
-                return;
-            }
+        // (SplitQtyForTPs moved to Execution.cs)
 
-            // Reparto de cantidad entre TPs habilitados (p.ej., 3→[2,1] si enabled=2)
-            var qtySplit = SplitQtyForTPs(totalQty, enabled); // ya existe en tu código
-
-            for (int i = 0; i < enabled; i++)
-            {
-                int legQty = Math.Max(1, qtySplit[i]);
-                var oco = Guid.NewGuid().ToString("N");
-                SubmitStop(oco, coverSide, legQty, slPx);
-                SubmitLimit(oco, coverSide, legQty, tpList[i]);
-            }
-
-            DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))} | Split=[{string.Join(",", qtySplit)}] | Total={totalQty}");
-        }
-
-        private (decimal slPx, List<decimal> tpList) BuildBracketPrices(int dir, int signalBar, int execBar)
-        {
-            // FIXED: Use UseSignalCandleSL property
-            var refCandle = UseSignalCandleSL ? GetCandle(signalBar) : GetCandle(execBar);
-
-            decimal sl = dir > 0 ? refCandle.Low  - Ticks(Math.Max(0, StopOffsetTicks))
-                                 : refCandle.High + Ticks(Math.Max(0, StopOffsetTicks));
-            sl = RoundToTick(sl);
-
-            // Entrada de referencia: apertura de N+1 (o close de N como fallback)
-            decimal entryPx;
-            try
-            {
-                // Intentar la apertura de la vela de ejecución
-                if (execBar <= CurrentBar)
-                {
-                    entryPx = GetCandle(execBar).Open;
-                }
-                else
-                {
-                    // Fallback: cierre de N si exec aún no existe
-                    entryPx = GetCandle(signalBar).Close;
-                }
-            }
-            catch
-            {
-                // Ultimate fallback
-                entryPx = GetCandle(signalBar).Close;
-            }
-
-            if (entryPx <= 0) entryPx = GetCandle(signalBar).Close;
-
-            decimal risk = Math.Abs(entryPx - sl);
-            if (risk <= 0) risk = Ticks(2);
-
-            var tps = new List<decimal>();
-            if (EnableTP1) tps.Add(RoundToTick(dir > 0 ? entryPx + TP1_R * risk : entryPx - TP1_R * risk));
-            if (EnableTP2) tps.Add(RoundToTick(dir > 0 ? entryPx + TP2_R * risk : entryPx - TP2_R * risk));
-            if (EnableTP3) tps.Add(RoundToTick(dir > 0 ? entryPx + TP3_R * risk : entryPx - TP3_R * risk));
-
-            DebugLog.W("468/STR", $"BRACKET-PRICES: entry~{entryPx:F2} sl={sl:F2} risk={risk:F2}");
-            return (sl, tps);
-        }
-
-        private List<int> SplitQtyForTPs(int totalQty, int nTps)
-        {
-            var q = new List<int>();
-            if (nTps <= 0) { q.Add(totalQty); return q; }
-            int baseQ = Math.Max(1, totalQty / nTps);
-            int rem = totalQty - baseQ * nTps;
-            for (int i = 0; i < nTps; i++) q.Add(baseQ + (i < rem ? 1 : 0));
-            return q;
-        }
-
-        // FIXED: Implement missing ElementAtOrDefault method
-        private static T GetElementAtOrDefault<T>(List<T> list, int index, T defaultValue)
-        {
-            return (index >= 0 && index < list.Count) ? list[index] : defaultValue;
-        }
+        // (GetElementAtOrDefault moved to Execution.cs)
 
         // ====================== ORDER WRAPPERS ======================
-        private void SubmitMarket(int dir, int qty, int bar, int signalBar)
-        {
-            // *** CRITICAL DEBUG ***
-            DebugLog.Critical("468/STR", $"SubmitMarket CALLED: dir={dir} qty={qty} bar={bar} t={GetCandle(bar).Time:HH:mm:ss} - THIS IS OUR N+1 EXECUTION");
+        // (SubmitMarket moved to Execution.cs)
 
-            var order = new Order
-            {
-                Portfolio = Portfolio,
-                Security  = Security,
-                Direction = dir > 0 ? OrderDirections.Buy : OrderDirections.Sell,
-                Type      = OrderTypes.Market,
-                QuantityToFill = qty,
-                Comment = $"468ENTRY:{DateTime.UtcNow:HHmmss}"
-            };
-            OpenOrder(order);
-            _liveOrders.Add(order);
+        // (SubmitLimit moved to Execution.cs)
 
-            // Track signal context for post-fill brackets
-            _targetQty = qty;
-            _lastSignalBar = signalBar;
-            _entryDir = dir;
-            _bracketsPlaced = false;
-
-            DebugLog.Critical("468/STR", $"MARKET ORDER SENT: {(dir>0?"BUY":"SELL")} {qty} at N+1 (bar={bar}) - OpenOrder() called successfully");
-        }
-
-        private void SubmitLimit(string oco, OrderDirections side, int qty, decimal px)
-        {
-            var order = new Order
-            {
-                Portfolio = Portfolio,
-                Security  = Security,
-                Direction = side,
-                Type      = OrderTypes.Limit,
-                Price     = px,
-                QuantityToFill = qty,
-                OCOGroup  = oco,
-                AutoCancel = EnableAutoCancel,
-                IsAttached = true,
-                Comment   = $"468TP:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
-            };
-            OpenOrder(order);
-            _liveOrders.Add(order);
-            DebugLog.W("468/ORD", $"LIMIT submitted: {side} {qty} @{px:F2} OCO={(oco??"none")}");
-        }
-
-        private void SubmitStop(string oco, OrderDirections side, int qty, decimal triggerPx)
-        {
-            var order = new Order
-            {
-                Portfolio = Portfolio,
-                Security  = Security,
-                Direction = side,
-                Type      = OrderTypes.Stop,
-                TriggerPrice = triggerPx,
-                QuantityToFill = qty,
-                OCOGroup = oco,
-                AutoCancel = EnableAutoCancel,
-                IsAttached = true,
-                Comment = $"468SL:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
-            };
-            OpenOrder(order);
-            _liveOrders.Add(order);
-            DebugLog.W("468/ORD", $"STOP submitted: {side} {qty} @{triggerPx:F2} OCO={(oco??"none")}");
-        }
+        // (SubmitStop moved to Execution.cs)
 
         private int GetFilledQtyFromOrder(object order)
         {
