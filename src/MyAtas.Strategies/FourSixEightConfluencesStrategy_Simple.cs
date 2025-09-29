@@ -252,6 +252,17 @@ namespace MyAtas.Strategies
         [ReadOnly(true)]
         public decimal EffectiveAccountEquity { get; private set; } = 10000.0m;
 
+        // ====================== EXTERNAL RISK MANAGEMENT INTEGRATION ======================
+        [Category("Risk Management/Integration"), DisplayName("External risk controls SL/Trail")]
+        public bool ExternalRiskControlsStops { get; set; } = false;
+
+        // TODO: Future integration points when connecting external RM:
+        // 1. Position sizing calculations (delegate to external RM)
+        // 2. SL placement and trailing logic (ActivateBreakEven early return)
+        // 3. Risk-based quantity adjustments
+        // 4. Portfolio-level risk limits and exposure checks
+        // 5. Cross-strategy position coordination
+
         // ====================== INTERNAL STATE ======================
         private FourSixEightIndicator _ind;
         private Pending? _pending;           // captured at N (GL-cross close confirmed)

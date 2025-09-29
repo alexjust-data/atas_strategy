@@ -93,6 +93,10 @@ namespace MyAtas.Strategies
         {
             if (totalQty <= 0) return;
 
+            // TODO: External Risk Management Integration Point
+            // When ExternalRiskControlsStops=true, this method could delegate
+            // SL creation to external RM while keeping TP logic internal
+
             var (slPx, tpList) = BuildBracketPrices(dir, signalBar, execBar); // tpList respeta EnableTP1/2/3
             var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
 

@@ -87,6 +87,14 @@ namespace MyAtas.Strategies
         // --- Aplicación del BE: reconstruye los OCO(s) de los TP(s) supervivientes ---
         private bool ActivateBreakEven(string reason)
         {
+            // TODO: External Risk Management Integration Point
+            // When external RM is connected, it will handle all SL/Trail logic
+            if (ExternalRiskControlsStops)
+            {
+                DebugLog.W("468/BRK", $"BE DELEGATED: External RM controls stops -> reason='{reason}'");
+                return false; // External RM will handle this
+            }
+
             try
             {
                 int net = Math.Abs(GetNetPosition());
