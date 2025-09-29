@@ -22,6 +22,46 @@ namespace MyAtas.Strategies
     [DisplayName("468 – Simple Strategy (GL close + 2 confluences) - FIXED")]
     public partial class FourSixEightSimpleStrategy : ChartStrategy
     {
+        // --- Helper: net por suma de fills (BUY=+1, SELL=-1) ---
+        private int NetByFills()
+        {
+            try { return _orderFills?.Values.Sum() ?? 0; }
+            catch { return 0; }
+        }
+
+        // --- Helper: ¿estado terminal? (no deben contarse como activos) ---
+        private static bool IsTerminal(OrderStatus s)
+            => s == OrderStatus.Filled
+            || s == OrderStatus.Canceled;
+
+        // --- Helper: ¿orden hija viva (TP/SL) con prefijo concreto? ---
+        private bool IsLiveChild(Order o, string prefix)
+        {
+            if (o == null) return false;
+            var comment = o.Comment ?? string.Empty;
+            if (!comment.StartsWith(prefix)) return false;
+            // Null-safe al leer Status() (algunos conectores pueden devolverlo nulo en microventanas)
+            var status = o.Status();
+            if (status != null && IsTerminal(status)) return false;
+            if (status == null) { /* conservador: no lo trates como terminal */ }
+            // Solo considerar activas las órdenes con State=Active (coherente con API ATAS)
+            return o.State == OrderStates.Active;
+        }
+
+        // --- Helper: cuenta TPs activos ---
+        private int CountActiveTPs()
+        {
+            try { return _liveOrders?.Count(o => IsLiveChild(o, "468TP:")) ?? 0; }
+            catch { return 0; }
+        }
+
+        // --- Helper: cuenta SLs activos ---
+        private int CountActiveSLs()
+        {
+            try { return _liveOrders?.Count(o => IsLiveChild(o, "468SL:")) ?? 0; }
+            catch { return 0; }
+        }
+
         // ====================== USER PARAMETERS ======================
         [Category("General"), DisplayName("Quantity")]
         public int Quantity { get; set; } = 1;
@@ -302,6 +342,14 @@ namespace MyAtas.Strategies
             // === SEÑALES: captura en N, ejecución en N+1 ===
             ProcessSignalLogic(bar);
 
+            // --- BE TOUCH: comprobar si se ha tocado algún TP habilitado ---
+            try
+            {
+                if (_tradeActive && _bracketsPlaced && (_entryDir != 0))
+                    CheckBreakEvenTouch_OnCalculate(bar);
+            }
+            catch { /* best-effort */ }
+
             // --- Reconciliación controlada (1x por barra y fuera de anti-flat) ---
             if (EnableReconciliation && bar != _lastReconcileBar && IsFirstTickOf(bar))
             {
@@ -334,6 +382,11 @@ namespace MyAtas.Strategies
                         _cachedNetPosition = 0;
                         _bracketsAttachedAt = DateTime.MinValue;
                         _antiFlatUntilBar = -1;
+                        // Reset BreakEven state
+                        _breakevenApplied = false;
+                        _entryPrice = 0m;
+                        _beLastTouchBar = -1;
+                        _beLastTouchAt = DateTime.MinValue;
                         _flatStreak = 0;
                         _lastFlatRead = DateTime.MinValue;
                         DebugLog.W("468/ORD", "Trade lock RELEASED by watchdog (flat & no active orders)");
@@ -342,16 +395,21 @@ namespace MyAtas.Strategies
                 catch { /* best-effort */ }
             }
 
-            // <<< PATCH 1: HEARTBEAT RELEASE (final, sin depender de AntiFlatMs/bars) >>>
-            // Si por cualquier razón no ha actuado el watchdog o los eventos, libera aquí.
-            if (_tradeActive && !HasAnyActiveOrders() && GetNetPosition() == 0)
+            // <<< PATCH 1: HEARTBEAT RELEASE (final) >>>
+            // Libera sólo si TAMBIÉN NetByFills()==0 para evitar falsos planos tras parciales (TP1).
+            if (_tradeActive && !HasAnyActiveOrders() && GetNetPosition() == 0 && NetByFills() == 0)
             {
+                DebugLog.W("468/ORD",
+                    $"FLAT CONFIRMED (heartbeat): net=0 netByFills=0 tpActive={CountActiveTPs()} slActive={CountActiveSLs()}");
                 _tradeActive = false;
                 _bracketsPlaced = false;
                 _orderFills.Clear();
                 _cachedNetPosition = 0;
                 _bracketsAttachedAt = DateTime.MinValue;
                 _antiFlatUntilBar = -1;
+                // Reset BreakEven state
+                _breakevenApplied = false;
+                _entryPrice = 0m;
                 _flatStreak = 0;
                 _lastFlatRead = DateTime.MinValue;
                 _lastFlatBar = CurrentBar;
@@ -381,6 +439,11 @@ namespace MyAtas.Strategies
                 if (status == OrderStatus.Filled || status == OrderStatus.PartlyFilled)
                 {
                     TrackOrderFill(order, "Filled");
+                    // Capturar precio de entrada al primer fill de la ENTRY
+                    if ((comment.StartsWith("468ENTRY:")))
+                        try { UpdateEntryPriceFromOrder(order); } catch { }
+                    // Disparar BE por FILL de TP si está configurado
+                    try { CheckBreakEvenTrigger_OnOrderChanged(order, status); } catch { }
                 }
                 else if (status == OrderStatus.Canceled)
                 {
@@ -428,6 +491,14 @@ namespace MyAtas.Strategies
                             _bracketsAttachedAt = DateTime.UtcNow;
                             _antiFlatUntilBar = CurrentBar + Math.Max(0, AntiFlatBars);
                             _flatStreak = 0;
+
+                            // --- STATE tras adjuntar brackets ---
+                            DebugLog.W("468/STR",
+                                $"STATE: tradeActive={_tradeActive} " +
+                                $"dir={_entryDir} net={GetNetPosition()} netByFills={NetByFills()} " +
+                                $"tpActive={CountActiveTPs()} slActive={CountActiveSLs()} " +
+                                $"liveOrders={(_liveOrders?.Count ?? 0)} " +
+                                $"signalBar={_lastSignalBar} antiFlatMs={AntiFlatMs} confirmFlatReads={ConfirmFlatReads}");
                             _lastFlatRead = DateTime.MinValue;
                             DebugLog.W("468/STR", $"BRACKETS ATTACHED (from net={net})");
                         }
@@ -469,6 +540,11 @@ namespace MyAtas.Strategies
                         _flatStreak = 0;
                         _lastFlatRead = DateTime.MinValue;
                         _lastFlatBar = CurrentBar;
+                        // Reset BreakEven state
+                        _breakevenApplied = false;
+                        _entryPrice = 0m;
+                        _beLastTouchBar = -1;
+                        _beLastTouchAt = DateTime.MinValue;
                         if (EnableCooldown && CooldownBars > 0)
                         {
                             _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
@@ -487,8 +563,10 @@ namespace MyAtas.Strategies
 
                 // <<< PATCH 2: RELEASE INCONDICIONAL AL FINAL DE OnOrderChanged >>>
                 // Cubre carreras donde FlatConfirmedNow() aún sea false pero ya no hay órdenes activas.
-                if (_tradeActive && netNow == 0 && !HasAnyActiveOrders())
+                if (_tradeActive && netNow == 0 && !HasAnyActiveOrders() && NetByFills() == 0)
                 {
+                    DebugLog.W("468/ORD",
+                        $"FLAT CONFIRMED (OnOrderChanged): net=0 netByFills=0 tpActive={CountActiveTPs()} slActive={CountActiveSLs()}");
                     _tradeActive = false;
                     _bracketsPlaced = false;
                     _bracketsAttachedAt = DateTime.MinValue;
@@ -498,6 +576,9 @@ namespace MyAtas.Strategies
                     _orderFills.Clear();
                     _cachedNetPosition = 0;
                     _lastFlatBar = CurrentBar;
+                    // Reset BreakEven state
+                    _breakevenApplied = false;
+                    _entryPrice = 0m;
                     if (EnableCooldown && CooldownBars > 0)
                         _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
                     DebugLog.W("468/ORD", "Trade lock RELEASED by OnOrderChanged (final)");
@@ -536,6 +617,14 @@ namespace MyAtas.Strategies
                     _bracketsAttachedAt = DateTime.UtcNow;
                     _antiFlatUntilBar = CurrentBar + Math.Max(0, AntiFlatBars);
                     _flatStreak = 0;
+
+                    // --- STATE tras adjuntar brackets (OnPositionChanged) ---
+                    DebugLog.W("468/STR",
+                        $"STATE: tradeActive={_tradeActive} " +
+                        $"dir={_entryDir} net={GetNetPosition()} netByFills={NetByFills()} " +
+                        $"tpActive={CountActiveTPs()} slActive={CountActiveSLs()} " +
+                        $"liveOrders={(_liveOrders?.Count ?? 0)} " +
+                        $"signalBar={_lastSignalBar} antiFlatMs={AntiFlatMs} confirmFlatReads={ConfirmFlatReads}");
                     _lastFlatRead = DateTime.MinValue;
                     DebugLog.W("468/STR", $"BRACKETS ATTACHED (via OnPositionChanged, net={net})");
                 }
@@ -559,6 +648,11 @@ namespace MyAtas.Strategies
                         // Clear fill tracking cache when truly flat
                         _orderFills.Clear();
                         _cachedNetPosition = 0;
+                        // Reset BreakEven state
+                        _breakevenApplied = false;
+                        _entryPrice = 0m;
+                        _beLastTouchBar = -1;
+                        _beLastTouchAt = DateTime.MinValue;
                         DebugLog.W("468/ORD", "Trade lock RELEASED by OnPositionChanged (flat confirmed & no active orders)");
                     }
                 }
@@ -818,6 +912,7 @@ namespace MyAtas.Strategies
                 {
                     _orderFills[orderId] = netQty;
                     DebugLog.W("468/POS", $"Tracked fill: {orderId} = {netQty} (type: {c.Substring(0,8)})");
+                    DebugLog.W("468/POS", $"FILL SNAPSHOT: netByFills={NetByFills()} | liveOrders={(_liveOrders?.Count ?? 0)}");
                 }
                 else if (action == "Canceled")
                 {
@@ -890,6 +985,10 @@ namespace MyAtas.Strategies
 
         private bool FlatConfirmedNow(int netNow)
         {
+            // Nunca confirmes 'flat' si por fills queda posición
+            if (NetByFills() != 0)
+                return false;
+
             // 1) Actualiza racha de lecturas planas
             if (netNow == 0)
             {
@@ -917,8 +1016,8 @@ namespace MyAtas.Strategies
                 _ => (timeOk && barsOk) // Hybrid
             };
 
-            // 3) Lecturas consistentes
-            bool readsOk = _flatStreak >= Math.Max(1, ConfirmFlatReads);
+            // Endurecer: mínimo 3 lecturas coherentes
+            bool readsOk = _flatStreak >= Math.Max(3, ConfirmFlatReads);
 
             return (netNow == 0) && policyOk && readsOk;
         }
@@ -1107,26 +1206,49 @@ namespace MyAtas.Strategies
         private void ReconcileBracketsWithNet()
         {
             int net = Math.Abs(GetNetPosition());
+            int netByFills = Math.Abs(NetByFills());
+            DebugLog.W("468/STR", $"RECONCILE START: net={net} netByFills={netByFills}");
+
             if (net <= 0 && !FlatConfirmedNow(0))
             {
                 DebugLog.W("468/STR", "RECONCILE SKIP: net=0 (not flat-confirmed) → protect children");
                 return;
             }
-            if (net < 0) net = 0;
+            if (net < 0)
+            {
+                DebugLog.W("468/STR", "RECONCILE: clamping net from negative to 0");
+                net = 0;
+            }
 
             // TPs activos de esta estrategia
             var tps = _liveOrders
                 .Where(o => o != null && (o.Comment?.StartsWith("468TP:") ?? false)
                        && o.State == OrderStates.Active && o.Status() != OrderStatus.Filled && o.Status() != OrderStatus.Canceled)
                 .ToList();
+            DebugLog.W("468/STR", $"RECONCILE TPs: found {tps.Count} active TPs for net={net}");
 
             // Si hay más TPs que net -> cancelar sobrantes
             if (tps.Count > net)
             {
-                // dejar los más cercanos primero (ordenar por Price asc. es suficiente para BUY)
-                var toCancel = tps.OrderBy(o => o.Price).Skip(net).ToList();
+                DebugLog.W("468/STR", $"RECONCILE TPs: need to cancel {tps.Count - net} excess TPs");
+                // dejar los más lejanos (más ambiciosos) para largos
+                var toCancel = tps.OrderByDescending(o => o.Price).Skip(net).ToList();
                 foreach (var o in toCancel)
-                    try { CancelOrder(o); } catch { }
+                {
+                    try
+                    {
+                        DebugLog.W("468/STR", $"RECONCILE CANCEL TP: price={o.Price:F2}");
+                        CancelOrder(o);
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugLog.W("468/STR", $"RECONCILE CANCEL TP EX: {ex.Message}");
+                    }
+                }
+            }
+            else if (tps.Count < net)
+            {
+                DebugLog.W("468/STR", $"RECONCILE TPs: have {tps.Count} TPs but net={net} (TP deficit, normal after partial fills)");
             }
 
             // Stops activos
@@ -1136,19 +1258,42 @@ namespace MyAtas.Strategies
                 .ToList();
             int slQty = 0;
             foreach (var s in sls) { try { slQty += (int)s.QuantityToFill; } catch { } }
+            DebugLog.W("468/STR", $"RECONCILE SLs: found {sls.Count} SL orders with total qty={slQty} (need={net})");
 
             // Si la suma de SL != net -> simplificar a un único SL = net
             if (slQty != net)
             {
-                foreach (var s in sls) { try { CancelOrder(s); } catch { } }
+                DebugLog.W("468/STR", $"RECONCILE SL QTY MISMATCH: have={slQty} need={net} -> rebuilding SL");
+                foreach (var s in sls)
+                {
+                    try
+                    {
+                        DebugLog.W("468/STR", $"RECONCILE CANCEL SL: price={s.TriggerPrice:F2} qty={(int)s.QuantityToFill}");
+                        CancelOrder(s);
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugLog.W("468/STR", $"RECONCILE CANCEL SL EX: {ex.Message}");
+                    }
+                }
                 if (Math.Abs(net) > 0 && _lastSignalBar >= 0 && _entryDir != 0)
                 {
                     var (slPx, _) = BuildBracketPrices(_entryDir, _lastSignalBar, CurrentBar);
                     var coverSide = _entryDir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
                     var oco = Guid.NewGuid().ToString();
+                    DebugLog.W("468/STR", $"RECONCILE REBUILD SL: {coverSide} qty={net} @{slPx:F2} oco={oco.Substring(0, 6)}");
                     SubmitStop(oco, coverSide, net, slPx);
                 }
+                else
+                {
+                    DebugLog.W("468/STR", $"RECONCILE SL SKIP: net={net} lastSignalBar={_lastSignalBar} entryDir={_entryDir}");
+                }
             }
+            else
+            {
+                DebugLog.W("468/STR", "RECONCILE SL QTY OK: no SL quantity adjustment needed");
+            }
+            DebugLog.W("468/STR", $"RECONCILED: net={net} netByFills={NetByFills()} tpActive={tps.Count} slActive={sls.Count}");
         }
 
         // === Cálculo local para evitar races de N+1 ===

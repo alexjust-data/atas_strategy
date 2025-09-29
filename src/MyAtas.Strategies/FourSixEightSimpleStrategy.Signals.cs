@@ -227,8 +227,8 @@ namespace MyAtas.Strategies
             _lastExecUid = _pending.Value.Uid;
             _pending = null;
 
-            DebugLog.Critical("468/STR",
-                $"ENTRY sent at N+1 bar={bar} (signal N={signalBar}) dir={(dir>0?"BUY":"SELL")} qty={qty} - brackets will attach post-fill");
+            DebugLog.Critical("468/ORD",
+                $"ENTRY SENT: dir={(dir>0?"Buy":"Sell")} qty={qty} bar={bar} (signal N={signalBar})");
 
             SubmitMarket(dir, qty, bar, signalBar); // está en Execution.cs
             _tradeActive = true;

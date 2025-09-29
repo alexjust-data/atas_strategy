@@ -90,7 +90,7 @@ namespace MyAtas.Strategies
             {
                 // Sin TPs activos → SL único por la qty completa
                 SubmitStop(null, coverSide, totalQty, slPx);
-                DebugLog.W("468/STR", $"BRACKETS: SL-only {totalQty} @ {slPx:F2} (no TPs enabled)");
+                DebugLog.W("468/ORD", $"BRACKETS ATTACHED: tp=0 sl=1 total={totalQty} (SL-only @ {slPx:F2})");
                 return;
             }
 
@@ -105,6 +105,7 @@ namespace MyAtas.Strategies
                 SubmitLimit(oco, coverSide, legQty, tpList[i]);
             }
 
+            DebugLog.W("468/ORD", $"BRACKETS ATTACHED: tp={enabled} sl=1 total={totalQty} (SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))})");
             DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))} | Split=[{string.Join(",", qtySplit)}] | Total={totalQty}");
         }
 
