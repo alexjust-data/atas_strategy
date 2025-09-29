@@ -4,5 +4,5 @@ using MyAtas.Risk.Models;
 
 public interface IPositionSizer
 {
-    int ComputeQty(EntryContext ctx, SizingConfig cfg);
+    int ComputeQty(EntryContext ctx, SizingConfig cfg, out string reason);
 }

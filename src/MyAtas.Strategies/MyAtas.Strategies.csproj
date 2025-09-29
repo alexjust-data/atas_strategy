@@ -11,6 +11,7 @@
   <ItemGroup>
     <ProjectReference Include="..\MyAtas.Shared\MyAtas.Shared.csproj" />
     <ProjectReference Include="..\MyAtas.Indicators\MyAtas.Indicators.csproj" />
+    <ProjectReference Include="..\MyAtas.Risk\MyAtas.Risk.csproj" />
   </ItemGroup>
 
   <ItemGroup>
