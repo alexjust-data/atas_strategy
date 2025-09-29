@@ -22,6 +22,9 @@ namespace MyAtas.Strategies
         [Category("Activation"), DisplayName("Manage manual entries")]
         public bool ManageManualEntries { get; set; } = true;
 
+        [Category("Activation"), DisplayName("Allow attach without net (fallback)")]
+        public bool AllowAttachFallback { get; set; } = true;
+
         [Category("Activation"), DisplayName("Ignore orders with prefix")]
         public string IgnorePrefix { get; set; } = "468"; // no interferir con la 468
 
@@ -118,6 +121,7 @@ namespace MyAtas.Strategies
         private decimal _pendingEntryPrice = 0m;
         private DateTime _pendingSince = DateTime.MinValue;
         private int _pendingDirHint = 0;                 // +1/-1 si logramos leerlo del Order
+        private int _pendingFillQty = 0;                 // qty del fill manual (si la API lo expone)
         private readonly int _attachThrottleMs = 500; // throttle para fallback
         private readonly int _attachDeadlineMs = 2500;   // tiempo máximo a esperar net≠0
         private System.Collections.Generic.List<Order> _liveOrders = new();
@@ -301,6 +305,24 @@ namespace MyAtas.Strategies
             return 0m; // NADA de GetCandle() aquí
         }
 
+        private int ExtractFilledQty(Order order)
+        {
+            foreach (var name in new[] { "Filled", "FilledQuantity", "Quantity", "QuantityToFill", "Volume", "Lots" })
+            {
+                try
+                {
+                    var p = order.GetType().GetProperty(name);
+                    if (p == null) continue;
+                    var v = p.GetValue(order);
+                    if (v == null) continue;
+                    var q = Convert.ToInt32(v);
+                    if (q > 0) return q;
+                }
+                catch { }
+            }
+            return 0;
+        }
+
         private int ExtractDirFromOrder(Order order)
         {
             foreach (var name in new[] { "Direction", "Side", "OrderDirection", "OrderSide", "TradeSide" })
@@ -375,6 +397,7 @@ namespace MyAtas.Strategies
 
                 // Marca attach pendiente; la dirección la deduciremos con el net por barra o ahora mismo
                 _pendingDirHint = ExtractDirFromOrder(order);
+                _pendingFillQty = ExtractFilledQty(order);
 
                 // Solo guardar entryPrice si el order tiene AvgPrice válido; si no, lo obtendremos de la posición
                 var orderAvgPrice = ExtractAvgFillPrice(order);
@@ -422,52 +445,56 @@ namespace MyAtas.Strategies
                 }
                 else
                 {
-                    // No hay transición válida: verificar timeout
-                    if (waitedMs >= _attachDeadlineMs)
+                    // si aún no llegamos al deadline → WAIT
+                    if (waitedMs < _attachDeadlineMs)
                     {
-                        // ABORT: cancelar pending y log
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → WAIT");
+                        return;
+                    }
+                    // deadline alcanzado → ¿podemos fallback?
+                    if (!(AllowAttachFallback && _pendingDirHint != 0))
+                    {
                         _pendingAttach = false;
                         if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ABORT");
                         if (EnableLogging) DebugLog.W("RM/ABORT", "flat after TTL");
                         return;
                     }
-                    else
-                    {
-                        // Seguir esperando
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → WAIT");
-                        return;
-                    }
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ATTACH(FALLBACK)");
                 }
 
-                var dir = Math.Sign(netNow);
+                var dir = Math.Abs(netNow) > 0 ? Math.Sign(netNow) : _pendingDirHint;
 
-                // >>> NUEVO: qty real si modo Manual
+                // qty a usar en Manual: net si lo hay, si no la del fill, si no la de la UI
                 int manualQtyToUse = ManualQty;
                 if (SizingMode == RmSizingMode.Manual)
-                    manualQtyToUse = Math.Max(1, Math.Abs(netNow));
+                {
+                    if (Math.Abs(netNow) > 0) manualQtyToUse = Math.Abs(netNow);
+                    else manualQtyToUse = Math.Max(1, (_pendingFillQty > 0 ? _pendingFillQty : ManualQty));
+                }
 
                 // Instrumento (fallbacks)
                 var tickSize = FallbackTickSize;
                 try { tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize); } catch { }
                 var tickValue = FallbackTickValueUsd;
 
-                // Precio de entrada: usa Order si disponible, si no usa avgPrice de la posición
+                // precio de entrada: order → avgPrice posición → vela previa (Close)
                 var entryPx = _pendingEntryPrice;
                 if (entryPx <= 0m)
                 {
-                    // Leer avgPrice de la posición usando ReadPositionSnapshot
-                    var posSnapshot = ReadPositionSnapshot();
-                    entryPx = posSnapshot.AvgPrice;
-
+                    var snap = ReadPositionSnapshot();
+                    entryPx = snap.AvgPrice;
                     if (EnableLogging)
                         DebugLog.W("RM/PLAN", $"Using position avgPrice: entryPx={entryPx:F2} (orderPrice was {_pendingEntryPrice:F2})");
                 }
-
-                // Si aún no tenemos precio válido, no podemos continuar
                 if (entryPx <= 0m)
                 {
-                    if (EnableLogging) DebugLog.W("RM/PLAN", "No valid entryPx available → retry");
-                    return;
+                    try
+                    {
+                        var barIdx = Math.Max(0, Math.Min(CurrentBar - 1, CurrentBar));
+                        entryPx = GetCandle(barIdx).Close;
+                        if (EnableLogging) DebugLog.W("RM/PLAN", $"Fallback candle price used: entryPx={entryPx:F2} (bar={barIdx})");
+                    } catch { }
+                    if (entryPx <= 0m) { if (EnableLogging) DebugLog.W("RM/PLAN", "No valid entryPx available → retry"); return; }
                 }
 
                 var ctx = new MyAtas.Risk.Models.EntryContext(
@@ -523,9 +550,10 @@ namespace MyAtas.Strategies
                 var plan = engine.BuildPlan(ctx, sizingCfg, bracketCfg, out var szReason);
 
                 if (EnableLogging)
-                    DebugLog.W("RM/PLAN", $"qty={plan.TotalQty} | SL@{plan.StopLoss.Price:F2} | " +
-                                          $"TPs=[{string.Join(",", plan.TakeProfits.Select(tp => $"{tp.Price:F2}x{tp.Quantity}"))}] | " +
-                                          $"reason=({szReason}) {plan.Reason}");
+                {
+                    var tag = (Math.Abs(netNow) > 0 ? "ATTACH" : "ATTACH(FALLBACK)");
+                    DebugLog.W("RM/PLAN", $"{tag} qty={plan.TotalQty} | SL@{plan.StopLoss.Price:F2} | TPs=[{string.Join(",", plan.TakeProfits.Select(tp => $"{tp.Price:F2}x{tp.Quantity}"))}] | reason=({szReason}) {plan.Reason}");
+                }
 
                 if (plan.TotalQty <= 0) { if (EnableLogging) DebugLog.W("RM/PLAN", "qty<=0 → no attach"); _pendingAttach = false; return; }
 
