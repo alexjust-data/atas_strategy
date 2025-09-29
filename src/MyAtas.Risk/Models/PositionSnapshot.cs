@@ -24,12 +24,14 @@ public enum UnderfundedPolicy { Min1, Abort }
 // Configs (del doc)
 public record SizingConfig(
     string Mode,                    // "Manual" | "FixedRiskUSD" | "PercentAccount"
-    int ManualQty,                  // NUEVO: qty fijo cuando Mode=Manual
+    int ManualQty,                  // qty fijo cuando Mode=Manual
     decimal RiskUsd,
     decimal RiskPct,
     decimal AccountEquityOverride,
     string TickValueOverrides,      // "MNQ=0.5;NQ=5;ES=12.5"
-    UnderfundedPolicy UnderfundedPolicy = UnderfundedPolicy.Min1
+    UnderfundedPolicy UnderfundedPolicy = UnderfundedPolicy.Min1,
+    int MinQty = 1,
+    int MaxQty = 1000
 );
 
 public record BracketConfig(

@@ -1,8 +1,9 @@
 # Deploy Indicators to ATAS - FIXED VERSION
 $ErrorActionPreference = "Stop"
 
-Write-Host "Building MyAtas.Indicators..." -ForegroundColor Yellow
+Write-Host "Cleaning + Building MyAtas.Indicators..." -ForegroundColor Yellow
 Set-Location "$PSScriptRoot\..\src\MyAtas.Indicators"
+dotnet clean
 dotnet build -c Debug
 
 if ($LASTEXITCODE -ne 0) {

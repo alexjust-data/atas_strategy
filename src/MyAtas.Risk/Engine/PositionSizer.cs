@@ -18,6 +18,8 @@ public sealed class PositionSizer : IPositionSizer
         if (mode.Equals("Manual", StringComparison.OrdinalIgnoreCase))
         {
             var q = Math.Max(1, cfg.ManualQty);
+            // clamp final
+            q = Math.Max(cfg.MinQty, Math.Min(cfg.MaxQty, q));
             reason = $"Manual qty={q}";
             return q;
         }
@@ -47,6 +49,8 @@ public sealed class PositionSizer : IPositionSizer
             {
                 reason = $"FixedRiskUSD: {cfg.RiskUsd} / {riskPerContract} => qty={q}";
             }
+            // clamp final
+            q = Math.Max(cfg.MinQty, Math.Min(cfg.MaxQty, q));
             return q;
         }
 
@@ -74,6 +78,8 @@ public sealed class PositionSizer : IPositionSizer
                 return 1;
             }
             reason = $"%Account: equity={eq} pct={cfg.RiskPct}% riskUsd={riskUsd} / {riskPerContract} → qty={qty}";
+            // clamp final
+            qty = Math.Max(cfg.MinQty, Math.Min(cfg.MaxQty, qty));
             return qty;
         }
 
