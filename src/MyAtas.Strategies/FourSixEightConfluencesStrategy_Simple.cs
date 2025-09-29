@@ -162,22 +162,28 @@ namespace MyAtas.Strategies
 
         // ====================== RISK MANAGEMENT PARAMETERS ======================
 
-        // --- Position Sizing ---
+        // --- Position Sizing --- (HIDDEN: Will be migrated to external Risk Manager)
+        [Browsable(false)]
         [Category("Risk Management/Position Sizing"), DisplayName("Position Sizing Mode")]
         public PositionSizingMode PositionSizingMode { get; set; } = PositionSizingMode.Manual;
 
+        [Browsable(false)]
         [Category("Risk Management/Position Sizing"), DisplayName("Risk per trade (USD)")]
         public decimal RiskPerTradeUsd { get; set; } = 100.0m;
 
+        [Browsable(false)]
         [Category("Risk Management/Position Sizing"), DisplayName("Risk % of account")]
         public decimal RiskPercentOfAccount { get; set; } = 0.5m;
 
+        [Browsable(false)]
         [Category("Risk Management/Position Sizing"), DisplayName("Manual account equity override")]
         public decimal ManualAccountEquityOverride { get; set; } = 0.0m;
 
+        [Browsable(false)]
         [Category("Risk Management/Position Sizing"), DisplayName("Tick value overrides (SYM=V)")]
         public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5";
 
+        [Browsable(false)]
         [Category("Risk Management/Position Sizing"), DisplayName("Enable detailed risk logging")]
         public bool EnableDetailedRiskLogging { get; set; } = false;
 
