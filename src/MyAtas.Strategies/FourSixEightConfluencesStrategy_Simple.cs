@@ -196,7 +196,7 @@ namespace MyAtas.Strategies
         // ====================== RISK MANAGEMENT PARAMETERS ======================
 
         // --- Position Sizing --- (HIDDEN: Will be migrated to external Risk Manager)
-        [Browsable(false)]
+        [Browsable(false)] // Hidden: External RM will handle position sizing
         [Category("Risk Management/Position Sizing"), DisplayName("Position Sizing Mode")]
         public PositionSizingMode PositionSizingMode { get; set; } = PositionSizingMode.Manual;
 
