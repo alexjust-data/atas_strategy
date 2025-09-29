@@ -117,7 +117,9 @@ namespace MyAtas.Strategies
         private bool _pendingAttach = false;
         private decimal _pendingEntryPrice = 0m;
         private DateTime _pendingSince = DateTime.MinValue;
+        private int _pendingDirHint = 0;                 // +1/-1 si logramos leerlo del Order
         private readonly int _attachThrottleMs = 500; // throttle para fallback
+        private readonly int _attachDeadlineMs = 2500;   // tiempo máximo a esperar net≠0
         private System.Collections.Generic.List<Order> _liveOrders = new();
 
         // Helper property for compatibility
@@ -163,10 +165,16 @@ namespace MyAtas.Strategies
         // Lee net de forma robusta SIN GetNetPosition()
         private int ReadNetPosition()
         {
+            var snapshot = ReadPositionSnapshot();
+            return snapshot.NetQty;
+        }
+
+        private (int NetQty, decimal AvgPrice) ReadPositionSnapshot()
+        {
             try
             {
                 if (Portfolio == null || Security == null)
-                    return 0;
+                    return (0, 0m);
 
                 // 1) Intento directo: Portfolio.GetPosition(Security)
                 try
@@ -177,13 +185,42 @@ namespace MyAtas.Strategies
                         var pos = getPos.Invoke(Portfolio, new object[] { Security });
                         if (pos != null)
                         {
+                            var netQty = 0;
+                            var avgPrice = 0m;
+
+                            // Leer Net/Amount/Qty/Position
                             foreach (var name in new[] { "Net", "Amount", "Qty", "Position" })
                             {
                                 var p = pos.GetType().GetProperty(name);
-                                if (p == null) continue;
-                                var v = p.GetValue(pos);
-                                if (v != null) return Convert.ToInt32(v);
+                                if (p != null)
+                                {
+                                    var v = p.GetValue(pos);
+                                    if (v != null)
+                                    {
+                                        netQty = Convert.ToInt32(v);
+                                        break;
+                                    }
+                                }
                             }
+
+                            // Leer AvgPrice/AveragePrice/EntryPrice/Price
+                            foreach (var name in new[] { "AveragePrice", "AvgPrice", "EntryPrice", "Price" })
+                            {
+                                var p = pos.GetType().GetProperty(name);
+                                if (p != null)
+                                {
+                                    var v = p.GetValue(pos);
+                                    if (v != null)
+                                    {
+                                        avgPrice = Convert.ToDecimal(v);
+                                        if (avgPrice > 0m) break;
+                                    }
+                                }
+                            }
+
+                            if (EnableLogging && (netQty != 0 || avgPrice > 0m))
+                                DebugLog.W("RM/SNAP", $"pos avgPrice={avgPrice:F2} net={netQty} (source=Portfolio.GetPosition)");
+                            return (netQty, avgPrice);
                         }
                     }
                 }
@@ -202,41 +239,83 @@ namespace MyAtas.Strategies
                             var secStr = secProp?.GetValue(pos)?.ToString() ?? "";
                             if (!string.IsNullOrEmpty(secStr) && (Security?.ToString() ?? "") == secStr)
                             {
+                                var netQty = 0;
+                                var avgPrice = 0m;
+
+                                // Leer Net/Amount/Qty/Position
                                 foreach (var name in new[] { "Net", "Amount", "Qty", "Position" })
                                 {
                                     var p = pos.GetType().GetProperty(name);
-                                    if (p == null) continue;
-                                    return Convert.ToInt32(p.GetValue(pos));
+                                    if (p != null)
+                                    {
+                                        var v = p.GetValue(pos);
+                                        if (v != null)
+                                        {
+                                            netQty = Convert.ToInt32(v);
+                                            break;
+                                        }
+                                    }
                                 }
+
+                                // Leer AvgPrice/AveragePrice/EntryPrice/Price
+                                foreach (var name in new[] { "AveragePrice", "AvgPrice", "EntryPrice", "Price" })
+                                {
+                                    var p = pos.GetType().GetProperty(name);
+                                    if (p != null)
+                                    {
+                                        var v = p.GetValue(pos);
+                                        if (v != null)
+                                        {
+                                            avgPrice = Convert.ToDecimal(v);
+                                            if (avgPrice > 0m) break;
+                                        }
+                                    }
+                                }
+
+                                if (EnableLogging && (netQty != 0 || avgPrice > 0m))
+                                    DebugLog.W("RM/SNAP", $"pos avgPrice={avgPrice:F2} net={netQty} (source=Portfolio.Positions)");
+                                return (netQty, avgPrice);
                             }
                         }
                     }
                 }
-                catch { /* devolver 0 */ }
+                catch { /* devolver valores por defecto */ }
             }
             catch { }
-            return 0;
+            return (0, 0m);
         }
 
-        private decimal ExtractAvgFillPrice(Order order, int fallbackBar)
+        private decimal ExtractAvgFillPrice(Order order)
         {
-            try
+            foreach (var name in new[] { "AvgPrice", "AveragePrice", "AvgFillPrice", "Price" })
             {
-                // Precio de entrada (average fill)
-                foreach (var name in new[] { "AvgPrice", "AveragePrice", "AvgFillPrice", "Price" })
+                try
                 {
                     var p = order.GetType().GetProperty(name);
                     if (p == null) continue;
                     var v = Convert.ToDecimal(p.GetValue(order));
                     if (v > 0m) return v;
                 }
-                // Fallback: precio actual de la barra
-                return GetCandle(Math.Max(0, fallbackBar)).Close;
+                catch { }
             }
-            catch
+            return 0m; // NADA de GetCandle() aquí
+        }
+
+        private int ExtractDirFromOrder(Order order)
+        {
+            foreach (var name in new[] { "Direction", "Side", "OrderDirection", "OrderSide", "TradeSide" })
             {
-                return GetCandle(Math.Max(0, CurrentBar)).Close;
+                try
+                {
+                    var p = order.GetType().GetProperty(name);
+                    if (p == null) continue;
+                    var s = p.GetValue(order)?.ToString() ?? "";
+                    if (s.IndexOf("Buy", StringComparison.OrdinalIgnoreCase) >= 0) return +1;
+                    if (s.IndexOf("Sell", StringComparison.OrdinalIgnoreCase) >= 0) return -1;
+                }
+                catch { }
             }
+            return 0;
         }
 
 
@@ -251,8 +330,22 @@ namespace MyAtas.Strategies
             if (_pendingAttach && (DateTime.UtcNow - _pendingSince).TotalMilliseconds >= _attachThrottleMs)
                 TryAttachBracketsNow();
 
-            // Actualiza snapshot de net
-            try { _prevNet = ReadNetPosition(); } catch { }
+            // Actualiza snapshot de net y limpia pendientes al cerrar posición
+            try
+            {
+                var currentNet = ReadNetPosition();
+
+                // Cleanup: si estábamos en posición y ahora estamos flat, limpiar pending
+                if (Math.Abs(_prevNet) > 0 && Math.Abs(currentNet) == 0 && _pendingAttach)
+                {
+                    _pendingAttach = false;
+                    if (EnableLogging)
+                        DebugLog.W("RM/PLAN", $"Position closed: cleanup pending state (prevNet={_prevNet} → currentNet={currentNet})");
+                }
+
+                _prevNet = currentNet;
+            }
+            catch { }
         }
 
         protected override void OnOrderChanged(Order order)
@@ -268,22 +361,33 @@ namespace MyAtas.Strategies
                 if (comment.StartsWith(IgnorePrefix)) return;
                 if (comment.StartsWith(OwnerPrefix)) return;
 
-                // Ignora cierres explícitos
-                if (comment.IndexOf("Close position", StringComparison.OrdinalIgnoreCase) >= 0) return;
+                // Ignora cierres explícitos y limpia pending state
+                if (comment.IndexOf("Close position", StringComparison.OrdinalIgnoreCase) >= 0)
+                {
+                    _pendingAttach = false;
+                    if (EnableLogging)
+                        DebugLog.W("RM/PLAN", "cleared by Close position");
+                    return;
+                }
 
                 // Sólo nos interesan fills/parciales
                 if (!(st == OrderStatus.Filled || st == OrderStatus.PartlyFilled)) return;
 
                 // Marca attach pendiente; la dirección la deduciremos con el net por barra o ahora mismo
+                _pendingDirHint = ExtractDirFromOrder(order);
+
+                // Solo guardar entryPrice si el order tiene AvgPrice válido; si no, lo obtendremos de la posición
+                var orderAvgPrice = ExtractAvgFillPrice(order);
+                _pendingEntryPrice = orderAvgPrice > 0m ? orderAvgPrice : 0m;
+
                 _pendingAttach = true;
-                _pendingEntryPrice = ExtractAvgFillPrice(order, CurrentBar);
                 _pendingSince = DateTime.UtcNow;
 
                 if (EnableLogging)
                     DebugLog.W("RM/ORD", $"Manual order filled → pendingAttach=true entryPx={_pendingEntryPrice:F2}");
 
-                // Intento inmediato
-                TryAttachBracketsNow();
+                // Dejamos que lo dispare OnCalculate tras actualizar net
+                // TryAttachBracketsNow();
             }
             catch (Exception ex)
             {
@@ -297,41 +401,74 @@ namespace MyAtas.Strategies
             {
                 if (!_pendingAttach) return;
 
-                // Si hay órdenes 468 o RM vivas → no tocar
-                var any468 = _liveOrders?.Any(o => (o?.Comment ?? "").StartsWith(IgnorePrefix)) == true;
-                var anyRM  = _liveOrders?.Any(o => (o?.Comment ?? "").StartsWith(OwnerPrefix)) == true;
+                // 1) ¿hay órdenes 468/RM vivas? no tocar
+                var any468 = HasLiveOrdersWithPrefix(IgnorePrefix);
+                var anyRM  = HasLiveOrdersWithPrefix(OwnerPrefix);
                 if (any468 || anyRM)
                 {
-                    if (EnableLogging) DebugLog.W("RM/PLAN", $"Abort attach: any468={any468} anyRM={anyRM}");
+                    if (EnableLogging) DebugLog.W("RM/ABORT", $"any468={any468} anyRM={anyRM}");
                     _pendingAttach = false;
                     return;
                 }
 
-                // Net actual y deducción de entrada: 0 → ≠0
+                // 2) Hard gate: solo adjuntar en transición FLAT→POSICIÓN (0→≠0)
                 var netNow = ReadNetPosition();
-                if (Math.Abs(_prevNet) != 0 || Math.Abs(netNow) == 0)
+                var waitedMs = (int)(DateTime.UtcNow - _pendingSince).TotalMilliseconds;
+
+                if (Math.Abs(_prevNet) == 0 && Math.Abs(netNow) > 0)
                 {
-                    // No es transición de plano a pos ⇒ probablemente cierre/parcial: no adjuntar
-                    if (EnableLogging) DebugLog.W("RM/PLAN", $"Skip attach: prevNet={_prevNet} netNow={netNow}");
-                    _pendingAttach = false;
-                    return;
+                    // Transición válida 0→≠0: proceder con adjuntar
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ATTACH");
+                }
+                else
+                {
+                    // No hay transición válida: verificar timeout
+                    if (waitedMs >= _attachDeadlineMs)
+                    {
+                        // ABORT: cancelar pending y log
+                        _pendingAttach = false;
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ABORT");
+                        if (EnableLogging) DebugLog.W("RM/ABORT", "flat after TTL");
+                        return;
+                    }
+                    else
+                    {
+                        // Seguir esperando
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → WAIT");
+                        return;
+                    }
                 }
 
-                var dir = Math.Sign(netNow); // +1 long, -1 short
-                if (dir == 0)
-                {
-                    if (EnableLogging) DebugLog.W("RM/PLAN", "dir=0 (no net) → abort");
-                    _pendingAttach = false;
-                    return;
-                }
+                var dir = Math.Sign(netNow);
+
+                // >>> NUEVO: qty real si modo Manual
+                int manualQtyToUse = ManualQty;
+                if (SizingMode == RmSizingMode.Manual)
+                    manualQtyToUse = Math.Max(1, Math.Abs(netNow));
 
                 // Instrumento (fallbacks)
                 var tickSize = FallbackTickSize;
                 try { tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize); } catch { }
                 var tickValue = FallbackTickValueUsd;
 
-                // Precio de entrada
-                var entryPx = _pendingEntryPrice > 0 ? _pendingEntryPrice : GetCandle(CurrentBar).Open;
+                // Precio de entrada: usa Order si disponible, si no usa avgPrice de la posición
+                var entryPx = _pendingEntryPrice;
+                if (entryPx <= 0m)
+                {
+                    // Leer avgPrice de la posición usando ReadPositionSnapshot
+                    var posSnapshot = ReadPositionSnapshot();
+                    entryPx = posSnapshot.AvgPrice;
+
+                    if (EnableLogging)
+                        DebugLog.W("RM/PLAN", $"Using position avgPrice: entryPx={entryPx:F2} (orderPrice was {_pendingEntryPrice:F2})");
+                }
+
+                // Si aún no tenemos precio válido, no podemos continuar
+                if (entryPx <= 0m)
+                {
+                    if (EnableLogging) DebugLog.W("RM/PLAN", "No valid entryPx available → retry");
+                    return;
+                }
 
                 var ctx = new MyAtas.Risk.Models.EntryContext(
                     Account: Portfolio?.ToString() ?? "DEFAULT",
@@ -346,7 +483,7 @@ namespace MyAtas.Strategies
 
                 var sizingCfg = new MyAtas.Risk.Models.SizingConfig(
                     Mode: SizingMode.ToString(),
-                    ManualQty: Math.Max(1, ManualQty),
+                    ManualQty: manualQtyToUse,
                     RiskUsd: RiskPerTradeUsd,
                     RiskPct: RiskPercentOfAccount,
                     AccountEquityOverride: 0m,
@@ -393,10 +530,20 @@ namespace MyAtas.Strategies
                 if (plan.TotalQty <= 0) { if (EnableLogging) DebugLog.W("RM/PLAN", "qty<=0 → no attach"); _pendingAttach = false; return; }
 
                 var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
-                var oco = Guid.NewGuid().ToString("N");
-                SubmitRmStop(oco, coverSide, plan.TotalQty, plan.StopLoss.Price);
-                foreach (var tp in plan.TakeProfits.Where(t => t.Quantity > 0))
-                    SubmitRmLimit(oco, coverSide, tp.Quantity, tp.Price);
+
+                // OCO 1:1 por TP — cada TP lleva su propio trozo de SL
+                foreach (var (tp, idx) in plan.TakeProfits.Select((t,i) => (t,i)))
+                {
+                    if (tp.Quantity <= 0) continue;
+
+                    var ocoId = Guid.NewGuid().ToString("N");
+                    // IMPORTANTE: el SL de este par usa la misma qty que el TP
+                    SubmitRmStop(ocoId, coverSide, tp.Quantity, plan.StopLoss.Price);
+                    SubmitRmLimit(ocoId, coverSide, tp.Quantity, tp.Price);
+
+                    if (EnableLogging)
+                        DebugLog.W("RM/ORD", $"PAIR #{idx+1}: OCO={ocoId} SL {tp.Quantity}@{plan.StopLoss.Price:F2} + TP {tp.Quantity}@{tp.Price:F2}");
+                }
 
                 _pendingAttach = false;
                 if (EnableLogging) DebugLog.W("RM/PLAN", "Attach DONE");
@@ -419,14 +566,17 @@ namespace MyAtas.Strategies
                     Security = Security,
                     Direction = side,
                     Type = OrderTypes.Stop,
-                    TriggerPrice = triggerPx,
+                    TriggerPrice = ShrinkPrice(triggerPx), // ← tick-safe
                     QuantityToFill = qty,
                     OCOGroup = oco,
                     IsAttached = true,
                     Comment = comment
                 };
+                order.AutoCancel = true;             // ← cancelar al cerrar
+                TrySetReduceOnly(order);             // ← no abrir nuevas
+                TrySetCloseOnTrigger(order);         // ← cerrar al disparar
                 OpenOrder(order);
-                DebugLog.W("RM/ORD", $"STOP submitted: {side} {qty} @{triggerPx:F2} OCO={(oco ?? "none")}");
+                DebugLog.W("RM/ORD", $"STOP submitted: {side} {qty} @{order.TriggerPrice:F2} OCO={(oco ?? "none")}");
             }
             catch (Exception ex)
             {
@@ -445,19 +595,70 @@ namespace MyAtas.Strategies
                     Security = Security,
                     Direction = side,
                     Type = OrderTypes.Limit,
-                    Price = price,
+                    Price = ShrinkPrice(price),       // ← tick-safe
                     QuantityToFill = qty,
                     OCOGroup = oco,
                     IsAttached = true,
                     Comment = comment
                 };
+                order.AutoCancel = true;             // ← cancelar al cerrar
+                TrySetReduceOnly(order);             // ← no abrir nuevas
                 OpenOrder(order);
-                DebugLog.W("RM/ORD", $"LIMIT submitted: {side} {qty} @{price:F2} OCO={(oco ?? "none")}");
+                DebugLog.W("RM/ORD", $"LIMIT submitted: {side} {qty} @{order.Price:F2} OCO={(oco ?? "none")}");
             }
             catch (Exception ex)
             {
                 DebugLog.W("RM/ORD", $"SubmitRmLimit EX: {ex.Message}");
             }
+        }
+
+        // === Additional order options via TradingManager ===
+        private void TrySetReduceOnly(Order order)
+        {
+            try
+            {
+                var flags = TradingManager?
+                    .GetSecurityTradingOptions()?
+                    .CreateExtendedOptions(order.Type);
+                if (flags is ATAS.DataFeedsCore.IOrderOptionReduceOnly ro)
+                {
+                    ro.ReduceOnly = true;   // evita abrir posición nueva
+                    order.ExtendedOptions = flags;
+                }
+            } catch { }
+        }
+
+        private void TrySetCloseOnTrigger(Order order)
+        {
+            try
+            {
+                var flags = TradingManager?
+                    .GetSecurityTradingOptions()?
+                    .CreateExtendedOptions(order.Type);
+                if (flags is ATAS.DataFeedsCore.IOrderOptionCloseOnTrigger ct)
+                {
+                    ct.CloseOnTrigger = true; // cerrar cuando dispare
+                    order.ExtendedOptions = flags;
+                }
+            } catch { }
+        }
+
+        private bool HasLiveOrdersWithPrefix(string prefix)
+        {
+            try
+            {
+                var list = this.Orders; // Strategy.Orders
+                if (list == null) return false;
+                return list.Any(o =>
+                {
+                    var c = o?.Comment ?? "";
+                    if (!c.StartsWith(prefix)) return false;
+                    // consideramos viva si NO está cancelada y NO está llena
+                    var st = o.Status();
+                    return !o.Canceled && st != OrderStatus.Filled && st != OrderStatus.Canceled;
+                });
+            }
+            catch { return false; }
         }
 
     }
