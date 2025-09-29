@@ -28,6 +28,9 @@ namespace MyAtas.Strategies
             OpenOrder(order);
             _liveOrders.Add(order);
 
+            // *** PHANTOM FIX: Registrar signo para ENTRY ***
+            RegisterChildSign(order.Comment, dir, isEntry: true);
+
             // Track signal context for post-fill brackets
             _targetQty = qty;
             _lastSignalBar = signalBar;
@@ -54,6 +57,10 @@ namespace MyAtas.Strategies
             };
             OpenOrder(order);
             _liveOrders.Add(order);
+
+            // *** PHANTOM FIX: Registrar signo para TP ***
+            RegisterChildSign(order.Comment, _entryDir, isEntry: false);
+
             DebugLog.W("468/ORD", $"LIMIT submitted: {side} {qty} @{px:F2} OCO={(oco??"none")}");
         }
 
@@ -74,6 +81,10 @@ namespace MyAtas.Strategies
             };
             OpenOrder(order);
             _liveOrders.Add(order);
+
+            // *** PHANTOM FIX: Registrar signo para SL ***
+            RegisterChildSign(order.Comment, _entryDir, isEntry: false);
+
             DebugLog.W("468/ORD", $"STOP submitted: {side} {qty} @{triggerPx:F2} OCO={(oco??"none")}");
         }
 

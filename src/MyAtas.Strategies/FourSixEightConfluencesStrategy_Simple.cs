@@ -29,6 +29,39 @@ namespace MyAtas.Strategies
             catch { return 0; }
         }
 
+        // *** PHANTOM FIX: Registro robusto de signo por orden hija ***
+        private void RegisterChildSign(string orderId, int dir, bool isEntry)
+        {
+            // Convención de signos:
+            //  - ENTRY aporta dir * qty al netByFills (abre posición)
+            //  - TP/SL aportan -dir * qty (cierran/reducen)
+            int sign = isEntry ? dir : -dir;
+            if (!string.IsNullOrEmpty(orderId))
+            {
+                _childSign[orderId] = sign;
+                DebugLog.W("468/POS", $"RegisterChildSign: {orderId} = {sign} (dir={dir} isEntry={isEntry})");
+            }
+        }
+
+        // *** PHANTOM FIX: Limpieza atómica tras confirmación de flat ***
+        private void AtomicFlatCleanup(string reason)
+        {
+            _tradeActive = false;
+            _bracketsPlaced = false;
+            _bracketsAttachedAt = DateTime.MinValue;
+            _antiFlatUntilBar = -1;
+            _flatStreak = 0;
+            _lastFlatRead = DateTime.MinValue;
+            _orderFills.Clear();
+            _childSign.Clear();
+            _cachedNetPosition = 0;
+            _breakevenApplied = false;
+            _entryPrice = 0m;
+            _beLastTouchBar = -1;
+            _beLastTouchAt = DateTime.MinValue;
+            DebugLog.W("468/POS", $"ATOMIC FLAT CLEANUP: {reason} → cleared fills/cache/childSign");
+        }
+
         // --- Helper: ¿estado terminal? (no deben contarse como activos) ---
         private static bool IsTerminal(OrderStatus s)
             => s == OrderStatus.Filled
@@ -245,6 +278,8 @@ namespace MyAtas.Strategies
         private int _cachedNetPosition = 0;  // cached position for latency issues
         private DateTime _lastPositionUpdate = DateTime.MinValue;
         private readonly Dictionary<string, int> _orderFills = new(); // track our fills
+        private readonly Dictionary<string, int> _childSign = new(); // robust sign tracking for fills
+        private DateTime _postEntryFlatBlockUntil = DateTime.MinValue; // suprime confirmación de flat tras ENTRY
 
         // Cooldown management
         private int _cooldownUntilBar = -1;   // bar index hasta el que no se permite re-entrada
@@ -403,7 +438,8 @@ namespace MyAtas.Strategies
 
             // <<< PATCH 1: HEARTBEAT RELEASE (final) >>>
             // Libera sólo si TAMBIÉN NetByFills()==0 para evitar falsos planos tras parciales (TP1).
-            if (_tradeActive && !HasAnyActiveOrders() && GetNetPosition() == 0 && NetByFills() == 0)
+            if (_tradeActive && !HasAnyActiveOrders() && GetNetPosition() == 0 && NetByFills() == 0
+                && DateTime.UtcNow >= _postEntryFlatBlockUntil)
             {
                 DebugLog.W("468/ORD",
                     $"FLAT CONFIRMED (heartbeat): net=0 netByFills=0 tpActive={CountActiveTPs()} slActive={CountActiveSLs()}");
@@ -447,9 +483,36 @@ namespace MyAtas.Strategies
                     TrackOrderFill(order, "Filled");
                     // Capturar precio de entrada al primer fill de la ENTRY
                     if ((comment.StartsWith("468ENTRY:")))
+                    {
                         try { UpdateEntryPriceFromOrder(order); } catch { }
+                        _postEntryFlatBlockUntil = DateTime.UtcNow.AddMilliseconds(Math.Max(AntiFlatMs * 2, 800));
+                        DebugLog.W("468/ORD", $"POST-ENTRY FLAT BLOCK armed for {Math.Max(AntiFlatMs * 2, 800)}ms");
+                    }
                     // Disparar BE por FILL de TP si está configurado
                     try { CheckBreakEvenTrigger_OnOrderChanged(order, status); } catch { }
+
+                    // Failsafe: si un SL se llena, cancela cualquier TP activo (evita LIMITs huérfanos)
+                    if ((comment.StartsWith("468SL:")) && (status == OrderStatus.Filled))
+                    {
+                        int cancelled = 0;
+                        try
+                        {
+                            foreach (var o in _liveOrders)
+                            {
+                                if (o == null) continue;
+                                var st2 = o.Status();
+                                if ((o.Comment?.StartsWith("468TP:") ?? false)
+                                    && o.State == OrderStates.Active
+                                    && st2 != OrderStatus.Filled
+                                    && st2 != OrderStatus.Canceled)
+                                {
+                                    try { CancelOrder(o); cancelled++; } catch { }
+                                }
+                            }
+                        }
+                        catch { }
+                        DebugLog.W("468/ORD", $"SL filled -> TP failsafe CANCEL ALL: {cancelled}");
+                    }
                 }
                 else if (status == OrderStatus.Canceled)
                 {
@@ -525,12 +588,32 @@ namespace MyAtas.Strategies
                     DebugLog.W("468/ORD", $"Removed {removed} from _liveOrders (now {_liveOrders.Count})");
                 }
 
+                // Failsafe tras cualquier cancelación manual de 468TP: o 468SL:
+                if (status == OrderStatus.Canceled && (comment.StartsWith("468TP:") || comment.StartsWith("468SL:")))
+                {
+                    if (_tradeActive)
+                    {
+                        var netAfterCancel = GetNetPosition();
+
+                        // Caso A: net=0 y solo quedan hijos -> cancelarlos y liberar
+                        if (netAfterCancel == 0 && HasAnyActiveOrders())
+                        {
+                            DebugLog.W("468/ORD", "Manual cancel detected -> zombie children cleanup");
+                            CancelAllLiveActiveOrders();
+                        }
+
+                        // Caso B: net=0 y ya no quedan órdenes -> libera candado
+                        if (netAfterCancel == 0 && !HasAnyActiveOrders())
+                            ReleaseTradeLock("manual cancel -> flat & no active orders");
+                    }
+                }
+
                 // IMPORTANTE: No reconciliar en OnOrderChanged para evitar ráfagas/reentradas.
                 // La reconciliación se hace en OnCalculate, 1x por barra, fuera de anti-flat.
 
                 // Plano: confirma con nueva lógica híbrida
                 int netNow = GetNetPosition();
-                if (FlatConfirmedNow(netNow))
+                if (DateTime.UtcNow >= _postEntryFlatBlockUntil && FlatConfirmedNow(netNow))
                 {
                     if (HasAnyActiveOrders())
                     {
@@ -539,27 +622,14 @@ namespace MyAtas.Strategies
                     }
                     if (!HasAnyActiveOrders())
                     {
-                        _tradeActive = false;
-                        _bracketsPlaced = false;
-                        _bracketsAttachedAt = DateTime.MinValue;
-                        _antiFlatUntilBar = -1;
-                        _flatStreak = 0;
-                        _lastFlatRead = DateTime.MinValue;
+                        // *** PHANTOM FIX: Limpieza atómica completa ***
+                        AtomicFlatCleanup("flat confirmed & no active orders");
                         _lastFlatBar = CurrentBar;
-                        // Reset BreakEven state
-                        _breakevenApplied = false;
-                        _entryPrice = 0m;
-                        _beLastTouchBar = -1;
-                        _beLastTouchAt = DateTime.MinValue;
                         if (EnableCooldown && CooldownBars > 0)
                         {
                             _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
                             DebugLog.W("468/STR", $"COOLDOWN armed until bar={_cooldownUntilBar} (now={CurrentBar})");
                         }
-                        // Clear fill tracking cache when truly flat
-                        _orderFills.Clear();
-                        _cachedNetPosition = 0;
-                        DebugLog.W("468/ORD", "Trade lock RELEASED (flat confirmed & no active orders)");
                     }
                 }
                 else if (netNow == 0)
@@ -567,27 +637,17 @@ namespace MyAtas.Strategies
                     DebugLog.W("468/ORD", $"ANTI-FLAT: net=0 detected but not confirmed yet (streak={_flatStreak}, policy={AntiFlatPolicy})");
                 }
 
-                // <<< PATCH 2: RELEASE INCONDICIONAL AL FINAL DE OnOrderChanged >>>
-                // Cubre carreras donde FlatConfirmedNow() aún sea false pero ya no hay órdenes activas.
+                // <<< PHANTOM FIX: RELEASE INCONDICIONAL AL FINAL DE OnOrderChanged >>>
+                // *** CRÍTICO: Este es el lugar donde detectamos el net fantasma tras BE ***
                 if (_tradeActive && netNow == 0 && !HasAnyActiveOrders() && NetByFills() == 0)
                 {
                     DebugLog.W("468/ORD",
                         $"FLAT CONFIRMED (OnOrderChanged): net=0 netByFills=0 tpActive={CountActiveTPs()} slActive={CountActiveSLs()}");
-                    _tradeActive = false;
-                    _bracketsPlaced = false;
-                    _bracketsAttachedAt = DateTime.MinValue;
-                    _antiFlatUntilBar = -1;
-                    _flatStreak = 0;
-                    _lastFlatRead = DateTime.MinValue;
-                    _orderFills.Clear();
-                    _cachedNetPosition = 0;
+                    // *** PHANTOM FIX: Limpieza atómica completa ***
+                    AtomicFlatCleanup("OnOrderChanged final check");
                     _lastFlatBar = CurrentBar;
-                    // Reset BreakEven state
-                    _breakevenApplied = false;
-                    _entryPrice = 0m;
                     if (EnableCooldown && CooldownBars > 0)
                         _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
-                    DebugLog.W("468/ORD", "Trade lock RELEASED by OnOrderChanged (final)");
                 }
 
                 // Self-heal eliminado aquí. El re-attach sólo se gestiona en OnCalculate (1x/bar, fuera de anti-flat).
@@ -636,7 +696,7 @@ namespace MyAtas.Strategies
                 }
 
                 // Plano: usa nueva lógica híbrida
-                if (FlatConfirmedNow(net))
+                if (DateTime.UtcNow >= _postEntryFlatBlockUntil && FlatConfirmedNow(net))
                 {
                     if (HasAnyActiveOrders())
                     {
@@ -763,23 +823,35 @@ namespace MyAtas.Strategies
                 return positionsPos;
             }
 
-            // Strategy 3: Use our cached position with fill tracking
-            int cachedPos = GetCachedPositionWithFills();
-            if (cachedPos != 0)
+            // *** PHANTOM FIX: Si broker dice 0, solo usar fills si seguimos "en trade" ***
+            bool live = HasAnyActiveOrders() || _tradeActive;
+            if (live)
             {
-                DebugLog.W("468/POS", $"GetNetPosition via Cache+Fills: {cachedPos}");
-                return cachedPos;
+                // Strategy 3: Use cached position with fill tracking (solo si hay actividad)
+                int cachedPos = GetCachedPositionWithFills();
+                if (cachedPos != 0)
+                {
+                    DebugLog.W("468/POS", $"GetNetPosition via Cache+Fills (live={live}): {cachedPos}");
+                    return cachedPos;
+                }
+
+                // Strategy 4: Sticky cache ONLY while anti-flat protection is active
+                if (_cachedNetPosition != 0 && (DateTime.UtcNow < _postEntryFlatBlockUntil || !FlatConfirmedNow(0)))
+                {
+                    DebugLog.W("468/POS", $"GetNetPosition via StickyCache (anti-flat active): {_cachedNetPosition}");
+                    return _cachedNetPosition;
+                }
             }
 
-            // Strategy 4: Sticky cache ONLY while anti-flat protection is active
-            if (_cachedNetPosition != 0 && !FlatConfirmedNow(0))
+            // *** PHANTOM FIX: Si no hay actividad, sanear residuos ***
+            if (!live && (_orderFills.Count > 0 || _cachedNetPosition != 0))
             {
-                DebugLog.W("468/POS", $"GetNetPosition via StickyCache (anti-flat active): {_cachedNetPosition}");
-                return _cachedNetPosition;
+                DebugLog.W("468/POS", $"PHANTOM CLEANUP: broker=0, live=false, clearing fills({_orderFills.Count}) and cache({_cachedNetPosition})");
+                _orderFills.Clear();
+                _cachedNetPosition = 0;
             }
 
-            // All strategies failed
-            DebugLog.W("468/POS", "GetNetPosition: all strategies failed, returning 0");
+            DebugLog.W("468/POS", $"GetNetPosition: flat confirmed (portfolio=0 positions=0 live={live})");
             return 0;
         }
 
@@ -904,13 +976,17 @@ namespace MyAtas.Strategies
 
                 var qty = (int)Math.Abs(Math.Truncate(qFilled));
 
-                // Determine sign based on direction and order type
-                var direction = order.Direction;
-                int sign = 0;
-
-                // FIX: For ALL orders (ENTRY, TP, SL), use consistent sign logic
-                // Buy = +1, Sell = -1 (TP/SL do NOT reverse, they reduce position)
-                sign = (direction.ToString().Contains("Buy")) ? 1 : -1;
+                // *** PHANTOM FIX: Usar registro determinista del signo ***
+                int sign;
+                if (!_childSign.TryGetValue(orderId, out sign))
+                {
+                    // Fallback: usa _entryDir si existe; por defecto considera que
+                    // si no es entry, entonces cierra (-_entryDir).
+                    int dir = _entryDir; // -1 short, +1 long
+                    bool isEntry = c.StartsWith("468ENTRY:");
+                    sign = isEntry ? dir : -dir;
+                    DebugLog.W("468/POS", $"TrackOrderFill FALLBACK sign: {orderId} = {sign} (dir={dir} isEntry={isEntry})");
+                }
 
                 var netQty = qty * sign;
 
@@ -919,10 +995,16 @@ namespace MyAtas.Strategies
                     _orderFills[orderId] = netQty;
                     DebugLog.W("468/POS", $"Tracked fill: {orderId} = {netQty} (type: {c.Substring(0,8)})");
                     DebugLog.W("468/POS", $"FILL SNAPSHOT: netByFills={NetByFills()} | liveOrders={(_liveOrders?.Count ?? 0)}");
+                    if (c.StartsWith("468ENTRY:"))
+                    {
+                        _postEntryFlatBlockUntil = DateTime.UtcNow.AddMilliseconds(Math.Max(AntiFlatMs * 2, 800));
+                        DebugLog.W("468/ORD", $"POST-ENTRY FLAT BLOCK armed (TrackFill) for {Math.Max(AntiFlatMs * 2, 800)}ms");
+                    }
                 }
                 else if (action == "Canceled")
                 {
                     _orderFills.Remove(orderId);
+                    _childSign.Remove(orderId); // también limpiar signo
                     DebugLog.W("468/POS", $"Removed fill tracking: {orderId}");
                 }
             }
@@ -1215,7 +1297,7 @@ namespace MyAtas.Strategies
             int netByFills = Math.Abs(NetByFills());
             DebugLog.W("468/STR", $"RECONCILE START: net={net} netByFills={netByFills}");
 
-            if (net <= 0 && !FlatConfirmedNow(0))
+            if (net <= 0 && (DateTime.UtcNow < _postEntryFlatBlockUntil || !FlatConfirmedNow(0)))
             {
                 DebugLog.W("468/STR", "RECONCILE SKIP: net=0 (not flat-confirmed) → protect children");
                 return;
@@ -1224,6 +1306,80 @@ namespace MyAtas.Strategies
             {
                 DebugLog.W("468/STR", "RECONCILE: clamping net from negative to 0");
                 net = 0;
+            }
+
+            // === FREEZE MODE: mientras BE activo, mantener 1 solo TP (no recrear TP1/TP2/TP3) ===
+            if (_breakevenApplied)
+            {
+                var beActiveTps = _liveOrders
+                    .Where(o => o != null && (o.Comment?.StartsWith("468TP:") ?? false)
+                        && o.State == OrderStates.Active && o.Status() != OrderStatus.Filled && o.Status() != OrderStatus.Canceled)
+                    .ToList();
+                var beActiveSls = _liveOrders
+                    .Where(o => o != null && (o.Comment?.StartsWith("468SL:") ?? false)
+                        && o.State == OrderStates.Active && o.Status() != OrderStatus.Filled && o.Status() != OrderStatus.Canceled)
+                    .ToList();
+
+                // 1) Elegir el TP "bueno": el más lejano en la dirección (o el último memorizado por BE)
+                Order keepTp = null;
+                if (beActiveTps.Count > 0)
+                {
+                    keepTp = (_entryDir > 0)
+                        ? beActiveTps.OrderByDescending(o => SafeGetPrice(o)).First()
+                        : beActiveTps.OrderBy(o => SafeGetPrice(o)).First();
+                }
+
+                // 2) Cancelar TPs extra (si quedaron más de uno por carreras)
+                foreach (var tp in beActiveTps)
+                    if (!object.ReferenceEquals(tp, keepTp))
+                        try { CancelOrder(tp); } catch {}
+
+                // 3) Asegurar que existe EXACTAMENTE 1 TP y su qty==net
+                var coverSide = _entryDir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+                string oco = null;
+                if (beActiveSls.Count > 0) // intenta heredar el OCO del SL actual
+                    try { oco = (string)beActiveSls[0].GetType().GetProperty("OCOGroup")?.GetValue(beActiveSls[0]); } catch {}
+                if (string.IsNullOrEmpty(oco)) oco = Guid.NewGuid().ToString("N");
+
+                if (keepTp == null && net > 0)
+                {
+                    // Si no hay TP vivo (por timing), crea uno en el TP memorizado por BE
+                    var px = _beLastTpPrice;
+                    if (px <= 0m)
+                    {
+                        // fallback prudente: un poco más allá del BE
+                        px = _entryDir > 0 ? RoundToTick(GetCandle(CurrentBar).Close + Ticks(Math.Max(4, BreakevenOffsetTicks)))
+                                           : RoundToTick(GetCandle(CurrentBar).Close - Ticks(Math.Max(4, BreakevenOffsetTicks)));
+                    }
+                    SubmitLimit(oco, coverSide, net, px);
+                    DebugLog.W("468/STR", $"RECON(BE): recreated single TP qty={net} @ {px:F2}");
+                }
+                else if (keepTp != null)
+                {
+                    // Si hay TP, comprueba qty y ajusta si hace falta
+                    int tpQty = 0; try { tpQty = (int)Math.Abs(keepTp.QuantityToFill); } catch {}
+                    if (tpQty != net)
+                    {
+                        try { CancelOrder(keepTp); } catch {}
+                        var px = SafeGetPrice(keepTp); if (px <= 0m) px = _beLastTpPrice;
+                        SubmitLimit(oco, coverSide, net, px);
+                        DebugLog.W("468/STR", $"RECON(BE): resized single TP from {tpQty} -> {net}");
+                    }
+                }
+
+                // 4) Para el SL, conserva únicamente 1 SL = net (no tocar precio BE)
+                int beSlQty = 0; foreach (var s in beActiveSls) { try { beSlQty += (int)Math.Abs(s.QuantityToFill); } catch {} }
+                if (beSlQty != net)
+                {
+                    foreach (var s in beActiveSls) { try { CancelOrder(s); } catch {} }
+                    // Nota: NO recalculamos precio; lo debe fijar BE. Si no hay SL, créalo en BE.
+                    decimal bePx = CalculateBreakEvenPrice(_entryDir, _entryPrice, BreakevenOffsetTicks);
+                    SubmitStop(oco, coverSide, net, bePx);
+                    DebugLog.W("468/STR", $"RECON(BE): resized SL to qty={net} @ {bePx:F2}");
+                }
+
+                // Importante: durante BE no seguimos con la reconciliación "normal" (que replantea TP1/TP2/TP3)
+                return;
             }
 
             // TPs activos de esta estrategia
@@ -1300,6 +1456,26 @@ namespace MyAtas.Strategies
                 DebugLog.W("468/STR", "RECONCILE SL QTY OK: no SL quantity adjustment needed");
             }
             DebugLog.W("468/STR", $"RECONCILED: net={net} netByFills={NetByFills()} tpActive={tps.Count} slActive={sls.Count}");
+        }
+
+        // === Helper: ReleaseTradeLock (botón de pánico) ===
+        private void ReleaseTradeLock(string reason)
+        {
+            _tradeActive = false;
+            _bracketsPlaced = false;
+            _bracketsAttachedAt = DateTime.MinValue;
+            _antiFlatUntilBar = -1;
+            _flatStreak = 0;
+            _lastFlatRead = DateTime.MinValue;
+            _orderFills.Clear();
+            _cachedNetPosition = 0;
+            _breakevenApplied = false;
+            _entryPrice = 0m;
+            _beLastTouchBar = -1;
+            _beLastTouchAt = DateTime.MinValue;
+            if (EnableCooldown && CooldownBars > 0)
+                _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
+            DebugLog.W("468/ORD", $"Trade lock RELEASED ({reason})");
         }
 
         // === Cálculo local para evitar races de N+1 ===

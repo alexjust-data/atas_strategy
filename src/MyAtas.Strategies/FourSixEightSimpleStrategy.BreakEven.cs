@@ -12,6 +12,7 @@ namespace MyAtas.Strategies
     {
         // --- Estado BE ---
         private bool _breakevenApplied = false;
+        private decimal _beLastTpPrice = 0m; // TP "congelado" mientras BE esté activo
         private decimal _entryPrice = 0m;
         private int _beLastTouchBar = -1;
         private DateTime _beLastTouchAt = DateTime.MinValue;
@@ -166,6 +167,7 @@ namespace MyAtas.Strategies
                         DebugLog.W("468/BRK", $"BE REBUILD OCO: newOco={newOco[..6]} qty={g.Qty} tp@{g.TpPx:F2} slBE@{bePx:F2}");
                         SubmitStop(newOco, coverSide, g.Qty, bePx);
                         SubmitLimit(newOco, coverSide, g.Qty, g.TpPx);
+                        _beLastTpPrice = g.TpPx; // memoriza el TP que debe sobrevivir durante BE
                     }
 
                     _breakevenApplied = true;

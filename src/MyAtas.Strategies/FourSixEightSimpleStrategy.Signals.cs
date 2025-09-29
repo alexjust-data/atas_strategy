@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.Linq;
 using ATAS.Types;
 using MyAtas.Shared;
@@ -197,27 +198,58 @@ namespace MyAtas.Strategies
         {
             if (OnlyOnePosition)
             {
-                int net = GetNetPosition();
+                // *** PHANTOM FIX: Verificar broker como autoridad máxima ***
+                int portfolioNet = TryGetPositionFromPortfolio();
+                int positionsNet = TryGetPositionFromPositions();
+                int net = GetNetPosition(); // este puede estar contaminado por phantom
+                int fillsSum = NetByFills();
+                bool live = HasAnyActiveOrders();
                 bool inCooldown = EnableCooldown && CooldownBars > 0 && _cooldownUntilBar >= 0 && bar <= _cooldownUntilBar;
-                bool busy = _tradeActive || net != 0 || HasAnyActiveOrders() || inCooldown;
+
                 DebugLog.W("468/STR",
-                    $"GUARD OnlyOnePosition: active={_tradeActive} net={net} activeOrders={CountActiveOrders()} " +
-                    $"cooldown={(inCooldown ? $"YES(until={_cooldownUntilBar})" : "NO")} -> {(busy ? "BLOCK" : "PASS")}");
+                    $"GUARD OnlyOnePosition: portfolio={portfolioNet} positions={positionsNet} net={net} fills={fillsSum} " +
+                    $"active={_tradeActive} live={live} cooldown={(inCooldown ? $"YES(until={_cooldownUntilBar})" : "NO")}");
+
+                // *** PHANTOM FIX: Si broker dice 0 y no hay órdenes vivas, NO bloquees por residuos en fills ***
+                if (portfolioNet == 0 && positionsNet == 0 && !live)
+                {
+                    if (net != 0 || fillsSum != 0)
+                    {
+                        DebugLog.W("468/STR", $"PHANTOM RECONCILE: broker=0, live=NO, net={net}, fillsSum={fillsSum} → forcing cleanup");
+                        _orderFills.Clear();
+                        _childSign.Clear();
+                        _cachedNetPosition = 0;
+                    }
+                    DebugLog.W("468/STR", "GUARD OnlyOnePosition: PASS (flat by broker, no live orders)");
+                    return true;
+                }
 
                 // Si net=0 pero hay órdenes activas "zombie", CANCELA en broker
-                if (net == 0 && HasAnyActiveOrders())
+                if (portfolioNet == 0 && positionsNet == 0 && live)
                 {
-                    DebugLog.W("468/STR", "ZOMBIE CANCEL: net=0 but active orders present -> cancelling...");
-                    CancelAllLiveActiveOrders(); // ← nombre correcto en tu repo
+                    DebugLog.W("468/STR", "ZOMBIE CANCEL: broker=0 but live orders present -> cancelling...");
+                    CancelAllLiveActiveOrders();
                     DebugLog.W("468/STR", "RETRY NEXT TICK: keeping pending for re-check after zombie cancel");
                     return false; // reintenta en el próximo tick
                 }
 
+                // Caso normal: bloquea si realmente hay net ≠ 0 o hay actividad
+                bool busy = _tradeActive || portfolioNet != 0 || positionsNet != 0 || live || inCooldown;
                 if (busy)
                 {
-                    DebugLog.W("468/STR", "ABORT ENTRY: OnlyOnePosition guard failed");
+                    // Detailed block reason for debugging
+                    var reasons = new List<string>();
+                    if (_tradeActive) reasons.Add("tradeActive");
+                    if (portfolioNet != 0) reasons.Add($"portfolio={portfolioNet}");
+                    if (positionsNet != 0) reasons.Add($"positions={positionsNet}");
+                    if (live) reasons.Add($"liveOrders={CountActiveOrders()}");
+                    if (inCooldown) reasons.Add($"cooldown(until={_cooldownUntilBar})");
+
+                    DebugLog.W("468/STR", $"ABORT ENTRY: OnlyOnePosition guard BLOCKED by: {string.Join(", ", reasons)}");
                     return false;
                 }
+
+                DebugLog.W("468/STR", "GUARD OnlyOnePosition: PASS");
             }
             return true;
         }
