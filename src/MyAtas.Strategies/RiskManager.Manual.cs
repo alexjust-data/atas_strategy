@@ -130,6 +130,8 @@ namespace MyAtas.Strategies
         private readonly int _attachThrottleMs = 200; // consolidación mínima
         private readonly int _attachDeadlineMs = 120; // fallback rápido si el net no llega
         private readonly int _cleanupWaitMs = 1200; // timeout para forzar segunda limpieza en entornos lentos
+        private readonly int _postCloseGraceMs = 1500; // 1.5s suele bastar con ATAS/broker
+        private DateTime _postCloseUntil = DateTime.MinValue; // hasta cuándo aplicar gracia post-close
         private System.Collections.Generic.List<Order> _liveOrders = new();
         private const string BuildStamp = "RM.Manual 2025-09-30T19:40Z"; // cambia en cada build
 
@@ -359,18 +361,20 @@ namespace MyAtas.Strategies
             if (_pendingAttach && (DateTime.UtcNow - _pendingSince).TotalMilliseconds >= _attachThrottleMs)
                 TryAttachBracketsNow();
 
-            // Actualiza snapshot de net y limpia pendientes al cerrar posición
+            // Actualiza snapshot de net y limpia al cerrar posición
             try
             {
                 var currentNet = ReadNetPosition();
 
-                // Cleanup: si estábamos en posición y ahora estamos flat, limpiar pending y brackets
-                if (Math.Abs(_prevNet) > 0 && Math.Abs(currentNet) == 0 && _pendingAttach)
+                // Cleanup: si estábamos en posición y ahora estamos flat, SIEMPRE limpiar
+                if (Math.Abs(_prevNet) > 0 && Math.Abs(currentNet) == 0)
                 {
                     _pendingAttach = false;
                     if (EnableLogging)
-                        DebugLog.W("RM/PLAN", $"Position closed: cleanup pending state (prevNet={_prevNet} → currentNet={currentNet})");
+                        DebugLog.W("RM/PLAN", $"Position closed: cleanup (prevNet={_prevNet} → currentNet={currentNet})");
                     CancelResidualBrackets("flat detected");
+                    // marca ventana de tolerancia post-close
+                    _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
                 }
 
                 _prevNet = currentNet;
@@ -401,12 +405,14 @@ namespace MyAtas.Strategies
                     return;
                 }
 
-                // Ignora cierres explícitos y limpia pending state
+                // Ignora cierres explícitos y limpia pending state + brackets + abre ventana de tolerancia
                 if (comment.IndexOf("Close position", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     _pendingAttach = false;
                     if (EnableLogging)
-                        DebugLog.W("RM/PLAN", "cleared by Close position");
+                        DebugLog.W("RM/PLAN", "cleared by Close position → cleanup + grace window");
+                    CancelResidualBrackets("user pressed Close");
+                    _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
                     return;
                 }
 
@@ -459,7 +465,9 @@ namespace MyAtas.Strategies
 
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Bracket check: any468={any468} anyRmSl={anyRmSl} anyRmTp={anyRmTp} anyBrackets={anyBrackets}");
 
-                if (anyBrackets)
+                // Si estamos en periodo de gracia post-close, NO bloqueamos por "vivos"
+                var inGrace = DateTime.UtcNow <= _postCloseUntil;
+                if (anyBrackets && !inGrace)
                 {
                     // Aún hay SL/TP marcados como vivos (posible latencia tras cancelar).
                     // NO abortamos; mantenemos _pendingAttach y reintentamos en el próximo tick.
@@ -476,6 +484,11 @@ namespace MyAtas.Strategies
                     }
                     // pequeño backoff para no martillear
                     return;
+                }
+                else if (anyBrackets && inGrace)
+                {
+                    if (EnableLogging)
+                        DebugLog.W("RM/GRACE", $"post-close grace active → ignoring live-brackets check and proceeding");
                 }
 
                 // 2) Hard gate: solo adjuntar en transición FLAT→POSICIÓN (0→≠0)
@@ -863,7 +876,9 @@ namespace MyAtas.Strategies
                     if (!c.StartsWith(prefix)) return false;
                     // consideramos viva si NO está cancelada y NO está llena
                     var st = o.Status();
-                    return !o.Canceled && st != OrderStatus.Filled && st != OrderStatus.Canceled;
+                    return !o.Canceled
+                           && st != OrderStatus.Filled
+                           && st != OrderStatus.Canceled;
                 });
             }
             catch { return false; }
