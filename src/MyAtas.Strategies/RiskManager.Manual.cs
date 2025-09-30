@@ -531,6 +531,8 @@ namespace MyAtas.Strategies
 
                 // 1) Cancelar brackets propios (RM:SL:/RM:TP:)
                 CancelResidualBrackets("stop-to-flat");
+                // 1.1) Cancelar cualquier otra orden viva del instrumento (entradas del ChartTrader, ENF pendientes, etc.)
+                CancelNonBracketWorkingOrders("stop-to-flat");
 
                 // 2) FLATTEN si hay posición
                 var net = ReadNetPosition();
@@ -548,6 +550,8 @@ namespace MyAtas.Strategies
                         QuantityToFill = qty,
                         Comment   = comment
                     };
+                    // marcar como ReduceOnly para no abrir de más si hay desincronización de net
+                    TrySetReduceOnly(o);
                     OpenOrder(o);
                     if (EnableLogging) DebugLog.W("RM/STOP", $"Flatten MARKET sent: {side} {qty} (comment={comment})");
                 }
@@ -1011,6 +1015,36 @@ namespace MyAtas.Strategies
             catch (Exception ex)
             {
                 if (EnableLogging) DebugLog.W("RM/ERR", $"CancelResidualBrackets EX: {ex.Message}");
+            }
+        }
+
+        private void CancelNonBracketWorkingOrders(string reason)
+        {
+            try
+            {
+                var list = this.Orders;
+                if (list == null) return;
+                int canceled = 0;
+                foreach (var o in list)
+                {
+                    if (o == null) continue;
+                    var c = o.Comment ?? "";
+                    // ya se gestionan en CancelResidualBrackets
+                    if (c.StartsWith(OwnerPrefix + "SL:") || c.StartsWith(OwnerPrefix + "TP:")) continue;
+                    // no cancelar mi propia orden de flatten
+                    if (c.StartsWith(OwnerPrefix + "STPFLAT:")) continue;
+                    var st = o.Status();
+                    // viva = no Canceled/Filled (ATAS enum: Placed/PartlyFilled/None pueden aparecer)
+                    if (!o.Canceled && st != OrderStatus.Canceled && st != OrderStatus.Filled)
+                    {
+                        try { CancelOrder(o); canceled++; } catch { }
+                    }
+                }
+                if (EnableLogging) DebugLog.W("RM/CLEAN", $"Canceled non-bracket working orders (n={canceled}) reason='{reason}'");
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/ERR", $"CancelNonBracketWorkingOrders EX: {ex.Message}");
             }
         }
 
