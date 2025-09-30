@@ -120,8 +120,26 @@ namespace MyAtas.Strategies
         private int _lastSeenBar = -1;
         private RiskEngine _engine;
 
+        // ==== Diagnostics / Build stamp ====
+        private const string BuildStamp = "RM.Manual/attach-protect+debounce 2025-09-30T21:15Z";
+
+        // ==== Post-Close grace & timeouts ====
+        private DateTime _postCloseUntil = DateTime.MinValue; // if now <= this → inGrace
+        private readonly int _postCloseGraceMs = 1500;        // grace after Close (ms)
+        private readonly int _cleanupWaitMs = 300;            // wait before aggressive cleanup (ms)
+        private readonly int _maxRetryMs = 2000;              // absolute escape from WAIT (ms)
+
+        // ==== State snapshots for external-close detection ====
+        private bool _hadRmBracketsPrevTick = false;          // were there RM brackets last tick?
+        private int  _prevNet = 0;                            // last net position snapshot
+        private DateTime _lastExternalCloseAt = DateTime.MinValue;
+        private const int ExternalCloseDebounceMs = 1500;
+
+        // ==== Attach protection ====
+        private DateTime _lastAttachArmAt = DateTime.MinValue;
+        private const int AttachProtectMs = 400;
+
         // --- Estado de net para detectar 0→≠0 (entrada) ---
-        private int _prevNet = 0;
         private bool _pendingAttach = false;
         private decimal _pendingEntryPrice = 0m;
         private DateTime _pendingSince = DateTime.MinValue;
@@ -129,11 +147,7 @@ namespace MyAtas.Strategies
         private int _pendingFillQty = 0;                 // qty del fill manual (si la API lo expone)
         private readonly int _attachThrottleMs = 200; // consolidación mínima
         private readonly int _attachDeadlineMs = 120; // fallback rápido si el net no llega
-        private readonly int _cleanupWaitMs = 1200; // timeout para forzar segunda limpieza en entornos lentos
-        private readonly int _postCloseGraceMs = 1500; // 1.5s suele bastar con ATAS/broker
-        private DateTime _postCloseUntil = DateTime.MinValue; // hasta cuándo aplicar gracia post-close
         private System.Collections.Generic.List<Order> _liveOrders = new();
-        private const string BuildStamp = "RM.Manual 2025-09-30T19:40Z"; // cambia en cada build
 
         // Helper property for compatibility
         private bool IsActivated => ManageManualEntries;
@@ -355,35 +369,60 @@ namespace MyAtas.Strategies
             if (!IsActivated) return;
 
             if (EnableLogging && IsFirstTickOf(bar))
-                DebugLog.W("RM/HEARTBEAT", $"bar={bar} t={GetCandle(bar).Time:HH:mm:ss} mode={SizingMode} be={BreakEvenMode} trail={TrailingMode} build={BuildStamp}");
+            {
+                var now = DateTime.UtcNow;
+                DebugLog.W("RM/HEARTBEAT",
+                    $"bar={bar} t={GetCandle(bar).Time:HH:mm:ss} mode={SizingMode} be={BreakEvenMode} trail={TrailingMode} build={BuildStamp} graceUntil={_postCloseUntil:HH:mm:ss.fff} inGrace={(now <= _postCloseUntil)}");
+            }
 
             // Fallback por barra si quedó pendiente
             if (_pendingAttach && (DateTime.UtcNow - _pendingSince).TotalMilliseconds >= _attachThrottleMs)
                 TryAttachBracketsNow();
 
-            // Actualiza snapshot de net y limpia al cerrar posición
+            // === Net & external-close detection (with attach protection) ===
             try
             {
                 var currentNet = ReadNetPosition();
+                var isFlat = Math.Abs(currentNet) == 0;
+                var hadBrNow = HasLiveRmBrackets();
 
-                // Cleanup: si estábamos en posición y ahora estamos flat, SIEMPRE limpiar
-                if (Math.Abs(_prevNet) > 0 && Math.Abs(currentNet) == 0)
+                bool transitionClose = (_prevNet != 0 && currentNet == 0);
+                bool bracketsEdgeClose = (_hadRmBracketsPrevTick && !hadBrNow && isFlat);
+                bool recentAttach = _pendingAttach && (DateTime.UtcNow - _lastAttachArmAt).TotalMilliseconds < AttachProtectMs;
+                bool debounce = (DateTime.UtcNow - _lastExternalCloseAt).TotalMilliseconds < ExternalCloseDebounceMs;
+
+                if ((transitionClose || bracketsEdgeClose) && !debounce)
                 {
-                    _pendingAttach = false;
-                    if (EnableLogging)
-                        DebugLog.W("RM/PLAN", $"Position closed: cleanup (prevNet={_prevNet} → currentNet={currentNet})");
-                    CancelResidualBrackets("flat detected");
-                    // marca ventana de tolerancia post-close
+                    CancelResidualBrackets("external close detected");
+                    if (!recentAttach) _pendingAttach = false; // <- NO matar attach recién armado
                     _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
+                    _lastExternalCloseAt = DateTime.UtcNow;
+                    if (EnableLogging)
+                        DebugLog.W("RM/GRACE", $"External close → grace until={_postCloseUntil:HH:mm:ss.fff}, recentAttach={recentAttach}");
                 }
 
+                // Update prev snapshots for next tick
+                _hadRmBracketsPrevTick = hadBrNow;
                 _prevNet = currentNet;
             }
-            catch { }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/ERR", $"OnCalculate net/check EX: {ex.Message}");
+            }
         }
 
         protected override void OnOrderChanged(Order order)
         {
+            // ==== Enhanced logging for ALL order events ====
+            try
+            {
+                var c = order?.Comment ?? "";
+                var st = order.Status();
+                if (EnableLogging)
+                    DebugLog.W("RM/EVT", $"OnOrderChanged: id={order?.Id} comment='{c}' status={st} side={order?.Direction} qty={order?.QuantityToFill} canceled={order?.Canceled}");
+            }
+            catch { /* ignore logging issues */ }
+
             try
             {
                 if (!IsActivated || !ManageManualEntries) return;
@@ -405,14 +444,15 @@ namespace MyAtas.Strategies
                     return;
                 }
 
-                // Ignora cierres explícitos y limpia pending state + brackets + abre ventana de tolerancia
+                // Keep legacy "Close position" detection (when comment is present)
                 if (comment.IndexOf("Close position", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
                     _pendingAttach = false;
+                    CancelResidualBrackets("user pressed Close (comment match)");
+                    var graceUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
+                    _postCloseUntil = graceUntil;
                     if (EnableLogging)
-                        DebugLog.W("RM/PLAN", "cleared by Close position → cleanup + grace window");
-                    CancelResidualBrackets("user pressed Close");
-                    _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
+                        DebugLog.W("RM/GRACE", $"Grace window opened after Close (EVT), until={graceUntil:HH:mm:ss.fff}");
                     return;
                 }
 
@@ -431,8 +471,10 @@ namespace MyAtas.Strategies
                 var orderAvgPrice = ExtractAvgFillPrice(order);
                 _pendingEntryPrice = orderAvgPrice > 0m ? orderAvgPrice : 0m;
 
+                // Armar attach con protección temporal
                 _pendingAttach = true;
                 _pendingSince = DateTime.UtcNow;
+                _lastAttachArmAt = _pendingSince;
 
                 if (EnableLogging)
                     DebugLog.W("RM/ORD", $"Manual order DETECTED → pendingAttach=true | dir={_pendingDirHint} fillQty={_pendingFillQty} entryPx={_pendingEntryPrice:F2}");
@@ -449,76 +491,82 @@ namespace MyAtas.Strategies
         {
             try
             {
-                if (EnableLogging) DebugLog.W("RM/ATTACH", $"TryAttachBracketsNow ENTER: _pendingAttach={_pendingAttach}");
-
                 if (!_pendingAttach) return;
 
-                // 0) Cancelar cualquier bracket RM residual si estamos flat (o en cualquier caso, para permitir re-attach limpio)
-                if (Math.Abs(ReadNetPosition()) == 0 && HasLiveRmBrackets())
-                    CancelResidualBrackets("pre-attach cleanup");
+                // 0) Pre-check & diagnostics
+                var now = DateTime.UtcNow;
+                var inGrace = now <= _postCloseUntil;
+                if (EnableLogging)
+                    DebugLog.W("RM/ATTACH", $"Pre-check: pendingSince={_pendingSince:HH:mm:ss.fff} inGrace={inGrace}");
 
-                // 1) ¿hay BRACKETS vivos? (SL/TP). Las órdenes de enforcement (ENF) no deben bloquear.
-                var any468 = HasLiveOrdersWithPrefix(IgnorePrefix);
+                // 1) Are there live brackets? (only SL:/TP:, ignore ENF)
+                var any468  = HasLiveOrdersWithPrefix(IgnorePrefix);
                 var anyRmSl = HasLiveOrdersWithPrefix(OwnerPrefix + "SL:");
                 var anyRmTp = HasLiveOrdersWithPrefix(OwnerPrefix + "TP:");
                 var anyBrackets = any468 || anyRmSl || anyRmTp;
+                if (EnableLogging)
+                    DebugLog.W("RM/ATTACH", $"Bracket check: any468={any468} anyRmSl={anyRmSl} anyRmTp={anyRmTp} anyBrackets={anyBrackets}");
 
-                if (EnableLogging) DebugLog.W("RM/ATTACH", $"Bracket check: any468={any468} anyRmSl={anyRmSl} anyRmTp={anyRmTp} anyBrackets={anyBrackets}");
-
-                // Si estamos en periodo de gracia post-close, NO bloqueamos por "vivos"
-                var inGrace = DateTime.UtcNow <= _postCloseUntil;
                 if (anyBrackets && !inGrace)
                 {
-                    // Aún hay SL/TP marcados como vivos (posible latencia tras cancelar).
-                    // NO abortamos; mantenemos _pendingAttach y reintentamos en el próximo tick.
-                    var bracketWaitMs = (int)(DateTime.UtcNow - _pendingSince).TotalMilliseconds;
-                    if (EnableLogging)
-                        DebugLog.W("RM/WAIT", $"live brackets (likely cancel-latency) → any468={any468} SL={anyRmSl} TP={anyRmTp} → RETRY (waited={bracketWaitMs}ms)");
-
-                    if (bracketWaitMs > _cleanupWaitMs)
+                    var waitedMs = (int)(now - _pendingSince).TotalMilliseconds;
+                    if (waitedMs > _maxRetryMs)
                     {
-                        // Fuerza una segunda limpieza y sigue esperando
-                        if (EnableLogging) DebugLog.W("RM/CLEAN", $"cleanup timeout exceeded ({bracketWaitMs}ms > {_cleanupWaitMs}ms) → forcing second cleanup");
-                        CancelResidualBrackets("cleanup timeout");
-                        _pendingSince = DateTime.UtcNow;
+                        _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs); // bypass
+                        if (EnableLogging)
+                            DebugLog.W("RM/GRACE", $"MaxRetry {waitedMs}ms → forcing grace & proceeding");
+                        // sigue sin return
                     }
-                    // pequeño backoff para no martillear
-                    return;
+                    else if (waitedMs > _cleanupWaitMs)
+                    {
+                        CancelResidualBrackets($"cleanup timeout waited={waitedMs}ms");
+                        _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
+                        _pendingSince = DateTime.UtcNow;
+                        if (EnableLogging)
+                            DebugLog.W("RM/GRACE", $"Cleanup timeout → grace reset to {_postCloseUntil:HH:mm:ss.fff}");
+                        return; // reintenta
+                    }
+                    else
+                    {
+                        if (EnableLogging)
+                            DebugLog.W("RM/WAIT", $"live brackets → retry (waited={waitedMs}ms)");
+                        return;
+                    }
                 }
                 else if (anyBrackets && inGrace)
                 {
                     if (EnableLogging)
-                        DebugLog.W("RM/GRACE", $"post-close grace active → ignoring live-brackets check and proceeding");
+                        DebugLog.W("RM/GRACE", "post-close grace ACTIVE → ignoring live-brackets block");
                 }
 
                 // 2) Hard gate: solo adjuntar en transición FLAT→POSICIÓN (0→≠0)
                 var netNow = ReadNetPosition();
-                var waitedMs = (int)(DateTime.UtcNow - _pendingSince).TotalMilliseconds;
+                var gateWaitedMs = (int)(DateTime.UtcNow - _pendingSince).TotalMilliseconds;
 
-                if (EnableLogging) DebugLog.W("RM/GATE", $"Gate check: _prevNet={_prevNet} netNow={netNow} waitedMs={waitedMs} deadline={_attachDeadlineMs}");
+                if (EnableLogging) DebugLog.W("RM/GATE", $"Gate check: _prevNet={_prevNet} netNow={netNow} waitedMs={gateWaitedMs} deadline={_attachDeadlineMs}");
 
                 if (Math.Abs(_prevNet) == 0 && Math.Abs(netNow) > 0)
                 {
                     // Transición válida 0→≠0: proceder con adjuntar
-                    if (EnableLogging) DebugLog.W("RM/GATE", $"VALID TRANSITION: prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ATTACH");
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"VALID TRANSITION: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms → ATTACH");
                 }
                 else
                 {
                     // si aún no llegamos al deadline → WAIT
-                    if (waitedMs < _attachDeadlineMs)
+                    if (gateWaitedMs < _attachDeadlineMs)
                     {
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"WAITING: prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms < deadline={_attachDeadlineMs}ms → WAIT");
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"WAITING: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms < deadline={_attachDeadlineMs}ms → WAIT");
                         return;
                     }
                     // deadline alcanzado → ¿podemos fallback?
                     if (!(AllowAttachFallback && _pendingDirHint != 0))
                     {
                         _pendingAttach = false;
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"ABORT: prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → no fallback allowed");
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"ABORT: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms → no fallback allowed");
                         if (EnableLogging) DebugLog.W("RM/ABORT", "flat after TTL");
                         return;
                     }
-                    if (EnableLogging) DebugLog.W("RM/GATE", $"FALLBACK: prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ATTACH(FALLBACK) dirHint={_pendingDirHint}");
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"FALLBACK: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms → ATTACH(FALLBACK) dirHint={_pendingDirHint}");
                 }
 
                 var dir = Math.Abs(netNow) > 0 ? Math.Sign(netNow) : _pendingDirHint;
@@ -615,10 +663,15 @@ namespace MyAtas.Strategies
 
                 var plan = engine.BuildPlan(ctx, sizingCfg, bracketCfg, out var szReason);
 
-                if (EnableLogging)
+                if (plan == null)
                 {
-                    var tag = (Math.Abs(netNow) > 0 ? "ATTACH" : "ATTACH(FALLBACK)");
-                    DebugLog.W("RM/PLAN", $"{tag} qty={plan.TotalQty} | SL@{plan.StopLoss.Price:F2} | TPs=[{string.Join(",", plan.TakeProfits.Select(tp => $"{tp.Price:F2}x{tp.Quantity}"))}] | reason=({szReason}) {plan.Reason}");
+                    if (EnableLogging) DebugLog.W("RM/PLAN", "BuildPlan → null");
+                    return;
+                }
+                else
+                {
+                    if (EnableLogging)
+                        DebugLog.W("RM/PLAN", $"Built plan: totalQty={plan.TotalQty} stop={plan.StopLoss?.Price:F2} tps={plan.TakeProfits?.Count} reason={plan.Reason}");
                 }
 
                 if (plan.TotalQty <= 0) { if (EnableLogging) DebugLog.W("RM/PLAN", "qty<=0 → no attach"); _pendingAttach = false; return; }
@@ -638,7 +691,8 @@ namespace MyAtas.Strategies
                     if (delta > 0)
                     {
                         var side = dir > 0 ? OrderDirections.Buy : OrderDirections.Sell;
-                        if (EnableLogging) DebugLog.W("RM/ENTRY", $"ENFORCE TRIGGER: Sending {side} Market Order delta=+{delta} (target={targetQty} - seen={qSeen})");
+                        if (EnableLogging)
+                            DebugLog.W("RM/ENTRY", $"ENFORCE TRIGGER: sending MARKET {side} +{delta}");
                         SubmitRmMarket(side, delta);
                     }
                     else
@@ -657,27 +711,18 @@ namespace MyAtas.Strategies
                 // OCO 1:1 por TP — cada TP lleva su propio trozo de SL
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Starting bracket loop: TakeProfits.Count={plan.TakeProfits.Count}");
 
-                foreach (var (tp, idx) in plan.TakeProfits.Select((t,i) => (t,i)))
+                for (int idx = 0; idx < plan.TakeProfits.Count; idx++)
                 {
-                    if (tp.Quantity <= 0)
-                    {
-                        if (EnableLogging) DebugLog.W("RM/ATTACH", $"SKIP TP #{idx+1}: qty={tp.Quantity} (<=0)");
-                        continue;
-                    }
-
+                    var tp = plan.TakeProfits[idx];
                     var ocoId = Guid.NewGuid().ToString("N");
-                    if (EnableLogging) DebugLog.W("RM/ATTACH", $"Creating OCO pair #{idx+1}: ocoId={ocoId} qty={tp.Quantity} SL@{plan.StopLoss.Price:F2} TP@{tp.Price:F2}");
-
-                    // IMPORTANTE: el SL de este par usa la misma qty que el TP
                     SubmitRmStop(ocoId, coverSide, tp.Quantity, plan.StopLoss.Price);
                     SubmitRmLimit(ocoId, coverSide, tp.Quantity, tp.Price);
-
                     if (EnableLogging)
-                        DebugLog.W("RM/ORD", $"PAIR #{idx+1}: OCO={ocoId} SL {tp.Quantity}@{plan.StopLoss.Price:F2} + TP {tp.Quantity}@{tp.Price:F2}");
+                        DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: OCO SL {tp.Quantity}@{plan.StopLoss.Price:F2} + TP {tp.Quantity}@{tp.Price:F2} (dir={(dir>0?"LONG":"SHORT")})");
                 }
 
                 _pendingAttach = false;
-                if (EnableLogging) DebugLog.W("RM/PLAN", "Attach COMPLETE: _pendingAttach set to false");
+                if (EnableLogging) DebugLog.W("RM/PLAN", "Attach DONE");
             }
             catch (Exception ex)
             {
@@ -795,26 +840,7 @@ namespace MyAtas.Strategies
             catch { return 0m; }
         }
 
-        // === Cleanup utilities ===
-        private void CancelResidualBrackets(string reason)
-        {
-            try
-            {
-                var list = this.Orders;
-                if (list == null) return;
-                foreach (var o in list)
-                {
-                    var c = o?.Comment ?? "";
-                    if (!c.StartsWith(OwnerPrefix)) continue;
-                    if (!(c.StartsWith(OwnerPrefix + "SL:") || c.StartsWith(OwnerPrefix + "TP:"))) continue;
-                    var st = o.Status();
-                    if (o.Canceled || st == OrderStatus.Canceled || st == OrderStatus.Filled) continue;
-                    try { CancelOrder(o); } catch { }
-                }
-                if (EnableLogging) DebugLog.W("RM/CLEAN", $"Canceled residual RM brackets ({reason})");
-            } catch { }
-        }
-
+        // ==== Helpers: RM brackets detection & cleanup ====
         private bool HasLiveRmBrackets()
         {
             try
@@ -826,11 +852,39 @@ namespace MyAtas.Strategies
                     var c = o?.Comment ?? "";
                     if (!(c.StartsWith(OwnerPrefix + "SL:") || c.StartsWith(OwnerPrefix + "TP:"))) continue;
                     var st = o.Status();
+                    // Consider live only if not canceled/filled
                     if (!o.Canceled && st != OrderStatus.Canceled && st != OrderStatus.Filled)
                         return true;
                 }
-            } catch { }
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/ERR", $"HasLiveRmBrackets EX: {ex.Message}");
+            }
             return false;
+        }
+
+        private void CancelResidualBrackets(string reason)
+        {
+            try
+            {
+                var list = this.Orders;
+                if (list == null) return;
+                int canceled = 0;
+                foreach (var o in list)
+                {
+                    var c = o?.Comment ?? "";
+                    if (!(c.StartsWith(OwnerPrefix + "SL:") || c.StartsWith(OwnerPrefix + "TP:"))) continue;
+                    var st = o.Status();
+                    if (o.Canceled || st == OrderStatus.Canceled || st == OrderStatus.Filled) continue;
+                    try { CancelOrder(o); canceled++; } catch { }
+                }
+                if (EnableLogging) DebugLog.W("RM/CLEAN", $"Canceled residual RM brackets (n={canceled}) reason='{reason}'");
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/ERR", $"CancelResidualBrackets EX: {ex.Message}");
+            }
         }
 
         // === Additional order options via TradingManager ===
