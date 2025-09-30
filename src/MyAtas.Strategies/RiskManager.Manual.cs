@@ -31,10 +31,15 @@ namespace MyAtas.Strategies
         [Category("Activation"), DisplayName("Owner prefix (this strategy)")]
         public string OwnerPrefix { get; set; } = "RM:";
 
+        [Category("Activation"), DisplayName("Enforce manual qty on entry")]
+        [Description("Si la entrada manual ejecuta menos contratos que el objetivo calculado por el RM, la estrategia enviará una orden a mercado por la diferencia (delta).")]
+        public bool EnforceManualQty { get; set; } = true;
+
         [Category("Position Sizing"), DisplayName("Mode")]
         public RmSizingMode SizingMode { get; set; } = RmSizingMode.Manual;
 
         [Category("Position Sizing"), DisplayName("Manual qty")]
+        [Description("Cantidad objetivo de la ESTRATEGIA. Si difiere de la qty del ChartTrader y 'Enforce manual qty' está activo, el RM ajustará con orden a mercado.")]
         public int ManualQty { get; set; } = 1;
 
         [Category("Position Sizing"), DisplayName("Risk per trade (USD)")]
@@ -122,9 +127,10 @@ namespace MyAtas.Strategies
         private DateTime _pendingSince = DateTime.MinValue;
         private int _pendingDirHint = 0;                 // +1/-1 si logramos leerlo del Order
         private int _pendingFillQty = 0;                 // qty del fill manual (si la API lo expone)
-        private readonly int _attachThrottleMs = 500; // throttle para fallback
-        private readonly int _attachDeadlineMs = 2500;   // tiempo máximo a esperar net≠0
+        private readonly int _attachThrottleMs = 200; // consolidación mínima
+        private readonly int _attachDeadlineMs = 120; // fallback rápido si el net no llega
         private System.Collections.Generic.List<Order> _liveOrders = new();
+        private const string BuildStamp = "RM.Manual 2025-09-30T19:40Z"; // cambia en cada build
 
         // Helper property for compatibility
         private bool IsActivated => ManageManualEntries;
@@ -346,7 +352,7 @@ namespace MyAtas.Strategies
             if (!IsActivated) return;
 
             if (EnableLogging && IsFirstTickOf(bar))
-                DebugLog.W("RM/HEARTBEAT", $"bar={bar} t={GetCandle(bar).Time:HH:mm:ss} mode={SizingMode} be={BreakEvenMode} trail={TrailingMode}");
+                DebugLog.W("RM/HEARTBEAT", $"bar={bar} t={GetCandle(bar).Time:HH:mm:ss} mode={SizingMode} be={BreakEvenMode} trail={TrailingMode} build={BuildStamp}");
 
             // Fallback por barra si quedó pendiente
             if (_pendingAttach && (DateTime.UtcNow - _pendingSince).TotalMilliseconds >= _attachThrottleMs)
@@ -357,12 +363,13 @@ namespace MyAtas.Strategies
             {
                 var currentNet = ReadNetPosition();
 
-                // Cleanup: si estábamos en posición y ahora estamos flat, limpiar pending
+                // Cleanup: si estábamos en posición y ahora estamos flat, limpiar pending y brackets
                 if (Math.Abs(_prevNet) > 0 && Math.Abs(currentNet) == 0 && _pendingAttach)
                 {
                     _pendingAttach = false;
                     if (EnableLogging)
                         DebugLog.W("RM/PLAN", $"Position closed: cleanup pending state (prevNet={_prevNet} → currentNet={currentNet})");
+                    CancelResidualBrackets("flat detected");
                 }
 
                 _prevNet = currentNet;
@@ -379,9 +386,19 @@ namespace MyAtas.Strategies
                 var comment = order?.Comment ?? "";
                 var st = order.Status();
 
+                if (EnableLogging) DebugLog.W("RM/ORD", $"OnOrderChanged: comment={comment} status={st}");
+
                 // Ignora la 468 y mis propias RM
-                if (comment.StartsWith(IgnorePrefix)) return;
-                if (comment.StartsWith(OwnerPrefix)) return;
+                if (comment.StartsWith(IgnorePrefix))
+                {
+                    if (EnableLogging) DebugLog.W("RM/ORD", $"OnOrderChanged SKIP: IgnorePrefix detected ({IgnorePrefix})");
+                    return;
+                }
+                if (comment.StartsWith(OwnerPrefix))
+                {
+                    if (EnableLogging) DebugLog.W("RM/ORD", $"OnOrderChanged SKIP: OwnerPrefix detected ({OwnerPrefix})");
+                    return;
+                }
 
                 // Ignora cierres explícitos y limpia pending state
                 if (comment.IndexOf("Close position", StringComparison.OrdinalIgnoreCase) >= 0)
@@ -393,7 +410,11 @@ namespace MyAtas.Strategies
                 }
 
                 // Sólo nos interesan fills/parciales
-                if (!(st == OrderStatus.Filled || st == OrderStatus.PartlyFilled)) return;
+                if (!(st == OrderStatus.Filled || st == OrderStatus.PartlyFilled))
+                {
+                    if (EnableLogging) DebugLog.W("RM/ORD", $"OnOrderChanged SKIP: status={st} (not filled/partly)");
+                    return;
+                }
 
                 // Marca attach pendiente; la dirección la deduciremos con el net por barra o ahora mismo
                 _pendingDirHint = ExtractDirFromOrder(order);
@@ -407,14 +428,13 @@ namespace MyAtas.Strategies
                 _pendingSince = DateTime.UtcNow;
 
                 if (EnableLogging)
-                    DebugLog.W("RM/ORD", $"Manual order filled → pendingAttach=true entryPx={_pendingEntryPrice:F2}");
+                    DebugLog.W("RM/ORD", $"Manual order DETECTED → pendingAttach=true | dir={_pendingDirHint} fillQty={_pendingFillQty} entryPx={_pendingEntryPrice:F2}");
 
-                // Dejamos que lo dispare OnCalculate tras actualizar net
-                // TryAttachBracketsNow();
+                TryAttachBracketsNow(); // intenta en el mismo tick; si el gate decide WAIT, ya lo reintentará OnCalculate
             }
             catch (Exception ex)
             {
-                DebugLog.W("RM/ORD", $"OnOrderChanged EX: {ex.Message}");
+                DebugLog.W("RM/ORD", $"OnOrderChanged EXCEPTION: {ex.Message} | Stack: {ex.StackTrace}");
             }
         }
 
@@ -422,14 +442,25 @@ namespace MyAtas.Strategies
         {
             try
             {
+                if (EnableLogging) DebugLog.W("RM/ATTACH", $"TryAttachBracketsNow ENTER: _pendingAttach={_pendingAttach}");
+
                 if (!_pendingAttach) return;
 
-                // 1) ¿hay órdenes 468/RM vivas? no tocar
+                // 0) Cancelar cualquier bracket RM residual si estamos flat (o en cualquier caso, para permitir re-attach limpio)
+                if (Math.Abs(ReadNetPosition()) == 0 && HasLiveRmBrackets())
+                    CancelResidualBrackets("pre-attach cleanup");
+
+                // 1) ¿hay BRACKETS vivos? (SL/TP). Las órdenes de enforcement (ENF) no deben bloquear.
                 var any468 = HasLiveOrdersWithPrefix(IgnorePrefix);
-                var anyRM  = HasLiveOrdersWithPrefix(OwnerPrefix);
-                if (any468 || anyRM)
+                var anyRmSl = HasLiveOrdersWithPrefix(OwnerPrefix + "SL:");
+                var anyRmTp = HasLiveOrdersWithPrefix(OwnerPrefix + "TP:");
+                var anyBrackets = any468 || anyRmSl || anyRmTp;
+
+                if (EnableLogging) DebugLog.W("RM/ATTACH", $"Bracket check: any468={any468} anyRmSl={anyRmSl} anyRmTp={anyRmTp} anyBrackets={anyBrackets}");
+
+                if (anyBrackets)
                 {
-                    if (EnableLogging) DebugLog.W("RM/ABORT", $"any468={any468} anyRM={anyRM}");
+                    if (EnableLogging) DebugLog.W("RM/ABORT", $"live brackets exist → any468={any468} SL={anyRmSl} TP={anyRmTp}");
                     _pendingAttach = false;
                     return;
                 }
@@ -438,38 +469,47 @@ namespace MyAtas.Strategies
                 var netNow = ReadNetPosition();
                 var waitedMs = (int)(DateTime.UtcNow - _pendingSince).TotalMilliseconds;
 
+                if (EnableLogging) DebugLog.W("RM/GATE", $"Gate check: _prevNet={_prevNet} netNow={netNow} waitedMs={waitedMs} deadline={_attachDeadlineMs}");
+
                 if (Math.Abs(_prevNet) == 0 && Math.Abs(netNow) > 0)
                 {
                     // Transición válida 0→≠0: proceder con adjuntar
-                    if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ATTACH");
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"VALID TRANSITION: prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ATTACH");
                 }
                 else
                 {
                     // si aún no llegamos al deadline → WAIT
                     if (waitedMs < _attachDeadlineMs)
                     {
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → WAIT");
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"WAITING: prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms < deadline={_attachDeadlineMs}ms → WAIT");
                         return;
                     }
                     // deadline alcanzado → ¿podemos fallback?
                     if (!(AllowAttachFallback && _pendingDirHint != 0))
                     {
                         _pendingAttach = false;
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ABORT");
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"ABORT: prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → no fallback allowed");
                         if (EnableLogging) DebugLog.W("RM/ABORT", "flat after TTL");
                         return;
                     }
-                    if (EnableLogging) DebugLog.W("RM/GATE", $"prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ATTACH(FALLBACK)");
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"FALLBACK: prevNet={_prevNet} netNow={netNow} elapsed={waitedMs}ms → ATTACH(FALLBACK) dirHint={_pendingDirHint}");
                 }
 
                 var dir = Math.Abs(netNow) > 0 ? Math.Sign(netNow) : _pendingDirHint;
+                if (EnableLogging) DebugLog.W("RM/ATTACH", $"Direction determined: dir={dir} (netNow={netNow}, dirHint={_pendingDirHint})");
 
-                // qty a usar en Manual: net si lo hay, si no la del fill, si no la de la UI
+                // qty OBJETIVO del plan:
+                //  - Manual  → SIEMPRE la UI (ManualQty), no el net/fill
+                //  - Riesgo  → la calculará el engine
                 int manualQtyToUse = ManualQty;
                 if (SizingMode == RmSizingMode.Manual)
                 {
-                    if (Math.Abs(netNow) > 0) manualQtyToUse = Math.Abs(netNow);
-                    else manualQtyToUse = Math.Max(1, (_pendingFillQty > 0 ? _pendingFillQty : ManualQty));
+                    manualQtyToUse = Math.Clamp(ManualQty, Math.Max(1, MinQty), Math.Max(1, MaxQty));
+                    if (EnableLogging) DebugLog.W("RM/SIZING", $"Manual mode: Using UI ManualQty={manualQtyToUse} (ignoring net/fill for TARGET)");
+                }
+                else
+                {
+                    if (EnableLogging) DebugLog.W("RM/SIZING", $"Risk-based sizing: engine will compute target qty");
                 }
 
                 // Instrumento (fallbacks)
@@ -557,14 +597,51 @@ namespace MyAtas.Strategies
 
                 if (plan.TotalQty <= 0) { if (EnableLogging) DebugLog.W("RM/PLAN", "qty<=0 → no attach"); _pendingAttach = false; return; }
 
+                // 3bis) ENFORCEMENT DE CANTIDAD (si procede)
+                if (EnforceManualQty)
+                {
+                    var currentNet = Math.Abs(ReadNetPosition());
+                    var filledHint = Math.Max(0, _pendingFillQty);
+                    var qSeen = Math.Max(currentNet, filledHint);
+                    var targetQty = Math.Max(1, plan.TotalQty); // ahora plan.TotalQty = ManualQty (o qty por riesgo)
+                    var delta = targetQty - qSeen;
+
+                    if (EnableLogging) DebugLog.W("RM/ENTRY",
+                        $"ENFORCE CHECK: target={targetQty} (from plan/UI) | seen={qSeen} (net={currentNet}, fillHint={filledHint}) | delta={delta}");
+
+                    if (delta > 0)
+                    {
+                        var side = dir > 0 ? OrderDirections.Buy : OrderDirections.Sell;
+                        if (EnableLogging) DebugLog.W("RM/ENTRY", $"ENFORCE TRIGGER: Sending {side} Market Order delta=+{delta} (target={targetQty} - seen={qSeen})");
+                        SubmitRmMarket(side, delta);
+                    }
+                    else
+                    {
+                        if (EnableLogging) DebugLog.W("RM/ENTRY", $"ENFORCE SKIP: No delta needed (target={targetQty} already met by seen={qSeen})");
+                    }
+                }
+                else
+                {
+                    if (EnableLogging) DebugLog.W("RM/ENTRY", "ENFORCE DISABLED: EnforceManualQty=false");
+                }
+
                 var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+                if (EnableLogging) DebugLog.W("RM/ATTACH", $"Cover side for brackets: coverSide={coverSide} (dir={dir})");
 
                 // OCO 1:1 por TP — cada TP lleva su propio trozo de SL
+                if (EnableLogging) DebugLog.W("RM/ATTACH", $"Starting bracket loop: TakeProfits.Count={plan.TakeProfits.Count}");
+
                 foreach (var (tp, idx) in plan.TakeProfits.Select((t,i) => (t,i)))
                 {
-                    if (tp.Quantity <= 0) continue;
+                    if (tp.Quantity <= 0)
+                    {
+                        if (EnableLogging) DebugLog.W("RM/ATTACH", $"SKIP TP #{idx+1}: qty={tp.Quantity} (<=0)");
+                        continue;
+                    }
 
                     var ocoId = Guid.NewGuid().ToString("N");
+                    if (EnableLogging) DebugLog.W("RM/ATTACH", $"Creating OCO pair #{idx+1}: ocoId={ocoId} qty={tp.Quantity} SL@{plan.StopLoss.Price:F2} TP@{tp.Price:F2}");
+
                     // IMPORTANTE: el SL de este par usa la misma qty que el TP
                     SubmitRmStop(ocoId, coverSide, tp.Quantity, plan.StopLoss.Price);
                     SubmitRmLimit(ocoId, coverSide, tp.Quantity, tp.Price);
@@ -574,7 +651,7 @@ namespace MyAtas.Strategies
                 }
 
                 _pendingAttach = false;
-                if (EnableLogging) DebugLog.W("RM/PLAN", "Attach DONE");
+                if (EnableLogging) DebugLog.W("RM/PLAN", "Attach COMPLETE: _pendingAttach set to false");
             }
             catch (Exception ex)
             {
@@ -586,15 +663,20 @@ namespace MyAtas.Strategies
         private void SubmitRmStop(string oco, OrderDirections side, int qty, decimal triggerPx)
         {
             var comment = $"{OwnerPrefix}SL:{Guid.NewGuid():N}";
+            if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop ENTER: side={side} qty={qty} triggerPx={triggerPx:F2} oco={oco} comment={comment}");
+
             try
             {
+                var shrunkPx = ShrinkPrice(triggerPx);
+                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop: ShrinkPrice({triggerPx:F2}) → {shrunkPx:F2}");
+
                 var order = new Order
                 {
                     Portfolio = Portfolio,
                     Security = Security,
                     Direction = side,
                     Type = OrderTypes.Stop,
-                    TriggerPrice = ShrinkPrice(triggerPx), // ← tick-safe
+                    TriggerPrice = shrunkPx, // ← tick-safe
                     QuantityToFill = qty,
                     OCOGroup = oco,
                     IsAttached = true,
@@ -603,27 +685,34 @@ namespace MyAtas.Strategies
                 order.AutoCancel = true;             // ← cancelar al cerrar
                 TrySetReduceOnly(order);             // ← no abrir nuevas
                 TrySetCloseOnTrigger(order);         // ← cerrar al disparar
+
+                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop: Calling OpenOrder() for SL");
                 OpenOrder(order);
-                DebugLog.W("RM/ORD", $"STOP submitted: {side} {qty} @{order.TriggerPrice:F2} OCO={(oco ?? "none")}");
+                DebugLog.W("RM/ORD", $"STOP SENT: {side} {qty} @{order.TriggerPrice:F2} OCO={(oco ?? "none")}");
             }
             catch (Exception ex)
             {
-                DebugLog.W("RM/ORD", $"SubmitRmStop EX: {ex.Message}");
+                DebugLog.W("RM/ORD", $"SubmitRmStop EXCEPTION: {ex.Message} | Stack: {ex.StackTrace}");
             }
         }
 
         private void SubmitRmLimit(string oco, OrderDirections side, int qty, decimal price)
         {
             var comment = $"{OwnerPrefix}TP:{Guid.NewGuid():N}";
+            if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit ENTER: side={side} qty={qty} price={price:F2} oco={oco} comment={comment}");
+
             try
             {
+                var shrunkPx = ShrinkPrice(price);
+                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit: ShrinkPrice({price:F2}) → {shrunkPx:F2}");
+
                 var order = new Order
                 {
                     Portfolio = Portfolio,
                     Security = Security,
                     Direction = side,
                     Type = OrderTypes.Limit,
-                    Price = ShrinkPrice(price),       // ← tick-safe
+                    Price = shrunkPx,       // ← tick-safe
                     QuantityToFill = qty,
                     OCOGroup = oco,
                     IsAttached = true,
@@ -631,13 +720,91 @@ namespace MyAtas.Strategies
                 };
                 order.AutoCancel = true;             // ← cancelar al cerrar
                 TrySetReduceOnly(order);             // ← no abrir nuevas
+
+                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit: Calling OpenOrder() for TP");
                 OpenOrder(order);
-                DebugLog.W("RM/ORD", $"LIMIT submitted: {side} {qty} @{order.Price:F2} OCO={(oco ?? "none")}");
+                DebugLog.W("RM/ORD", $"LIMIT SENT: {side} {qty} @{order.Price:F2} OCO={(oco ?? "none")}");
             }
             catch (Exception ex)
             {
-                DebugLog.W("RM/ORD", $"SubmitRmLimit EX: {ex.Message}");
+                DebugLog.W("RM/ORD", $"SubmitRmLimit EXCEPTION: {ex.Message} | Stack: {ex.StackTrace}");
             }
+        }
+
+        // === Market (enforcement) ===
+        private void SubmitRmMarket(OrderDirections side, int qty)
+        {
+            var comment = $"{OwnerPrefix}ENF:{Guid.NewGuid():N}";
+            if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmMarket ENTER: side={side} qty={qty} comment={comment}");
+
+            try
+            {
+                var order = new Order
+                {
+                    Portfolio = Portfolio,
+                    Security = Security,
+                    Direction = side,
+                    Type = OrderTypes.Market,
+                    QuantityToFill = qty,
+                    Comment = comment
+                };
+                // IMPORTANTE: no marcar ReduceOnly aquí — queremos abrir delta
+                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmMarket: Calling OpenOrder() for {side} +{qty} (ReduceOnly=false)");
+                OpenOrder(order);
+                if (EnableLogging) DebugLog.W("RM/ORD", $"ENFORCE MARKET SENT: {side} +{qty} @{GetLastPriceSafe():F2} comment={comment}");
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("RM/ORD", $"SubmitRmMarket EXCEPTION: {ex.Message} | Stack: {ex.StackTrace}");
+            }
+        }
+
+        private decimal GetLastPriceSafe()
+        {
+            try
+            {
+                var barIdx = Math.Max(0, Math.Min(CurrentBar - 1, CurrentBar));
+                return GetCandle(barIdx).Close;
+            }
+            catch { return 0m; }
+        }
+
+        // === Cleanup utilities ===
+        private void CancelResidualBrackets(string reason)
+        {
+            try
+            {
+                var list = this.Orders;
+                if (list == null) return;
+                foreach (var o in list)
+                {
+                    var c = o?.Comment ?? "";
+                    if (!c.StartsWith(OwnerPrefix)) continue;
+                    if (!(c.StartsWith(OwnerPrefix + "SL:") || c.StartsWith(OwnerPrefix + "TP:"))) continue;
+                    var st = o.Status();
+                    if (o.Canceled || st == OrderStatus.Canceled || st == OrderStatus.Filled) continue;
+                    try { CancelOrder(o); } catch { }
+                }
+                if (EnableLogging) DebugLog.W("RM/CLEAN", $"Canceled residual RM brackets ({reason})");
+            } catch { }
+        }
+
+        private bool HasLiveRmBrackets()
+        {
+            try
+            {
+                var list = this.Orders;
+                if (list == null) return false;
+                foreach (var o in list)
+                {
+                    var c = o?.Comment ?? "";
+                    if (!(c.StartsWith(OwnerPrefix + "SL:") || c.StartsWith(OwnerPrefix + "TP:"))) continue;
+                    var st = o.Status();
+                    if (!o.Canceled && st != OrderStatus.Canceled && st != OrderStatus.Filled)
+                        return true;
+                }
+            } catch { }
+            return false;
         }
 
         // === Additional order options via TradingManager ===
