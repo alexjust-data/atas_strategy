@@ -129,6 +129,7 @@ namespace MyAtas.Strategies
         private int _pendingFillQty = 0;                 // qty del fill manual (si la API lo expone)
         private readonly int _attachThrottleMs = 200; // consolidación mínima
         private readonly int _attachDeadlineMs = 120; // fallback rápido si el net no llega
+        private readonly int _cleanupWaitMs = 1200; // timeout para forzar segunda limpieza en entornos lentos
         private System.Collections.Generic.List<Order> _liveOrders = new();
         private const string BuildStamp = "RM.Manual 2025-09-30T19:40Z"; // cambia en cada build
 
@@ -460,8 +461,20 @@ namespace MyAtas.Strategies
 
                 if (anyBrackets)
                 {
-                    if (EnableLogging) DebugLog.W("RM/ABORT", $"live brackets exist → any468={any468} SL={anyRmSl} TP={anyRmTp}");
-                    _pendingAttach = false;
+                    // Aún hay SL/TP marcados como vivos (posible latencia tras cancelar).
+                    // NO abortamos; mantenemos _pendingAttach y reintentamos en el próximo tick.
+                    var bracketWaitMs = (int)(DateTime.UtcNow - _pendingSince).TotalMilliseconds;
+                    if (EnableLogging)
+                        DebugLog.W("RM/WAIT", $"live brackets (likely cancel-latency) → any468={any468} SL={anyRmSl} TP={anyRmTp} → RETRY (waited={bracketWaitMs}ms)");
+
+                    if (bracketWaitMs > _cleanupWaitMs)
+                    {
+                        // Fuerza una segunda limpieza y sigue esperando
+                        if (EnableLogging) DebugLog.W("RM/CLEAN", $"cleanup timeout exceeded ({bracketWaitMs}ms > {_cleanupWaitMs}ms) → forcing second cleanup");
+                        CancelResidualBrackets("cleanup timeout");
+                        _pendingSince = DateTime.UtcNow;
+                    }
+                    // pequeño backoff para no martillear
                     return;
                 }
 
