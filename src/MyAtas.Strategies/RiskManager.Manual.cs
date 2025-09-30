@@ -154,7 +154,8 @@ namespace MyAtas.Strategies
         private int _pendingFillQty = 0;                 // qty del fill manual (si la API lo expone)
         private readonly int _attachThrottleMs = 200; // consolidación mínima
         private readonly int _attachDeadlineMs = 120; // fallback rápido si el net no llega
-        private System.Collections.Generic.List<Order> _liveOrders = new();
+        private readonly System.Collections.Generic.List<Order> _liveOrders = new();
+        private readonly object _liveOrdersLock = new();
 
         // Helper property for compatibility
         private bool IsActivated => ManageManualEntries;
@@ -442,6 +443,19 @@ namespace MyAtas.Strategies
                     DebugLog.W("RM/EVT", $"OnOrderChanged: id={order?.Id} comment='{c}' status={st} side={order?.Direction} qty={order?.QuantityToFill} canceled={order?.Canceled}");
                 if (_stopToFlat && EnableLogging)
                     DebugLog.W("RM/STOP", $"EVT: id={order?.Id} comment='{c}' status={st} qty={order?.QuantityToFill} canceled={order?.Canceled}");
+
+                // Track also EXTERNAL orders (ChartTrader) for later mass-cancel on Stop
+                // Scope to this instrument+portfolio
+                if (order?.Security?.ToString() == Security?.ToString() &&
+                    order?.Portfolio?.ToString() == Portfolio?.ToString())
+                {
+                    lock (_liveOrdersLock)
+                    {
+                        _liveOrders.Add(order);
+                        if (_liveOrders.Count > 512)
+                            _liveOrders.RemoveRange(0, _liveOrders.Count - 512);
+                    }
+                }
             }
             catch { /* ignore logging issues */ }
 
@@ -509,6 +523,28 @@ namespace MyAtas.Strategies
             }
         }
 
+        // New: capture newly seen orders too (fires when order is registered)
+        protected override void OnNewOrder(Order order)
+        {
+            try
+            {
+                if (order == null) return;
+                if (EnableLogging)
+                    DebugLog.W("RM/EVT", $"OnNewOrder: id={order.Id} comment='{order.Comment}' type={order.Type} status={order.Status()} qty={order.QuantityToFill}");
+                if (order.Security?.ToString() == Security?.ToString() &&
+                    order.Portfolio?.ToString() == Portfolio?.ToString())
+                {
+                    lock (_liveOrdersLock)
+                    {
+                        _liveOrders.Add(order);
+                        if (_liveOrders.Count > 512)
+                            _liveOrders.RemoveRange(0, _liveOrders.Count - 512);
+                    }
+                }
+            }
+            catch { }
+        }
+
         // =================== Stop Strategy hooks ===================
         protected override void OnStarted()
         {
@@ -538,22 +574,26 @@ namespace MyAtas.Strategies
                 var net = ReadNetPosition();
                 if (Math.Abs(net) != 0)
                 {
-                    var side = net > 0 ? OrderDirections.Sell : OrderDirections.Buy;
-                    var qty  = Math.Abs(net);
-                    var comment = $"{OwnerPrefix}STPFLAT:{Guid.NewGuid():N}";
-                    var o = new Order
+                    // 2a) Prefer: TradingManager.ClosePosition (más robusto)
+                    if (!TryClosePositionViaTradingManager())
                     {
-                        Portfolio = Portfolio,
-                        Security  = Security,
-                        Direction = side,
-                        Type      = OrderTypes.Market,
-                        QuantityToFill = qty,
-                        Comment   = comment
-                    };
-                    // marcar como ReduceOnly para no abrir de más si hay desincronización de net
-                    TrySetReduceOnly(o);
-                    OpenOrder(o);
-                    if (EnableLogging) DebugLog.W("RM/STOP", $"Flatten MARKET sent: {side} {qty} (comment={comment})");
+                        // 2b) Fallback: MARKET reduce-only (tu método actual)
+                        var side = net > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+                        var qty  = Math.Abs(net);
+                        var comment = $"{OwnerPrefix}STPFLAT:{Guid.NewGuid():N}";
+                        var o = new Order
+                        {
+                            Portfolio = Portfolio,
+                            Security  = Security,
+                            Direction = side,
+                            Type      = OrderTypes.Market,
+                            QuantityToFill = qty,
+                            Comment   = comment
+                        };
+                        TrySetReduceOnly(o);
+                        OpenOrder(o);
+                        if (EnableLogging) DebugLog.W("RM/STOP", $"Flatten MARKET sent (fallback): {side} {qty} (comment={comment})");
+                    }
                 }
                 else
                 {
@@ -1022,30 +1062,77 @@ namespace MyAtas.Strategies
         {
             try
             {
-                var list = this.Orders;
-                if (list == null) return;
-                int canceled = 0;
-                foreach (var o in list)
+                // Build union: strategy-owned + externally created (ChartTrader)
+                var union = new System.Collections.Generic.List<Order>();
+                if (this.Orders != null) union.AddRange(this.Orders);
+                lock (_liveOrdersLock) union.AddRange(_liveOrders);
+
+                // Filter same Portfolio/Security and de-dup by Id
+                var seen = new System.Collections.Generic.HashSet<string>();
+                int canceled = 0, considered = 0;
+                foreach (var o in union)
                 {
                     if (o == null) continue;
+                    if (o.Security?.ToString() != Security?.ToString()) continue;
+                    if (o.Portfolio?.ToString() != Portfolio?.ToString()) continue;
+                    var oid = o.Id ?? $"{o.GetHashCode()}";
+                    if (!seen.Add(oid)) continue;
+
                     var c = o.Comment ?? "";
                     // ya se gestionan en CancelResidualBrackets
                     if (c.StartsWith(OwnerPrefix + "SL:") || c.StartsWith(OwnerPrefix + "TP:")) continue;
                     // no cancelar mi propia orden de flatten
                     if (c.StartsWith(OwnerPrefix + "STPFLAT:")) continue;
                     var st = o.Status();
-                    // viva = no Canceled/Filled (ATAS enum: Placed/PartlyFilled/None pueden aparecer)
-                    if (!o.Canceled && st != OrderStatus.Canceled && st != OrderStatus.Filled)
+                    considered++;
+                    // viva = Placed/PartlyFilled/None (ATAS enum)
+                    if (!o.Canceled && (st == OrderStatus.Placed || st == OrderStatus.PartlyFilled || st == OrderStatus.None))
                     {
-                        try { CancelOrder(o); canceled++; } catch { }
+                        if (TryCancelAnyOrder(o))
+                            canceled++;
                     }
                 }
-                if (EnableLogging) DebugLog.W("RM/CLEAN", $"Canceled non-bracket working orders (n={canceled}) reason='{reason}'");
+                if (EnableLogging) DebugLog.W("RM/CLEAN", $"Canceled non-bracket working orders (n={canceled}/{considered}) reason='{reason}'");
             }
             catch (Exception ex)
             {
                 if (EnableLogging) DebugLog.W("RM/ERR", $"CancelNonBracketWorkingOrders EX: {ex.Message}");
             }
+        }
+
+        // Try to cancel with both Strategy API and TradingManager (external orders)
+        private bool TryCancelAnyOrder(Order o)
+        {
+            try
+            {
+                // 1) Strategy-owned way (works for this strategy orders)
+                try { CancelOrder(o); return true; } catch { /* might not belong to strategy */ }
+
+                // 2) TradingManager (platform-level) — sync variant
+                var tm = this.TradingManager;
+                if (tm != null)
+                {
+                    var mi = tm.GetType().GetMethod("CancelOrder", new[] { typeof(Order), typeof(bool), typeof(bool) });
+                    if (mi != null)
+                    {
+                        mi.Invoke(tm, new object[] { o, false, false });
+                        return true;
+                    }
+                    // 2b) Async variant
+                    var mia = tm.GetType().GetMethod("CancelOrderAsync", new[] { typeof(Order), typeof(bool), typeof(bool) });
+                    if (mia != null)
+                    {
+                        var task = (System.Threading.Tasks.Task)mia.Invoke(tm, new object[] { o, false, false });
+                        // fire-and-forget; assume submitted
+                        return true;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/ERR", $"TryCancelAnyOrder EX: {ex.Message}");
+            }
+            return false;
         }
 
         // === Additional order options via TradingManager ===
@@ -1062,6 +1149,53 @@ namespace MyAtas.Strategies
                     order.ExtendedOptions = flags;
                 }
             } catch { }
+        }
+
+        // ClosePosition por TradingManager si está disponible
+        private bool TryClosePositionViaTradingManager()
+        {
+            try
+            {
+                var tm = this.TradingManager;
+                if (tm == null)
+                {
+                    if (EnableLogging) DebugLog.W("RM/STOP", "TradingManager null → fallback to MARKET");
+                    return false;
+                }
+
+                // Buscar método ClosePosition(Portfolio, Security, ...)
+                // Firmas típicas: ClosePosition(Portfolio, Security) o ClosePosition(Portfolio, Security, bool, bool)
+                var type = tm.GetType();
+                var mi = type.GetMethod("ClosePosition", new[] { typeof(Portfolio), typeof(Security) });
+                if (mi == null)
+                {
+                    mi = type.GetMethod("ClosePosition", new[] { typeof(Portfolio), typeof(Security), typeof(bool), typeof(bool) });
+                }
+
+                if (mi != null)
+                {
+                    if (mi.GetParameters().Length == 2)
+                    {
+                        mi.Invoke(tm, new object[] { Portfolio, Security });
+                    }
+                    else if (mi.GetParameters().Length == 4)
+                    {
+                        mi.Invoke(tm, new object[] { Portfolio, Security, false, false });
+                    }
+                    if (EnableLogging) DebugLog.W("RM/STOP", "Flatten via TradingManager.ClosePosition SUCCESS");
+                    return true;
+                }
+                else
+                {
+                    if (EnableLogging) DebugLog.W("RM/STOP", "ClosePosition method not found → fallback to MARKET");
+                    return false;
+                }
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/STOP", $"TryClosePositionViaTradingManager EX: {ex.Message} → fallback to MARKET");
+                return false;
+            }
         }
 
         private void TrySetCloseOnTrigger(Order order)
