@@ -121,11 +121,11 @@ namespace MyAtas.Strategies
         private RiskEngine _engine;
 
         // ==== Diagnostics / Build stamp ====
-        private const string BuildStamp = "RM.Manual/attach-protect+debounce 2025-09-30T21:15Z";
+        private const string BuildStamp = "RM.Manual/grace-bypass+live-fix 2025-09-30T21:45Z";
 
         // ==== Post-Close grace & timeouts ====
         private DateTime _postCloseUntil = DateTime.MinValue; // if now <= this → inGrace
-        private readonly int _postCloseGraceMs = 1500;        // grace after Close (ms)
+        private readonly int _postCloseGraceMs = 2200;        // un poco más de holgura tras Close
         private readonly int _cleanupWaitMs = 300;            // wait before aggressive cleanup (ms)
         private readonly int _maxRetryMs = 2000;              // absolute escape from WAIT (ms)
 
@@ -137,7 +137,7 @@ namespace MyAtas.Strategies
 
         // ==== Attach protection ====
         private DateTime _lastAttachArmAt = DateTime.MinValue;
-        private const int AttachProtectMs = 400;
+        private const int AttachProtectMs = 1200;             // proteger el attach más tiempo
 
         // --- Estado de net para detectar 0→≠0 (entrada) ---
         private bool _pendingAttach = false;
@@ -499,6 +499,9 @@ namespace MyAtas.Strategies
                 if (EnableLogging)
                     DebugLog.W("RM/ATTACH", $"Pre-check: pendingSince={_pendingSince:HH:mm:ss.fff} inGrace={inGrace}");
 
+                // Telemetría de estados de brackets antes del check
+                LogOrderStateHistogram("pre-attach");
+
                 // 1) Are there live brackets? (only SL:/TP:, ignore ENF)
                 var any468  = HasLiveOrdersWithPrefix(IgnorePrefix);
                 var anyRmSl = HasLiveOrdersWithPrefix(OwnerPrefix + "SL:");
@@ -539,34 +542,37 @@ namespace MyAtas.Strategies
                         DebugLog.W("RM/GRACE", "post-close grace ACTIVE → ignoring live-brackets block");
                 }
 
-                // 2) Hard gate: solo adjuntar en transición FLAT→POSICIÓN (0→≠0)
+                // 2) Gate: si estamos en GRACE, saltamos el gate y vamos a FALLBACK ya mismo
                 var netNow = ReadNetPosition();
                 var gateWaitedMs = (int)(DateTime.UtcNow - _pendingSince).TotalMilliseconds;
+                if (EnableLogging) DebugLog.W("RM/GATE", $"Gate check: _prevNet={_prevNet} netNow={netNow} waitedMs={gateWaitedMs} deadline={_attachDeadlineMs} inGrace={inGrace}");
 
-                if (EnableLogging) DebugLog.W("RM/GATE", $"Gate check: _prevNet={_prevNet} netNow={netNow} waitedMs={gateWaitedMs} deadline={_attachDeadlineMs}");
-
-                if (Math.Abs(_prevNet) == 0 && Math.Abs(netNow) > 0)
+                if (!inGrace)
                 {
-                    // Transición válida 0→≠0: proceder con adjuntar
-                    if (EnableLogging) DebugLog.W("RM/GATE", $"VALID TRANSITION: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms → ATTACH");
+                    if (Math.Abs(_prevNet) == 0 && Math.Abs(netNow) > 0)
+                    {
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"VALID TRANSITION: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms → ATTACH");
+                    }
+                    else
+                    {
+                        if (gateWaitedMs < _attachDeadlineMs)
+                        {
+                            if (EnableLogging) DebugLog.W("RM/GATE", $"WAITING: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms < deadline={_attachDeadlineMs}ms → WAIT");
+                            return;
+                        }
+                        if (!(AllowAttachFallback && _pendingDirHint != 0))
+                        {
+                            _pendingAttach = false;
+                            if (EnableLogging) DebugLog.W("RM/GATE", $"ABORT: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms → no fallback allowed");
+                            if (EnableLogging) DebugLog.W("RM/ABORT", "flat after TTL");
+                            return;
+                        }
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"FALLBACK: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms → ATTACH(FALLBACK) dirHint={_pendingDirHint}");
+                    }
                 }
                 else
                 {
-                    // si aún no llegamos al deadline → WAIT
-                    if (gateWaitedMs < _attachDeadlineMs)
-                    {
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"WAITING: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms < deadline={_attachDeadlineMs}ms → WAIT");
-                        return;
-                    }
-                    // deadline alcanzado → ¿podemos fallback?
-                    if (!(AllowAttachFallback && _pendingDirHint != 0))
-                    {
-                        _pendingAttach = false;
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"ABORT: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms → no fallback allowed");
-                        if (EnableLogging) DebugLog.W("RM/ABORT", "flat after TTL");
-                        return;
-                    }
-                    if (EnableLogging) DebugLog.W("RM/GATE", $"FALLBACK: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms → ATTACH(FALLBACK) dirHint={_pendingDirHint}");
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"GRACE BYPASS: skipping net gate → ATTACH(FALLBACK) dirHint={_pendingDirHint}");
                 }
 
                 var dir = Math.Abs(netNow) > 0 ? Math.Sign(netNow) : _pendingDirHint;
@@ -852,8 +858,9 @@ namespace MyAtas.Strategies
                     var c = o?.Comment ?? "";
                     if (!(c.StartsWith(OwnerPrefix + "SL:") || c.StartsWith(OwnerPrefix + "TP:"))) continue;
                     var st = o.Status();
-                    // Consider live only if not canceled/filled
-                    if (!o.Canceled && st != OrderStatus.Canceled && st != OrderStatus.Filled)
+                    // Consider LIVE only when actively working according to ATAS enum:
+                    // Placed (working) or PartlyFilled (still has remainder). Ignore None/Filled/Canceled.
+                    if (!o.Canceled && (st == OrderStatus.Placed || st == OrderStatus.PartlyFilled))
                         return true;
                 }
             }
@@ -862,6 +869,30 @@ namespace MyAtas.Strategies
                 if (EnableLogging) DebugLog.W("RM/ERR", $"HasLiveRmBrackets EX: {ex.Message}");
             }
             return false;
+        }
+
+        private void LogOrderStateHistogram(string tag)
+        {
+            try
+            {
+                var list = this.Orders;
+                if (list == null) return;
+                int slPlaced = 0, slPart = 0, tpPlaced = 0, tpPart = 0;
+                foreach (var o in list)
+                {
+                    var c = o?.Comment ?? "";
+                    var st = o.Status();
+                    bool isSL = c.StartsWith(OwnerPrefix + "SL:");
+                    bool isTP = c.StartsWith(OwnerPrefix + "TP:");
+                    if (isSL && st == OrderStatus.Placed) slPlaced++;
+                    else if (isSL && st == OrderStatus.PartlyFilled) slPart++;
+                    else if (isTP && st == OrderStatus.Placed) tpPlaced++;
+                    else if (isTP && st == OrderStatus.PartlyFilled) tpPart++;
+                }
+                if (EnableLogging)
+                    DebugLog.W("RM/STATES", $"{tag}: SL(placed={slPlaced}, partly={slPart}) TP(placed={tpPlaced}, partly={tpPart})");
+            }
+            catch { }
         }
 
         private void CancelResidualBrackets(string reason)
