@@ -120,8 +120,15 @@ namespace MyAtas.Strategies
         private int _lastSeenBar = -1;
         private RiskEngine _engine;
 
+        // =================== Stop-to-Flat (RM Close) ===================
+        // Cuando el usuario pulsa el botón rojo de ATAS (Stop Strategy),
+        // queremos: cancelar brackets propios y hacer FLATTEN de la posición.
+        private bool _stopToFlat = false;
+        private DateTime _rmStopGraceUntil = DateTime.MinValue;     // mientras now<=esto, estamos drenando cancel/fill
+        private const int _rmStopGraceMs = 2200;                    // holgura post-cancel/flatten
+
         // ==== Diagnostics / Build stamp ====
-        private const string BuildStamp = "RM.Manual/grace-bypass+live-fix 2025-09-30T21:45Z";
+        private const string BuildStamp = "RM.Manual/stop-to-flat 2025-09-30T22:00Z";
 
         // ==== Post-Close grace & timeouts ====
         private DateTime _postCloseUntil = DateTime.MinValue; // if now <= this → inGrace
@@ -368,11 +375,24 @@ namespace MyAtas.Strategies
         {
             if (!IsActivated) return;
 
+            // Heartbeat del estado de Stop-to-Flat (visible en logs)
             if (EnableLogging && IsFirstTickOf(bar))
             {
                 var now = DateTime.UtcNow;
                 DebugLog.W("RM/HEARTBEAT",
                     $"bar={bar} t={GetCandle(bar).Time:HH:mm:ss} mode={SizingMode} be={BreakEvenMode} trail={TrailingMode} build={BuildStamp} graceUntil={_postCloseUntil:HH:mm:ss.fff} inGrace={(now <= _postCloseUntil)}");
+                DebugLog.W("RM/STOP", $"tick={bar} inStop={_stopToFlat} stopGraceUntil={_rmStopGraceUntil:HH:mm:ss.fff} inGrace={(now <= _rmStopGraceUntil)}");
+            }
+
+            // Si estamos parando (Stop-to-Flat), no armes/adjuntes brackets nuevos
+            if (_stopToFlat)
+            {
+                // Limpieza pasiva mientras drenamos: reporta si siguen vivos SL/TP
+                var flat = Math.Abs(ReadNetPosition()) == 0;
+                var live = HasLiveRmBrackets();
+                if (EnableLogging)
+                    DebugLog.W("RM/STOP", $"drain: flat={flat} liveBrackets={live} inGrace={(DateTime.UtcNow <= _rmStopGraceUntil)}");
+                // No retornamos de OnCalculate global: simplemente dejamos que no se dispare TryAttachBracketsNow()
             }
 
             // Fallback por barra si quedó pendiente
@@ -420,6 +440,8 @@ namespace MyAtas.Strategies
                 var st = order.Status();
                 if (EnableLogging)
                     DebugLog.W("RM/EVT", $"OnOrderChanged: id={order?.Id} comment='{c}' status={st} side={order?.Direction} qty={order?.QuantityToFill} canceled={order?.Canceled}");
+                if (_stopToFlat && EnableLogging)
+                    DebugLog.W("RM/STOP", $"EVT: id={order?.Id} comment='{c}' status={st} qty={order?.QuantityToFill} canceled={order?.Canceled}");
             }
             catch { /* ignore logging issues */ }
 
@@ -487,17 +509,91 @@ namespace MyAtas.Strategies
             }
         }
 
+        // =================== Stop Strategy hooks ===================
+        protected override void OnStarted()
+        {
+            try
+            {
+                _stopToFlat = false;
+                _rmStopGraceUntil = DateTime.MinValue;
+                if (EnableLogging) DebugLog.W("RM/STOP", "Started → reset stop-to-flat flags");
+            }
+            catch { }
+        }
+
+        protected override void OnStopping()
+        {
+            try
+            {
+                _stopToFlat = true;
+                _rmStopGraceUntil = DateTime.UtcNow.AddMilliseconds(_rmStopGraceMs);
+                if (EnableLogging) DebugLog.W("RM/STOP", $"OnStopping → engage StopToFlat, grace until={_rmStopGraceUntil:HH:mm:ss.fff}");
+
+                // 1) Cancelar brackets propios (RM:SL:/RM:TP:)
+                CancelResidualBrackets("stop-to-flat");
+
+                // 2) FLATTEN si hay posición
+                var net = ReadNetPosition();
+                if (Math.Abs(net) != 0)
+                {
+                    var side = net > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+                    var qty  = Math.Abs(net);
+                    var comment = $"{OwnerPrefix}STPFLAT:{Guid.NewGuid():N}";
+                    var o = new Order
+                    {
+                        Portfolio = Portfolio,
+                        Security  = Security,
+                        Direction = side,
+                        Type      = OrderTypes.Market,
+                        QuantityToFill = qty,
+                        Comment   = comment
+                    };
+                    OpenOrder(o);
+                    if (EnableLogging) DebugLog.W("RM/STOP", $"Flatten MARKET sent: {side} {qty} (comment={comment})");
+                }
+                else
+                {
+                    if (EnableLogging) DebugLog.W("RM/STOP", "Already flat at OnStopping");
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("RM/STOP", $"OnStopping EX: {ex.Message}");
+            }
+            // No bloquees aquí: ATAS seguirá el ciclo; terminamos de drenar en eventos/ticks
+        }
+
+        protected override void OnStopped()
+        {
+            try
+            {
+                if (EnableLogging) DebugLog.W("RM/STOP", "OnStopped → strategy stopped (final)");
+                _stopToFlat = false;
+                _rmStopGraceUntil = DateTime.MinValue;
+            }
+            catch { }
+        }
+
         private void TryAttachBracketsNow()
         {
             try
             {
                 if (!_pendingAttach) return;
 
+                // Si estamos parando, no adjuntar nada (evita re-entradas durante stop)
+                if (_stopToFlat)
+                {
+                    if (EnableLogging) DebugLog.W("RM/STOP", "Skipping attach: strategy is stopping");
+                    _pendingAttach = false;
+                    return;
+                }
+
                 // 0) Pre-check & diagnostics
                 var now = DateTime.UtcNow;
-                var inGrace = now <= _postCloseUntil;
+                // Para los cierres por Stop usamos la gracia local de stop
+                var inGrace = (now <= _postCloseUntil) || (now <= _rmStopGraceUntil);
                 if (EnableLogging)
-                    DebugLog.W("RM/ATTACH", $"Pre-check: pendingSince={_pendingSince:HH:mm:ss.fff} inGrace={inGrace}");
+                    DebugLog.W("RM/ATTACH", $"Pre-check: pendingSince={_pendingSince:HH:mm:ss.fff} inGrace={inGrace} (closeGrace={(now <= _postCloseUntil)} stopGrace={(now <= _rmStopGraceUntil)})");
 
                 // Telemetría de estados de brackets antes del check
                 LogOrderStateHistogram("pre-attach");
