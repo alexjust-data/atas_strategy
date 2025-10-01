@@ -17,6 +17,38 @@ namespace MyAtas.Strategies
     public enum RmStopPlacement { ByTicks, PrevBarOppositeExtreme }  // modo de colocaciÃ³n del SL
     public enum RmPrevBarOffsetSide { Outside, Inside }              // NEW: lado del offset (fuera/dentro)
 
+    // --- Helpers de normalizacion de TPs/splits ---
+    internal static class _RmSplitHelper
+    {
+        // Devuelve arrays listos para el motor: solo TPs con split>0 y suma=100 (el ultimo absorbe la diferencia)
+        public static (decimal[] r, int[] s) BuildTpArrays(int preset, decimal tp1, decimal tp2, decimal tp3, int sp1, int sp2, int sp3)
+        {
+            var rList = new System.Collections.Generic.List<decimal>();
+            var sList = new System.Collections.Generic.List<int>();
+            var n = Math.Clamp(preset, 1, 3);
+            if (n >= 1 && sp1 > 0) { rList.Add(tp1); sList.Add(Math.Max(0, sp1)); }
+            if (n >= 2 && sp2 > 0) { rList.Add(tp2); sList.Add(Math.Max(0, sp2)); }
+            if (n >= 3 && sp3 > 0) { rList.Add(tp3); sList.Add(Math.Max(0, sp3)); }
+            if (rList.Count == 0)
+            {
+                // Fallback: un solo TP al 100% a 1R
+                rList.Add(Math.Max(1m, tp1));
+                sList.Add(100);
+                return (rList.ToArray(), sList.ToArray());
+            }
+            var sum = sList.Sum();
+            if (sum != 100)
+            {
+                // Re-normaliza a 100 y el ultimo absorbe la diferencia
+                for (int i = 0; i < sList.Count; i++)
+                    sList[i] = (int)Math.Max(0, Math.Round(100m * sList[i] / Math.Max(1, sum)));
+                var diff = 100 - sList.Sum();
+                sList[^1] = Math.Max(1, sList[^1] + diff);
+            }
+            return (rList.ToArray(), sList.ToArray());
+        }
+    }
+
     // Nota: esqueleto "safe". No envï¿½a ni cancela ï¿½rdenes.
     public class RiskManagerManualStrategy : ChartStrategy
     {
@@ -881,28 +913,16 @@ namespace MyAtas.Strategies
                     MaxQty: Math.Max(1, MaxQty)
                 );
 
-                // TPs desde UI (normalizados a 100%)
-                var tps = new System.Collections.Generic.List<decimal>();
-                var splits = new System.Collections.Generic.List<int>();
-                int n = Math.Clamp(PresetTPs, 1, 3);
-                if (n >= 1) { tps.Add(TP1R); splits.Add(TP1pctunit); }
-                if (n >= 2) { tps.Add(TP2R); splits.Add(TP2pctunit); }
-                if (n >= 3) { tps.Add(TP3R); splits.Add(TP3pctunit); }
-                var sum = splits.Sum();
-                if (sum <= 0) { splits.Clear(); splits.AddRange(new[] { 100 }); }
-                else if (sum != 100)
-                {
-                    for (int i = 0; i < splits.Count; i++)
-                        splits[i] = (int)Math.Max(0, Math.Round(100m * splits[i] / sum));
-                    var diff = 100 - splits.Sum();
-                    if (diff != 0) splits[^1] = Math.Max(0, splits[^1] + diff);
-                }
+                // TPs desde UI (filtrando splits=0 y normalizando)
+                var (tpR, tpSplits) = _RmSplitHelper.BuildTpArrays(PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit);
+                if (EnableLogging)
+                    DebugLog.W("RM/SPLIT", $"UI -> preset={PresetTPs} tpR=[{string.Join(",", tpR)}] splits=[{string.Join(",", tpSplits)}]");
 
                 var bracketCfg = new MyAtas.Risk.Models.BracketConfig(
                     StopTicks: approxStopTicks,                            // <-- idem
                     SlOffsetTicks: 0m,
-                    TpRMultiples: tps.ToArray(),
-                    Splits: splits.ToArray()
+                    TpRMultiples: tpR,
+                    Splits: tpSplits
                 );
 
                 var engine = GetEngine();
@@ -982,6 +1002,7 @@ namespace MyAtas.Strategies
         // ====================== RM ORDER SUBMISSION HELPERS ======================
         private void SubmitRmStop(string oco, OrderDirections side, int qty, decimal triggerPx)
         {
+            if (qty <= 0) { if (EnableLogging) DebugLog.W("RM/ORD", "SubmitRmStop SKIP: qty<=0"); return; }
             var comment = $"{OwnerPrefix}SL:{Guid.NewGuid():N}";
             if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop ENTER: side={side} qty={qty} triggerPx={triggerPx:F2} oco={oco} comment={comment}");
 
@@ -1018,6 +1039,7 @@ namespace MyAtas.Strategies
 
         private void SubmitRmLimit(string oco, OrderDirections side, int qty, decimal price)
         {
+            if (qty <= 0) { if (EnableLogging) DebugLog.W("RM/ORD", "SubmitRmLimit SKIP: qty<=0"); return; }
             var comment = $"{OwnerPrefix}TP:{Guid.NewGuid():N}";
             if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit ENTER: side={side} qty={qty} price={price:F2} oco={oco} comment={comment}");
 
