@@ -10,11 +10,11 @@ using MyAtas.Risk.Models;
 
 namespace MyAtas.Strategies
 {
-    // Enums externos para serializaciÃ³n correcta de ATAS
+    // Enums externos para serializaciÃƒÂ³n correcta de ATAS
     public enum RmSizingMode { Manual, FixedRiskUSD, PercentAccount }
     public enum RmBeMode { Off, OnTP1Touch, OnTP1Fill }
     public enum RmTrailMode { Off, BarByBar, TpToTp }
-    public enum RmStopPlacement { ByTicks, PrevBarOppositeExtreme }  // modo de colocaciÃ³n del SL
+    public enum RmStopPlacement { ByTicks, PrevBarOppositeExtreme }  // modo de colocaciÃƒÂ³n del SL
     public enum RmPrevBarOffsetSide { Outside, Inside }              // NEW: lado del offset (fuera/dentro)
 
     // --- Helpers de normalizacion de TPs/splits ---
@@ -49,7 +49,7 @@ namespace MyAtas.Strategies
         }
     }
 
-    // Nota: esqueleto "safe". No envï¿½a ni cancela ï¿½rdenes.
+    // Nota: esqueleto "safe". No envÃ¯Â¿Â½a ni cancela Ã¯Â¿Â½rdenes.
     public class RiskManagerManualStrategy : ChartStrategy
     {
         // =================== Activation ===================
@@ -66,14 +66,14 @@ namespace MyAtas.Strategies
         public string OwnerPrefix { get; set; } = "RM:";
 
         [Category("Activation"), DisplayName("Enforce manual qty on entry")]
-        [Description("Si la entrada manual ejecuta menos contratos que el objetivo calculado por el RM, la estrategia enviarÃ¡ una orden a mercado por la diferencia (delta).")]
+        [Description("Si la entrada manual ejecuta menos contratos que el objetivo calculado por el RM, la estrategia enviarÃƒÂ¡ una orden a mercado por la diferencia (delta).")]
         public bool EnforceManualQty { get; set; } = true;
 
         [Category("Position Sizing"), DisplayName("Mode")]
         public RmSizingMode SizingMode { get; set; } = RmSizingMode.Manual;
 
         [Category("Position Sizing"), DisplayName("Manual qty")]
-        [Description("Cantidad objetivo de la ESTRATEGIA. Si difiere de la qty del ChartTrader y 'Enforce manual qty' estÃ¡ activo, el RM ajustarÃ¡ con orden a mercado.")]
+        [Description("Cantidad objetivo de la ESTRATEGIA. Si difiere de la qty del ChartTrader y 'Enforce manual qty' estÃƒÂ¡ activo, el RM ajustarÃƒÂ¡ con orden a mercado.")]
         public int ManualQty { get; set; } = 1;
 
         [Category("Position Sizing"), DisplayName("Risk per trade (USD)")]
@@ -132,11 +132,11 @@ namespace MyAtas.Strategies
         public RmStopPlacement StopPlacementMode { get; set; } = RmStopPlacement.ByTicks;
 
         [Category("Stops & TPs"), DisplayName("Prev-bar offset (ticks)")]
-        [Description("Holgura aÃ±adida al extremo de la vela N-1 (1 = un tick mÃ¡s allÃ¡ del High/Low).")]
+        [Description("Holgura aÃƒÂ±adida al extremo de la vela N-1 (1 = un tick mÃƒÂ¡s allÃƒÂ¡ del High/Low).")]
         public int PrevBarOffsetTicks { get; set; } = 1;
 
         [Category("Stops & TPs"), DisplayName("Prev-bar offset side")]
-        [Description("Outside: fuera del extremo (mÃ¡s allÃ¡ del High/Low). Inside: dentro del rango de la vela.")]
+        [Description("Outside: fuera del extremo (mÃƒÂ¡s allÃƒÂ¡ del High/Low). Inside: dentro del rango de la vela.")]
         public RmPrevBarOffsetSide PrevBarOffsetSide { get; set; } = RmPrevBarOffsetSide.Outside;
 
         // =================== Breakeven ===================
@@ -165,23 +165,29 @@ namespace MyAtas.Strategies
 
         // =================== Internal Helpers ===================
         private int _lastSeenBar = -1;
+
+        // === Breakeven: estado mínimo requerido por ResetAttachState / gates ===
+        private bool   _beArmed     = false;
+        private bool   _beDone      = false;
+        private decimal _beTargetPx = 0m;
+
         private RiskEngine _engine;
 
         // =================== Stop-to-Flat (RM Close) ===================
-        // Cuando el usuario pulsa el botÃ³n rojo de ATAS (Stop Strategy),
-        // queremos: cancelar brackets propios y hacer FLATTEN de la posiciÃ³n.
+        // Cuando el usuario pulsa el botÃƒÂ³n rojo de ATAS (Stop Strategy),
+        // queremos: cancelar brackets propios y hacer FLATTEN de la posiciÃƒÂ³n.
         private bool _stopToFlat = false;
         private DateTime _rmStopGraceUntil = DateTime.MinValue;     // mientras now<=esto, estamos drenando cancel/fill
         private const int _rmStopGraceMs = 2200;                    // holgura post-cancel/flatten
         private DateTime _nextStopSweepAt = DateTime.MinValue;
-        private const int _stopSweepEveryMs = 250;                  // sweep periÃ³dico durante el stop
+        private const int _stopSweepEveryMs = 250;                  // sweep periÃƒÂ³dico durante el stop
 
         // ==== Diagnostics / Build stamp ====
         private const string BuildStamp = "RM.Manual/stop-to-flat 2025-09-30T22:00Z";
 
         // ==== Post-Close grace & timeouts ====
-        private DateTime _postCloseUntil = DateTime.MinValue; // if now <= this â†’ inGrace
-        private readonly int _postCloseGraceMs = 2200;        // un poco mÃ¡s de holgura tras Close
+        private DateTime _postCloseUntil = DateTime.MinValue; // if now <= this Ã¢â€ â€™ inGrace
+        private readonly int _postCloseGraceMs = 2200;        // un poco mÃƒÂ¡s de holgura tras Close
         private readonly int _cleanupWaitMs = 300;            // wait before aggressive cleanup (ms)
         private readonly int _maxRetryMs = 2000;              // absolute escape from WAIT (ms)
 
@@ -193,30 +199,40 @@ namespace MyAtas.Strategies
 
         // ==== Attach protection ====
         private DateTime _lastAttachArmAt = DateTime.MinValue;
-        private const int AttachProtectMs = 1200;             // proteger el attach mÃ¡s tiempo
+        private const int AttachProtectMs = 1200;             // proteger el attach mÃƒÂ¡s tiempo
 
-        // --- Estado de net para detectar 0â†’â‰ 0 (entrada) ---
+        // --- Estado de net para detectar 0Ã¢â€ â€™Ã¢â€° 0 (entrada) ---
         private bool _pendingAttach = false;
         private decimal _pendingEntryPrice = 0m;
         private DateTime _pendingSince = DateTime.MinValue;
         private int _pendingDirHint = 0;                 // +1/-1 si logramos leerlo del Order
         private int _pendingFillQty = 0;                 // qty del fill manual (si la API lo expone)
-        private readonly int _attachThrottleMs = 200; // consolidaciÃ³n mÃ­nima
-        private readonly int _attachDeadlineMs = 120; // fallback rÃ¡pido si el net no llega
+        private readonly int _attachThrottleMs = 200; // consolidaciÃƒÂ³n mÃƒÂ­nima
+        private readonly int _attachDeadlineMs = 120; // fallback rÃƒÂ¡pido si el net no llega
         private readonly System.Collections.Generic.List<Order> _liveOrders = new();
         private readonly object _liveOrdersLock = new();
-        // Ancla de contexto para SL por estructura: Ã­ndice de N-1 "en el momento del fill"
+        // Ancla de contexto para SL por estructura: ÃƒÂ­ndice de N-1 "en el momento del fill"
         private int _pendingPrevBarIdxAtFill = -1;
 
         // Helper property for compatibility
         private bool IsActivated => ManageManualEntries;
 
-        // Constructor explÃ­cito para evitar excepciones durante carga ATAS
+        private void ResetAttachState(string reason = "")
+        {
+            _pendingAttach = false;
+            _pendingEntryPrice = 0m;
+            _pendingPrevBarIdxAtFill = -1;
+            _pendingFillQty = 0;
+            _beArmed = false; _beDone = false; _beTargetPx = 0m;
+            if (EnableLogging) DebugLog.W("RM/GATE", $"ResetAttachState: {reason}");
+        }
+
+        // Constructor explÃƒÂ­cito para evitar excepciones durante carga ATAS
         public RiskManagerManualStrategy()
         {
             try
             {
-                // No inicializar aquÃ­ para evitar problemas de carga
+                // No inicializar aquÃƒÂ­ para evitar problemas de carga
                 _engine = null;
             }
             catch
@@ -413,7 +429,7 @@ namespace MyAtas.Strategies
                 if (getPos != null)
                 {
                     var pos = getPos.Invoke(Portfolio, new object[] { Security });
-                    return pos; // puede ser null si no hay posiciÃ³n
+                    return pos; // puede ser null si no hay posiciÃƒÂ³n
                 }
             }
             catch { }
@@ -433,7 +449,7 @@ namespace MyAtas.Strategies
                 }
                 catch { }
             }
-            return 0m; // NADA de GetCandle() aquÃ­
+            return 0m; // NADA de GetCandle() aquÃƒÂ­
         }
 
         private int ExtractFilledQty(Order order)
@@ -494,7 +510,7 @@ namespace MyAtas.Strategies
                 if (EnableLogging)
                     DebugLog.W("RM/STOP", $"drain: flat={flat} liveBrackets={live} inGrace={(DateTime.UtcNow <= _rmStopGraceUntil)}");
 
-                // Barrido periÃ³dico durante el stop: re-cancelar y re-flatten si hace falta (sin duplicar)
+                // Barrido periÃƒÂ³dico durante el stop: re-cancelar y re-flatten si hace falta (sin duplicar)
                 var now = DateTime.UtcNow;
                 if (now >= _nextStopSweepAt && now <= _rmStopGraceUntil)
                 {
@@ -508,7 +524,7 @@ namespace MyAtas.Strategies
                 // No retornamos de OnCalculate global: simplemente dejamos que no se dispare TryAttachBracketsNow()
             }
 
-            // Fallback por barra si quedÃ³ pendiente
+            // Fallback por barra si quedÃƒÂ³ pendiente
             if (_pendingAttach && (DateTime.UtcNow - _pendingSince).TotalMilliseconds >= _attachThrottleMs)
                 TryAttachBracketsNow();
 
@@ -527,11 +543,11 @@ namespace MyAtas.Strategies
                 if ((transitionClose || bracketsEdgeClose) && !debounce)
                 {
                     CancelResidualBrackets("external close detected");
-                    if (!recentAttach) _pendingAttach = false; // <- NO matar attach reciÃ©n armado
+                    if (!recentAttach) _pendingAttach = false; // <- NO matar attach reciÃƒÂ©n armado
                     _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
                     _lastExternalCloseAt = DateTime.UtcNow;
                     if (EnableLogging)
-                        DebugLog.W("RM/GRACE", $"External close â†’ grace until={_postCloseUntil:HH:mm:ss.fff}, recentAttach={recentAttach}");
+                        DebugLog.W("RM/GRACE", $"External close Ã¢â€ â€™ grace until={_postCloseUntil:HH:mm:ss.fff}, recentAttach={recentAttach}");
                 }
 
                 // Update prev snapshots for next tick
@@ -542,6 +558,21 @@ namespace MyAtas.Strategies
             {
                 if (EnableLogging) DebugLog.W("RM/ERR", $"OnCalculate net/check EX: {ex.Message}");
             }
+
+            // 4) Limpia solo si realmente estamos "idle" (sin attach armado ni brackets)
+            try
+            {
+                var net = Math.Abs(ReadNetPosition());
+                var hasLive = HasLiveRmBrackets();
+                var justArmed = _pendingAttach && (DateTime.UtcNow - _lastAttachArmAt).TotalMilliseconds < (AttachProtectMs + 400);
+                if (net == 0 && !hasLive && !justArmed)
+                {
+                    ResetAttachState("flat idle");
+                    if (_postCloseUntil < DateTime.UtcNow)
+                        _postCloseUntil = DateTime.UtcNow.AddMilliseconds(250);
+                }
+            }
+            catch { /* defensivo */ }
         }
 
         protected override void OnOrderChanged(Order order)
@@ -578,6 +609,19 @@ namespace MyAtas.Strategies
                 var comment = order?.Comment ?? "";
                 var st = order.Status();
 
+                // 3a) Ignorar fills de cierre manual/estrategia
+                if (comment.Equals("Close position", StringComparison.OrdinalIgnoreCase))
+                {
+                    if (st == OrderStatus.Filled || st == OrderStatus.PartlyFilled)
+                    {
+                        // Cuarentena corta para evitar attach reentrante
+                        _postCloseUntil = DateTime.UtcNow.AddMilliseconds(800);
+                        ResetAttachState("Close position fill");
+                    }
+                    if (EnableLogging) DebugLog.W("RM/GATE", "Skip arming on 'Close position' fill");
+                    return;
+                }
+
                 if (EnableLogging) DebugLog.W("RM/ORD", $"OnOrderChanged: comment={comment} status={st}");
 
                 // Ignora la 468 y mis propias RM
@@ -604,40 +648,40 @@ namespace MyAtas.Strategies
                     return;
                 }
 
-                // SÃ³lo nos interesan fills/parciales
+                // SÃƒÂ³lo nos interesan fills/parciales
                 if (!(st == OrderStatus.Filled || st == OrderStatus.PartlyFilled))
                 {
                     if (EnableLogging) DebugLog.W("RM/ORD", $"OnOrderChanged SKIP: status={st} (not filled/partly)");
                     return;
                 }
 
-                // Marca attach pendiente; la direcciÃ³n la deduciremos con el net por barra o ahora mismo
+                // Marca attach pendiente; la direcciÃƒÂ³n la deduciremos con el net por barra o ahora mismo
                 _pendingDirHint = ExtractDirFromOrder(order);
                 _pendingFillQty = ExtractFilledQty(order);
 
-                // Solo guardar entryPrice si el order tiene AvgPrice vÃ¡lido; si no, lo obtendremos de la posiciÃ³n
+                // Solo guardar entryPrice si el order tiene AvgPrice vÃƒÂ¡lido; si no, lo obtendremos de la posiciÃƒÂ³n
                 var orderAvgPrice = ExtractAvgFillPrice(order);
                 _pendingEntryPrice = orderAvgPrice > 0m ? orderAvgPrice : 0m;
 
                 // Anclar la "prev-bar" en el instante del fill (N-1 respecto a la barra visible ahora)
                 try
                 {
-                    // En ATAS: Ãºltimo Ã­ndice es CurrentBar-1 (vela actual). La "prev" cerrada es CurrentBar-2.
+                    // En ATAS: ÃƒÂºltimo ÃƒÂ­ndice es CurrentBar-1 (vela actual). La "prev" cerrada es CurrentBar-2.
                     _pendingPrevBarIdxAtFill = Math.Max(0, CurrentBar - 2);
                     if (EnableLogging)
                         DebugLog.W("RM/STOPMODE", $"Anchor prevBarIdx set at fill (N-1): {_pendingPrevBarIdxAtFill} (curBarAtFill={CurrentBar})");
                 }
                 catch { _pendingPrevBarIdxAtFill = -1; }
 
-                // Armar attach con protecciÃ³n temporal
+                // Armar attach con protecciÃƒÂ³n temporal
                 _pendingAttach = true;
                 _pendingSince = DateTime.UtcNow;
                 _lastAttachArmAt = _pendingSince;
 
                 if (EnableLogging)
-                    DebugLog.W("RM/ORD", $"Manual order DETECTED â†’ pendingAttach=true | dir={_pendingDirHint} fillQty={_pendingFillQty} entryPx={_pendingEntryPrice:F2}");
+                    DebugLog.W("RM/ORD", $"Manual order DETECTED Ã¢â€ â€™ pendingAttach=true | dir={_pendingDirHint} fillQty={_pendingFillQty} entryPx={_pendingEntryPrice:F2}");
 
-                TryAttachBracketsNow(); // intenta en el mismo tick; si el gate decide WAIT, ya lo reintentarÃ¡ OnCalculate
+                TryAttachBracketsNow(); // intenta en el mismo tick; si el gate decide WAIT, ya lo reintentarÃƒÂ¡ OnCalculate
             }
             catch (Exception ex)
             {
@@ -675,7 +719,7 @@ namespace MyAtas.Strategies
                 _stopToFlat = false;
                 _rmStopGraceUntil = DateTime.MinValue;
                 _nextStopSweepAt   = DateTime.MinValue;
-                if (EnableLogging) DebugLog.W("RM/STOP", "Started â†’ reset stop-to-flat flags");
+                if (EnableLogging) DebugLog.W("RM/STOP", "Started Ã¢â€ â€™ reset stop-to-flat flags");
             }
             catch { }
         }
@@ -687,7 +731,7 @@ namespace MyAtas.Strategies
                 _stopToFlat = true;
                 _rmStopGraceUntil = DateTime.UtcNow.AddMilliseconds(_rmStopGraceMs);
                 _nextStopSweepAt   = DateTime.UtcNow; // primer barrido inmediato
-                if (EnableLogging) DebugLog.W("RM/STOP", $"OnStopping â†’ engage StopToFlat, grace until={_rmStopGraceUntil:HH:mm:ss.fff}");
+                if (EnableLogging) DebugLog.W("RM/STOP", $"OnStopping Ã¢â€ â€™ engage StopToFlat, grace until={_rmStopGraceUntil:HH:mm:ss.fff}");
 
                 // 1) Cancelar brackets + cualquier otra orden viva del instrumento
                 CancelResidualBrackets("stop-to-flat");
@@ -705,14 +749,14 @@ namespace MyAtas.Strategies
             {
                 DebugLog.W("RM/STOP", $"OnStopping EX: {ex.Message}");
             }
-            // No bloquees aquÃ­: ATAS seguirÃ¡ el ciclo; terminamos de drenar en eventos/ticks
+            // No bloquees aquÃƒÂ­: ATAS seguirÃƒÂ¡ el ciclo; terminamos de drenar en eventos/ticks
         }
 
         protected override void OnStopped()
         {
             try
             {
-                if (EnableLogging) DebugLog.W("RM/STOP", "OnStopped â†’ strategy stopped (final)");
+                if (EnableLogging) DebugLog.W("RM/STOP", "OnStopped Ã¢â€ â€™ strategy stopped (final)");
                 _stopToFlat = false;
                 _rmStopGraceUntil = DateTime.MinValue;
             }
@@ -723,7 +767,23 @@ namespace MyAtas.Strategies
         {
             try
             {
-                if (!_pendingAttach) return;
+                // Si acabamos de armar attach, no bloquees por una grace antigua
+                if (_pendingAttach && DateTime.UtcNow <= _postCloseUntil)
+                    _postCloseUntil = DateTime.MinValue;
+                // Gate 1: cuarentena post-close
+                if (DateTime.UtcNow <= _postCloseUntil)
+                {
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"HOLD attach (in post-close grace until {_postCloseUntil:HH:mm:ss.fff})");
+                    return;
+                }
+                // Gate 2: requiere attach armado
+                if (!_pendingAttach)
+                {
+                    if (EnableLogging) DebugLog.W("RM/GATE", "Skip attach: _pendingAttach=false");
+                    return;
+                }
+                var netAbs = Math.Abs(ReadNetPosition());
+                // No hacemos return aquí: el gate inferior decidirá si WAIT / ATTACH / FALLBACK
 
                 // Si estamos parando, no adjuntar nada (evita re-entradas durante stop)
                 if (_stopToFlat)
@@ -740,7 +800,7 @@ namespace MyAtas.Strategies
                 if (EnableLogging)
                     DebugLog.W("RM/ATTACH", $"Pre-check: pendingSince={_pendingSince:HH:mm:ss.fff} inGrace={inGrace} (closeGrace={(now <= _postCloseUntil)} stopGrace={(now <= _rmStopGraceUntil)})");
 
-                // TelemetrÃ­a de estados de brackets antes del check
+                // TelemetrÃƒÂ­a de estados de brackets antes del check
                 LogOrderStateHistogram("pre-attach");
 
                 // 1) Are there live brackets? (only SL:/TP:, ignore ENF)
@@ -758,7 +818,7 @@ namespace MyAtas.Strategies
                     {
                         _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs); // bypass
                         if (EnableLogging)
-                            DebugLog.W("RM/GRACE", $"MaxRetry {waitedMs}ms â†’ forcing grace & proceeding");
+                            DebugLog.W("RM/GRACE", $"MaxRetry {waitedMs}ms Ã¢â€ â€™ forcing grace & proceeding");
                         // sigue sin return
                     }
                     else if (waitedMs > _cleanupWaitMs)
@@ -767,20 +827,20 @@ namespace MyAtas.Strategies
                         _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
                         _pendingSince = DateTime.UtcNow;
                         if (EnableLogging)
-                            DebugLog.W("RM/GRACE", $"Cleanup timeout â†’ grace reset to {_postCloseUntil:HH:mm:ss.fff}");
+                            DebugLog.W("RM/GRACE", $"Cleanup timeout Ã¢â€ â€™ grace reset to {_postCloseUntil:HH:mm:ss.fff}");
                         return; // reintenta
                     }
                     else
                     {
                         if (EnableLogging)
-                            DebugLog.W("RM/WAIT", $"live brackets â†’ retry (waited={waitedMs}ms)");
+                            DebugLog.W("RM/WAIT", $"live brackets Ã¢â€ â€™ retry (waited={waitedMs}ms)");
                         return;
                     }
                 }
                 else if (anyBrackets && inGrace)
                 {
                     if (EnableLogging)
-                        DebugLog.W("RM/GRACE", "post-close grace ACTIVE â†’ ignoring live-brackets block");
+                        DebugLog.W("RM/GRACE", "post-close grace ACTIVE Ã¢â€ â€™ ignoring live-brackets block");
                 }
 
                 // 2) Gate: si estamos en GRACE, saltamos el gate y vamos a FALLBACK ya mismo
@@ -792,36 +852,36 @@ namespace MyAtas.Strategies
                 {
                     if (Math.Abs(_prevNet) == 0 && Math.Abs(netNow) > 0)
                     {
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"VALID TRANSITION: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms â†’ ATTACH");
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"VALID TRANSITION: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms Ã¢â€ â€™ ATTACH");
                     }
                     else
                     {
                         if (gateWaitedMs < _attachDeadlineMs)
                         {
-                            if (EnableLogging) DebugLog.W("RM/GATE", $"WAITING: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms < deadline={_attachDeadlineMs}ms â†’ WAIT");
+                            if (EnableLogging) DebugLog.W("RM/GATE", $"WAITING: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms < deadline={_attachDeadlineMs}ms Ã¢â€ â€™ WAIT");
                             return;
                         }
                         if (!(AllowAttachFallback && _pendingDirHint != 0))
                         {
                             _pendingAttach = false;
-                            if (EnableLogging) DebugLog.W("RM/GATE", $"ABORT: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms â†’ no fallback allowed");
+                            if (EnableLogging) DebugLog.W("RM/GATE", $"ABORT: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms Ã¢â€ â€™ no fallback allowed");
                             if (EnableLogging) DebugLog.W("RM/ABORT", "flat after TTL");
                             return;
                         }
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"FALLBACK: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms â†’ ATTACH(FALLBACK) dirHint={_pendingDirHint}");
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"FALLBACK: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms Ã¢â€ â€™ ATTACH(FALLBACK) dirHint={_pendingDirHint}");
                     }
                 }
                 else
                 {
-                    if (EnableLogging) DebugLog.W("RM/GATE", $"GRACE BYPASS: skipping net gate â†’ ATTACH(FALLBACK) dirHint={_pendingDirHint}");
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"GRACE BYPASS: skipping net gate Ã¢â€ â€™ ATTACH(FALLBACK) dirHint={_pendingDirHint}");
                 }
 
                 var dir = Math.Abs(netNow) > 0 ? Math.Sign(netNow) : _pendingDirHint;
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Direction determined: dir={dir} (netNow={netNow}, dirHint={_pendingDirHint})");
 
                 // qty OBJETIVO del plan:
-                //  - Manual  â†’ SIEMPRE la UI (ManualQty), no el net/fill
-                //  - Riesgo  â†’ la calcularÃ¡ el engine
+                //  - Manual  Ã¢â€ â€™ SIEMPRE la UI (ManualQty), no el net/fill
+                //  - Riesgo  Ã¢â€ â€™ la calcularÃƒÂ¡ el engine
                 int manualQtyToUse = ManualQty;
                 if (SizingMode == RmSizingMode.Manual)
                 {
@@ -838,7 +898,7 @@ namespace MyAtas.Strategies
                 try { tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize); } catch { }
                 var tickValue = FallbackTickValueUsd;
 
-                // precio de entrada: order â†’ avgPrice posiciÃ³n â†’ vela previa (Close)
+                // precio de entrada: order Ã¢â€ â€™ avgPrice posiciÃƒÂ³n Ã¢â€ â€™ vela previa (Close)
                 var entryPx = _pendingEntryPrice;
                 if (entryPx <= 0m)
                 {
@@ -855,7 +915,7 @@ namespace MyAtas.Strategies
                         entryPx = GetCandle(barIdx).Close;
                         if (EnableLogging) DebugLog.W("RM/PLAN", $"Fallback candle price used: entryPx={entryPx:F2} (bar={barIdx})");
                     } catch { }
-                    if (entryPx <= 0m) { if (EnableLogging) DebugLog.W("RM/PLAN", "No valid entryPx available â†’ retry"); return; }
+                    if (entryPx <= 0m) { if (EnableLogging) DebugLog.W("RM/PLAN", "No valid entryPx available Ã¢â€ â€™ retry"); return; }
                 }
 
                 // === STOP por estructura (opcional) ===
@@ -865,27 +925,36 @@ namespace MyAtas.Strategies
                 {
                     if (StopPlacementMode == RmStopPlacement.PrevBarOppositeExtreme)
                     {
-                        // Usar la N-1 capturada en el fill; si no estÃ¡, caer a CurrentBar-2 (prev cerrada)
                         var prevIdx = _pendingPrevBarIdxAtFill >= 0
                             ? Math.Max(0, _pendingPrevBarIdxAtFill)
-                            : Math.Max(0, CurrentBar - 2);
+                            : Math.Max(0, CurrentBar - 2);          // N-1 cerrada
                         var prev = GetCandle(prevIdx);
-                        if (prev != null)
+                        var cur  = GetCandle(Math.Max(0, CurrentBar - 1)); // N (intravela)
+                        if (prev != null && cur != null)
                         {
-                            var basePx = (dir > 0) ? prev.Low : prev.High;        // LONG â†’ Low(N-1); SHORT â†’ High(N-1)
+                            // Engulfing-safe base:
+                            // LONG → min(prev.Low, cur.Low) ; SHORT → max(prev.High, cur.High)
+                            var prevExtreme = (dir > 0) ? prev.Low  : prev.High;
+                            var curExtreme  = (dir > 0) ? cur.Low   : cur.High;
+                            var baseExtreme = (dir > 0)
+                                ? Math.Min(prevExtreme, curExtreme)
+                                : Math.Max(prevExtreme, curExtreme);
+
                             var offsetTicks = Math.Max(0, PrevBarOffsetTicks);
-                            var offset = offsetTicks * Convert.ToDecimal(tickSize);
-                            var outside = PrevBarOffsetSide == RmPrevBarOffsetSide.Outside;
+                            var offset      = offsetTicks * Convert.ToDecimal(tickSize);
+                            var outside     = PrevBarOffsetSide == RmPrevBarOffsetSide.Outside;
+
                             decimal rawSL;
                             if (dir > 0) // LONG
-                                rawSL = outside ? (basePx - offset) : (basePx + offset);
+                                rawSL = outside ? (baseExtreme - offset) : (baseExtreme + offset);
                             else         // SHORT
-                                rawSL = outside ? (basePx + offset) : (basePx - offset);
-                            overrideStopPx = ShrinkPrice(rawSL);                   // tick-safe
-                            // ticks aproximados desde entryPx
-                            approxStopTicks = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - overrideStopPx.Value) / tickSize));
+                                rawSL = outside ? (baseExtreme + offset) : (baseExtreme - offset);
+
+                            overrideStopPx   = ShrinkPrice(rawSL);  // tick-safe
+                            approxStopTicks  = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - overrideStopPx.Value) / tickSize));
                             if (EnableLogging)
-                                DebugLog.W("RM/STOPMODE", $"PrevBar SL({PrevBarOffsetSide}): used prevIdx={prevIdx} base={basePx:F2} offsetTicks={offsetTicks} â†’ SL={overrideStopPx.Value:F2} ticksâ‰ˆ{approxStopTicks}");
+                                DebugLog.W("RM/STOPMODE",
+                                    $"PrevBar+N SL({PrevBarOffsetSide}): prevIdx={prevIdx} prev={prevExtreme:F2} cur={curExtreme:F2} base={baseExtreme:F2} offTicks={offsetTicks} → SL={overrideStopPx.Value:F2} ticks≈{approxStopTicks}");
                         }
                     }
                 } catch { /* fallback a DefaultStopTicks */ }
@@ -926,13 +995,13 @@ namespace MyAtas.Strategies
                 );
 
                 var engine = GetEngine();
-                if (engine == null) { if (EnableLogging) DebugLog.W("RM/PLAN", "Engine not available â†’ abort"); return; }
+                if (engine == null) { if (EnableLogging) DebugLog.W("RM/PLAN", "Engine not available Ã¢â€ â€™ abort"); return; }
 
                 var plan = engine.BuildPlan(ctx, sizingCfg, bracketCfg, out var szReason);
 
                 if (plan == null)
                 {
-                    if (EnableLogging) DebugLog.W("RM/PLAN", "BuildPlan â†’ null");
+                    if (EnableLogging) DebugLog.W("RM/PLAN", "BuildPlan Ã¢â€ â€™ null");
                     return;
                 }
                 else
@@ -941,7 +1010,7 @@ namespace MyAtas.Strategies
                         DebugLog.W("RM/PLAN", $"Built plan: totalQty={plan.TotalQty} stop={plan.StopLoss?.Price:F2} tps={plan.TakeProfits?.Count} reason={plan.Reason}");
                 }
 
-                if (plan.TotalQty <= 0) { if (EnableLogging) DebugLog.W("RM/PLAN", "qty<=0 â†’ no attach"); _pendingAttach = false; return; }
+                if (plan.TotalQty <= 0) { if (EnableLogging) DebugLog.W("RM/PLAN", "qty<=0 Ã¢â€ â€™ no attach"); _pendingAttach = false; return; }
 
                 // 3bis) ENFORCEMENT DE CANTIDAD (si procede)
                 if (EnforceManualQty)
@@ -975,7 +1044,7 @@ namespace MyAtas.Strategies
                 var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Cover side for brackets: coverSide={coverSide} (dir={dir})");
 
-                // OCO 1:1 por TP â€” cada TP lleva su propio trozo de SL
+                // OCO 1:1 por TP Ã¢â‚¬â€ cada TP lleva su propio trozo de SL
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Starting bracket loop: TakeProfits.Count={plan.TakeProfits.Count}");
 
                 for (int idx = 0; idx < plan.TakeProfits.Count; idx++)
@@ -1009,7 +1078,7 @@ namespace MyAtas.Strategies
             try
             {
                 var shrunkPx = ShrinkPrice(triggerPx);
-                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop: ShrinkPrice({triggerPx:F2}) â†’ {shrunkPx:F2}");
+                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop: ShrinkPrice({triggerPx:F2}) Ã¢â€ â€™ {shrunkPx:F2}");
 
                 var order = new Order
                 {
@@ -1017,15 +1086,15 @@ namespace MyAtas.Strategies
                     Security = Security,
                     Direction = side,
                     Type = OrderTypes.Stop,
-                    TriggerPrice = shrunkPx, // â† tick-safe
+                    TriggerPrice = shrunkPx, // Ã¢â€ Â tick-safe
                     QuantityToFill = qty,
                     OCOGroup = oco,
                     IsAttached = true,
                     Comment = comment
                 };
-                order.AutoCancel = true;             // â† cancelar al cerrar
-                TrySetReduceOnly(order);             // â† no abrir nuevas
-                TrySetCloseOnTrigger(order);         // â† cerrar al disparar
+                order.AutoCancel = true;             // Ã¢â€ Â cancelar al cerrar
+                TrySetReduceOnly(order);             // Ã¢â€ Â no abrir nuevas
+                TrySetCloseOnTrigger(order);         // Ã¢â€ Â cerrar al disparar
 
                 if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop: Calling OpenOrder() for SL");
                 OpenOrder(order);
@@ -1046,7 +1115,7 @@ namespace MyAtas.Strategies
             try
             {
                 var shrunkPx = ShrinkPrice(price);
-                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit: ShrinkPrice({price:F2}) â†’ {shrunkPx:F2}");
+                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit: ShrinkPrice({price:F2}) Ã¢â€ â€™ {shrunkPx:F2}");
 
                 var order = new Order
                 {
@@ -1054,14 +1123,14 @@ namespace MyAtas.Strategies
                     Security = Security,
                     Direction = side,
                     Type = OrderTypes.Limit,
-                    Price = shrunkPx,       // â† tick-safe
+                    Price = shrunkPx,       // Ã¢â€ Â tick-safe
                     QuantityToFill = qty,
                     OCOGroup = oco,
                     IsAttached = true,
                     Comment = comment
                 };
-                order.AutoCancel = true;             // â† cancelar al cerrar
-                TrySetReduceOnly(order);             // â† no abrir nuevas
+                order.AutoCancel = true;             // Ã¢â€ Â cancelar al cerrar
+                TrySetReduceOnly(order);             // Ã¢â€ Â no abrir nuevas
 
                 if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit: Calling OpenOrder() for TP");
                 OpenOrder(order);
@@ -1090,7 +1159,7 @@ namespace MyAtas.Strategies
                     QuantityToFill = qty,
                     Comment = comment
                 };
-                // IMPORTANTE: no marcar ReduceOnly aquÃ­ â€” queremos abrir delta
+                // IMPORTANTE: no marcar ReduceOnly aquÃƒÂ­ Ã¢â‚¬â€ queremos abrir delta
                 if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmMarket: Calling OpenOrder() for {side} +{qty} (ReduceOnly=false)");
                 OpenOrder(order);
                 if (EnableLogging) DebugLog.W("RM/ORD", $"ENFORCE MARKET SENT: {side} +{qty} @{GetLastPriceSafe():F2} comment={comment}");
@@ -1187,7 +1256,7 @@ namespace MyAtas.Strategies
         {
             try
             {
-                // UniÃ³n: Ã³rdenes de la estrategia + externas detectadas (ChartTrader)
+                // UniÃƒÂ³n: ÃƒÂ³rdenes de la estrategia + externas detectadas (ChartTrader)
                 var union = new System.Collections.Generic.List<Order>();
                 if (this.Orders != null) union.AddRange(this.Orders);
                 lock (_liveOrdersLock) union.AddRange(_liveOrders);
@@ -1197,7 +1266,7 @@ namespace MyAtas.Strategies
                 foreach (var o in union)
                 {
                     if (o == null) continue;
-                    // Mismo instrumento/portfolio (comparaciÃ³n laxa por ToString para evitar tipos internos)
+                    // Mismo instrumento/portfolio (comparaciÃƒÂ³n laxa por ToString para evitar tipos internos)
                     if (o.Security?.ToString() != Security?.ToString()) continue;
                     if (o.Portfolio?.ToString() != Portfolio?.ToString()) continue;
                     var oid = o.Id ?? $"{o.GetHashCode()}";
@@ -1234,7 +1303,7 @@ namespace MyAtas.Strategies
                 // 1) Strategy-owned way (works for this strategy orders)
                 try { CancelOrder(o); return true; } catch { /* might not belong to strategy */ }
 
-                // 2) TradingManager (platform-level) â€” sync variant
+                // 2) TradingManager (platform-level) Ã¢â‚¬â€ sync variant
                 var tm = this.TradingManager;
                 if (tm != null)
                 {
@@ -1271,13 +1340,13 @@ namespace MyAtas.Strategies
                     .CreateExtendedOptions(order.Type);
                 if (flags is ATAS.DataFeedsCore.IOrderOptionReduceOnly ro)
                 {
-                    ro.ReduceOnly = true;   // evita abrir posiciÃ³n nueva
+                    ro.ReduceOnly = true;   // evita abrir posiciÃƒÂ³n nueva
                     order.ExtendedOptions = flags;
                 }
             } catch { }
         }
 
-        // Flatten por TradingManager (cascada de firmas). Devuelve true si se invocÃ³ alguna variante.
+        // Flatten por TradingManager (cascada de firmas). Devuelve true si se invocÃƒÂ³ alguna variante.
         private bool TryClosePositionViaTradingManager()
         {
             try
@@ -1285,7 +1354,7 @@ namespace MyAtas.Strategies
                 var tm = this.TradingManager;
                 if (tm == null)
                 {
-                    if (EnableLogging) DebugLog.W("RM/STOP", "TradingManager null â†’ fallback MARKET");
+                    if (EnableLogging) DebugLog.W("RM/STOP", "TradingManager null Ã¢â€ â€™ fallback MARKET");
                     return false;
                 }
 
@@ -1346,12 +1415,12 @@ namespace MyAtas.Strategies
                     return true;
                 }
 
-                if (EnableLogging) DebugLog.W("RM/STOP", "ClosePosition* not found â†’ fallback MARKET");
+                if (EnableLogging) DebugLog.W("RM/STOP", "ClosePosition* not found Ã¢â€ â€™ fallback MARKET");
                 return false;
             }
             catch (Exception ex)
             {
-                if (EnableLogging) DebugLog.W("RM/STOP", $"TryClosePositionViaTradingManager EX: {ex.Message} â†’ fallback MARKET");
+                if (EnableLogging) DebugLog.W("RM/STOP", $"TryClosePositionViaTradingManager EX: {ex.Message} Ã¢â€ â€™ fallback MARKET");
                 return false;
             }
         }
@@ -1381,7 +1450,7 @@ namespace MyAtas.Strategies
                 {
                     var c = o?.Comment ?? "";
                     if (!c.StartsWith(prefix)) return false;
-                    // consideramos viva si NO estÃ¡ cancelada y NO estÃ¡ llena
+                    // consideramos viva si NO estÃƒÂ¡ cancelada y NO estÃƒÂ¡ llena
                     var st = o.Status();
                     return !o.Canceled
                            && st != OrderStatus.Filled
@@ -1391,7 +1460,7 @@ namespace MyAtas.Strategies
             catch { return false; }
         }
 
-        // Log de cancelaciÃ³n fallida (para ver por quÃ© queda algo "working")
+        // Log de cancelaciÃƒÂ³n fallida (para ver por quÃƒÂ© queda algo "working")
         protected override void OnOrderCancelFailed(Order order, string message)
         {
             if (!EnableLogging) return;
@@ -1402,7 +1471,7 @@ namespace MyAtas.Strategies
         }
 
         // ========= Helpers de neta y flatten =========
-        // Siempre usa el snapshot de CUENTA (TM.Position/Portfolio). No uses CurrentPosition aquÃ­.
+        // Siempre usa el snapshot de CUENTA (TM.Position/Portfolio). No uses CurrentPosition aquÃƒÂ­.
         private int ReadNetPositionSafe()
         {
             try { return ReadNetPosition(); } catch { return 0; }
@@ -1426,7 +1495,7 @@ namespace MyAtas.Strategies
             return false;
         }
 
-        // EnvÃ­a (si hace falta) la orden MARKET reduce-only para quedar flat.
+        // EnvÃƒÂ­a (si hace falta) la orden MARKET reduce-only para quedar flat.
         // Evita duplicarla si ya hay una STPFLAT "working".
         private void EnsureFlattenOutstanding(string reason)
         {
@@ -1455,7 +1524,7 @@ namespace MyAtas.Strategies
                     QuantityToFill = qty,
                     Comment        = comment
                 };
-                TrySetReduceOnly(o); // evita abrir si hay desincronizaciÃ³n
+                TrySetReduceOnly(o); // evita abrir si hay desincronizaciÃƒÂ³n
                 OpenOrder(o);
                 if (EnableLogging) DebugLog.W("RM/STOP", $"Flatten MARKET sent: {side} {qty} ({reason}) comment={comment}");
             }
