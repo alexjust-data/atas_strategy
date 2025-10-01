@@ -181,6 +181,10 @@ namespace MyAtas.Strategies
         [Category("Breakeven"), DisplayName("Mode")]
         public RmBeMode BreakEvenMode { get; set; } = RmBeMode.OnTP1Touch;
 
+        [Category("Breakeven"), DisplayName("BE trigger TP (1..3)")]
+        [Description("Qué TP dispara el paso a breakeven (1, 2 o 3). Funciona también en modo virtual sin TP real.")]
+        public int BeTriggerTp { get; set; } = 1;
+
         [Category("Breakeven"), DisplayName("BE offset (ticks)")]
         public int BeOffsetTicks { get; set; } = 4;
 
@@ -208,6 +212,80 @@ namespace MyAtas.Strategies
         private bool   _beArmed     = false;
         private bool   _beDone      = false;
         private decimal _beTargetPx = 0m;
+
+        // === Breakeven helpers ===
+        private int _beDirHint = 0; // +1/-1 al armar (por si net no está disponible aún)
+
+        private decimal ComputeBePrice(int dir, decimal entryPx, decimal tickSize)
+        {
+            var off = Math.Max(0, BeOffsetTicks) * tickSize;
+            return dir > 0 ? ShrinkPrice(entryPx + off) : ShrinkPrice(entryPx - off);
+        }
+
+        // REEMPLAZA todos los SL (propios) de cada OCO por un SL al precio 'newStopPx'.
+        // Para mantener los OCO con sus TPs, se cancela el SL antiguo y se reabre el SL con el MISMO OCO y qty.
+        private void MoveAllRmStopsTo(decimal newStopPx, string reason = "BE")
+        {
+            try
+            {
+                var list = this.Orders;
+                if (list == null) return;
+
+                // Agrupar TPs y SLs por OCO
+                var tpsByOco = new System.Collections.Generic.Dictionary<string, Order>();
+                var slsByOco = new System.Collections.Generic.Dictionary<string, Order>();
+
+                foreach (var o in list)
+                {
+                    if (o == null) continue;
+                    var c = o.Comment ?? "";
+                    var st = o.Status();
+                    if (o.Canceled || st == OrderStatus.Canceled || st == OrderStatus.Filled) continue;
+
+                    if (c.StartsWith(OwnerPrefix + "TP:"))
+                        tpsByOco[o.OCOGroup ?? ""] = o;
+                    else if (c.StartsWith(OwnerPrefix + "SL:"))
+                        slsByOco[o.OCOGroup ?? ""] = o;
+                }
+
+                int replaced = 0;
+                foreach (var kv in tpsByOco)
+                {
+                    var oco = kv.Key;
+                    if (!slsByOco.TryGetValue(oco, out var slOld)) continue;
+
+                    var qty = Math.Max(0, slOld.QuantityToFill);
+                    if (qty <= 0) continue;
+
+                    try { CancelOrder(slOld); } catch { /* tolerante */ }
+
+                    var side = slOld.Direction; // ya es la cara "cover" correcta
+                    var slNew = new Order
+                    {
+                        Portfolio      = Portfolio,
+                        Security       = Security,
+                        Direction      = side,
+                        Type           = OrderTypes.Stop,
+                        TriggerPrice   = newStopPx,
+                        QuantityToFill = qty,
+                        OCOGroup       = oco,
+                        IsAttached     = true,
+                        Comment        = $"{OwnerPrefix}SL:{Guid.NewGuid():N}"
+                    };
+                    TrySetReduceOnly(slNew);
+                    TrySetCloseOnTrigger(slNew);
+                    OpenOrder(slNew);
+                    replaced++;
+                }
+
+                if (EnableLogging)
+                    DebugLog.W("RM/BE", $"Moved SLs to {newStopPx:F2} (pairs updated={replaced}) reason={reason}");
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("RM/BE", $"MoveAllRmStopsTo EX: {ex.Message}");
+            }
+        }
 
         private RiskEngine _engine;
 
@@ -709,6 +787,31 @@ namespace MyAtas.Strategies
                 }
             }
             catch { /* defensivo */ }
+
+            // === BE por TOUCH de precio (funciona con TP real o virtual) ===
+            try
+            {
+                if (_beArmed && !_beDone && BreakEvenMode == RmBeMode.OnTP1Touch)
+                {
+                    var snap = ReadPositionSnapshot();
+                    if (Math.Abs(snap.NetQty) != 0 && _beTargetPx > 0m)
+                    {
+                        var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+                        var last = GetLastPriceSafe();
+                        var dir  = Math.Sign(snap.NetQty != 0 ? snap.NetQty : _beDirHint);
+
+                        var touched = dir > 0 ? (last >= _beTargetPx) : (last <= _beTargetPx);
+                        if (touched)
+                        {
+                            var bePx = ComputeBePrice(dir, snap.AvgPrice > 0m ? snap.AvgPrice : last, tickSize);
+                            if (EnableLogging) DebugLog.W("RM/BE", $"TOUCH trigger @ {_beTargetPx:F2} Ã¢â€ â€™ move SL to BE {bePx:F2}");
+                            MoveAllRmStopsTo(bePx, "BE touch");
+                            _beDone = true;
+                        }
+                    }
+                }
+            }
+            catch (Exception ex) { DebugLog.W("RM/BE", $"BE touch check EX: {ex.Message}"); }
         }
 
         protected override void OnOrderChanged(Order order)
@@ -823,6 +926,31 @@ namespace MyAtas.Strategies
             {
                 DebugLog.W("RM/ORD", $"OnOrderChanged EXCEPTION: {ex.Message} | Stack: {ex.StackTrace}");
             }
+
+            // === BE por FILL real del TP ===
+            try
+            {
+                if (_beArmed && !_beDone && BreakEvenMode == RmBeMode.OnTP1Fill)
+                {
+                    var c = order?.Comment ?? "";
+                    var st = order.Status();
+                    if (c.StartsWith(OwnerPrefix + "TP:") && (st == OrderStatus.Filled || st == OrderStatus.PartlyFilled))
+                    {
+                        // Confirmar lado y entrada
+                        var snap = ReadPositionSnapshot();
+                        var dir = Math.Sign(snap.NetQty != 0 ? snap.NetQty : _beDirHint);
+                        if (dir != 0)
+                        {
+                            var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+                            var bePx = ComputeBePrice(dir, snap.AvgPrice > 0m ? snap.AvgPrice : ExtractAvgFillPrice(order), tickSize);
+                            if (EnableLogging) DebugLog.W("RM/BE", $"FILL trigger by TP Ã¢â€ â€™ move SL to BE {bePx:F2}");
+                            MoveAllRmStopsTo(bePx, "BE fill");
+                            _beDone = true;
+                        }
+                    }
+                }
+            }
+            catch { /* tolerante */ }
         }
 
         // New: capture newly seen orders too (fires when order is registered)
@@ -1155,6 +1283,47 @@ namespace MyAtas.Strategies
                         DebugLog.W("RM/PLAN", $"Built plan: totalQty={plan.TotalQty} stop={plan.StopLoss?.Price:F2} tps={plan.TakeProfits?.Count} reason={plan.Reason}");
                 }
 
+                // ===== "LA UI MANDA": Si EnforceManualQty está activo, usar ManualQty =====
+                var manualTarget = Math.Max(MinQty, ManualQty);
+                var targetForEnforce = EnforceManualQty ? manualTarget : plan.TotalQty;
+
+                // Si estamos imponiendo cantidad manual y difiere del plan,
+                // recalculamos los splits para que brackets y ENFORCE vayan alineados.
+                if (EnforceManualQty && targetForEnforce != plan.TotalQty)
+                {
+                    var q = targetForEnforce;
+                    var s1 = Math.Max(0, Math.Min(100, TP1pctunit));
+                    var s2 = Math.Max(0, Math.Min(100, TP2pctunit));
+                    var s3 = Math.Max(0, Math.Min(100, TP3pctunit));
+                    var sum = Math.Max(1, s1 + s2 + s3);
+                    int q1 = (int)Math.Floor(q * s1 / (decimal)sum);
+                    int q2 = (int)Math.Floor(q * s2 / (decimal)sum);
+                    int q3 = q - q1 - q2; // "resto" al último para evitar qty=0
+
+                    // Extraer precios del plan antes de reconstruir
+                    var tp1Px = plan.TakeProfits.Count > 0 ? plan.TakeProfits[0].Price : 0m;
+                    var tp2Px = plan.TakeProfits.Count > 1 ? plan.TakeProfits[1].Price : 0m;
+                    var tp3Px = plan.TakeProfits.Count > 2 ? plan.TakeProfits[2].Price : 0m;
+
+                    // Reconstruir lista de TPs con nuevas cantidades (BracketLeg es immutable)
+                    var newTps = new System.Collections.Generic.List<MyAtas.Risk.Models.BracketLeg>();
+                    if (q1 > 0) newTps.Add(new MyAtas.Risk.Models.BracketLeg(tp1Px, q1));
+                    if (q2 > 0) newTps.Add(new MyAtas.Risk.Models.BracketLeg(tp2Px, q2));
+                    if (q3 > 0) newTps.Add(new MyAtas.Risk.Models.BracketLeg(tp3Px, q3));
+
+                    // Reconstruir plan completo con nueva cantidad total y nuevos TPs (record positional)
+                    plan = new MyAtas.Risk.Models.RiskPlan(
+                        TotalQty: q,
+                        StopLoss: plan.StopLoss,
+                        TakeProfits: newTps,
+                        OcoPolicy: plan.OcoPolicy,
+                        Reason: plan.Reason + " [UI override]"
+                    );
+
+                    if (EnableLogging)
+                        DebugLog.W("RM/PLAN", $"LA UI MANDA: Overriding plan qty {plan.TotalQty}→{q}, splits=[{q1},{q2},{q3}]");
+                }
+
                 // ===== TARGET QTY por modo de dimensionado =====
                 var riskPerContract = Math.Max(1, approxStopTicks) * tickValue; // USD por contrato
                 int targetQty;
@@ -1193,23 +1362,42 @@ namespace MyAtas.Strategies
                     if (EnableLogging) DebugLog.W("RM/SIZING", $"TARGET QTY (Risk mode) = {targetQty}");
                 }
 
-                // ===== ENFORCEMENT (si procede) sobre targetQty calculada arriba =====
-                if (EnforceManualQty)
+                // ===== ENFORCEMENT (imponer SIEMPRE el objetivo del modo activo) =====
+                targetForEnforce = (SizingMode == RmSizingMode.Manual)
+                    ? Math.Clamp(ManualQty, Math.Max(1, MinQty), Math.Max(1, MaxQty))
+                    : plan.TotalQty; // objetivo de riesgo
+
+                var currentNet = Math.Abs(ReadNetPosition());
+                var filledHint = Math.Max(0, _pendingFillQty);
+                var seen = Math.Max(currentNet, filledHint);
+                var delta = targetForEnforce - seen;
+                if (EnableLogging) DebugLog.W("RM/ENTRY", $"ENFORCE: target={targetForEnforce} seen={seen} delta={delta}");
+
+                if (delta != 0)
                 {
-                    var currentNet = Math.Abs(ReadNetPosition());
-                    var filledHint = Math.Max(0, _pendingFillQty);
-                    var qSeen = Math.Max(currentNet, filledHint);
-                    var delta = targetQty - qSeen;
-                    if (EnableLogging) DebugLog.W("RM/ENTRY",
-                        $"ENFORCE CHECK: target={targetQty} | seen={qSeen} (net={currentNet}, fillHint={filledHint}) | delta={delta}");
+                    var addSide = (dir > 0 ? OrderDirections.Buy : OrderDirections.Sell);
+                    var cutSide = (dir > 0 ? OrderDirections.Sell : OrderDirections.Buy);
+
                     if (delta > 0)
                     {
-                        var side = dir > 0 ? OrderDirections.Buy : OrderDirections.Sell;
-                        if (EnableLogging) DebugLog.W("RM/ENTRY", $"ENFORCE TRIGGER: MARKET {side} +{delta}");
-                        SubmitRmMarket(side, delta);
+                        // abrir la diferencia
+                        if (EnableLogging) DebugLog.W("RM/ENTRY", $"ENFORCE TRIGGER: MARKET {addSide} +{delta}");
+                        SubmitRmMarket(addSide, delta); // (no reduce-only)
+                    }
+                    else
+                    {
+                        // cerrar el exceso con reduce-only
+                        if (EnableLogging) DebugLog.W("RM/ENTRY", $"ENFORCE CUT: MARKET {cutSide} -{Math.Abs(delta)} (reduce-only)");
+                        var o = new Order {
+                            Portfolio = Portfolio, Security = Security,
+                            Direction = cutSide, Type = OrderTypes.Market,
+                            QuantityToFill = Math.Abs(delta),
+                            Comment = $"{OwnerPrefix}ENF-CUT:{Guid.NewGuid():N}"
+                        };
+                        TrySetReduceOnly(o);
+                        OpenOrder(o);
                     }
                 }
-                else if (EnableLogging) DebugLog.W("RM/ENTRY", "ENFORCE DISABLED: EnforceManualQty=false");
 
                 var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Cover side for brackets: coverSide={coverSide} (dir={dir})");
@@ -1217,9 +1405,9 @@ namespace MyAtas.Strategies
                 // OCO 1:1 por TP Ã¢â‚¬â€ cada TP lleva su propio trozo de SL
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Starting bracket loop: TakeProfits.Count={plan.TakeProfits.Count}");
 
-                // Reparto de cantidades por splits (sin ceros)
-                var splitQty = _RmSplitHelper.SplitQty(targetQty, tpSplits);
-                if (EnableLogging) DebugLog.W("RM/SPLIT", $"targetQty={targetQty} Ã¢â€ â€™ splitQty=[{string.Join(",", splitQty)}]");
+                // Reparto de cantidades por splits (sin ceros) - usar targetForEnforce
+                var splitQty = _RmSplitHelper.SplitQty(targetForEnforce, tpSplits);
+                if (EnableLogging) DebugLog.W("RM/SPLIT", $"targetForEnforce={targetForEnforce} Ã¢â€ â€™ splitQty=[{string.Join(",", splitQty)}]");
 
                 for (int idx = 0; idx < plan.TakeProfits.Count && idx < splitQty.Length; idx++)
                 {
@@ -1232,6 +1420,23 @@ namespace MyAtas.Strategies
                     SubmitRmLimit(ocoId, coverSide, q, tp.Price);
                     if (EnableLogging)
                         DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: OCO SL {q}@{slPriceToUse:F2} + TP {q}@{tp.Price:F2} (dir={(dir>0?"LONG":"SHORT")})");
+                }
+
+                // Armar el BE (vigilancia del TP trigger para mover SL a breakeven)
+                if (BreakEvenMode != RmBeMode.Off && plan.TakeProfits != null && plan.TakeProfits.Count > 0)
+                {
+                    var tpIdx = Math.Clamp(BeTriggerTp, 1, Math.Min(3, plan.TakeProfits.Count)) - 1;
+                    _beTargetPx = plan.TakeProfits[tpIdx].Price;  // precio objetivo que vamos a vigilar (virtual o real)
+                    _beDirHint  = dir;
+                    _beArmed    = true;
+                    _beDone     = false;
+
+                    if (EnableLogging)
+                        DebugLog.W("RM/BE", $"ARMED Ã¢â€ â€™ mode={BreakEvenMode} triggerTP={tpIdx + 1} tpPx={_beTargetPx:F2} dir={(_beDirHint>0?"LONG":"SHORT")}");
+                }
+                else
+                {
+                    _beArmed = _beDone = false; _beTargetPx = 0m; _beDirHint = 0;
                 }
 
                 _pendingAttach = false;
