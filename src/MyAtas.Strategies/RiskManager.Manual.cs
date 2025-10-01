@@ -1,5 +1,6 @@
 using System;
 using System.ComponentModel;
+using System.Globalization;
 using System.Linq;
 using ATAS.Strategies.Chart;
 using ATAS.Types;
@@ -47,6 +48,33 @@ namespace MyAtas.Strategies
             }
             return (rList.ToArray(), sList.ToArray());
         }
+
+        // Reparte 'total' según 'splits' (% normalizados a 100). Último absorbe diferencia.
+        public static int[] SplitQty(int total, int[] splits)
+        {
+            if (total <= 0 || splits == null || splits.Length == 0) return Array.Empty<int>();
+            var q = new int[splits.Length];
+            var remain = total;
+            for (int i = 0; i < splits.Length; i++)
+            {
+                if (i == splits.Length - 1)
+                {
+                    q[i] = Math.Max(0, remain);
+                }
+                else
+                {
+                    var qi = (int)Math.Round(total * (splits[i] / 100m));
+                    q[i] = Math.Max(0, qi);
+                    remain -= q[i];
+                }
+            }
+            // Ajuste anti-todo-en-cero: si sumó 0 pero total>0, pon 1 al último
+            if (q.Sum() == 0 && total > 0) q[^1] = total;
+            // Ajuste si por redondeo sobrepasó:
+            var diff = q.Sum() - total;
+            if (diff > 0) q[^1] = Math.Max(0, q[^1] - diff);
+            return q;
+        }
     }
 
     // Nota: esqueleto "safe". No envÃ¯Â¿Â½a ni cancela Ã¯Â¿Â½rdenes.
@@ -82,9 +110,6 @@ namespace MyAtas.Strategies
         [Category("Position Sizing"), DisplayName("Risk % of account")]
         public decimal RiskPercentOfAccount { get; set; } = 0.5m;
 
-        [Category("Position Sizing"), DisplayName("Tick value overrides (SYM=V;...)")]
-        public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5";
-
         [Category("Position Sizing"), DisplayName("Default stop (ticks)")]
         public int DefaultStopTicks { get; set; } = 12;
 
@@ -103,6 +128,19 @@ namespace MyAtas.Strategies
         [Category("Position Sizing"), DisplayName("Underfunded policy")]
         public MyAtas.Risk.Models.UnderfundedPolicy Underfunded { get; set; } =
             MyAtas.Risk.Models.UnderfundedPolicy.Min1;
+
+        // === Snapshot de cuenta (solo lectura en UI) ===
+        [Category("Position Sizing"), DisplayName("Account equity (USD)")]
+        [System.ComponentModel.ReadOnly(true)]
+        public decimal AccountEquitySnapshot { get; private set; } = 0m;
+
+        private DateTime _nextEquityProbeAt = DateTime.MinValue;
+
+        [Category("Position Sizing"), DisplayName("Account equity override (USD)")]
+        public decimal AccountEquityOverride { get; set; } = 0m;
+
+        [Category("Position Sizing"), DisplayName("Tick value overrides (SYM=V;...)")]
+        public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10";
 
         // =================== Stops & TPs ===================
         [Category("Stops & TPs"), DisplayName("Preset TPs (1..3)")]
@@ -419,6 +457,96 @@ namespace MyAtas.Strategies
             return (0, 0m);
         }
 
+        // Sondea la cuenta real (TradingManager.Account / Portfolio) por reflexión.
+        // Busca en orden: Equity, NetLiquidation, Balance, AccountBalance, Cash.
+        // Devuelve el primer valor > 0m encontrado.
+        private decimal ReadAccountEquityUSD()
+        {
+            try
+            {
+                // 1) TradingManager.Account.* (Equity/Balance/NetLiquidation/Cash)
+                var tm = this.TradingManager;
+                var acct = tm?.GetType().GetProperty("Account")?.GetValue(tm);
+                if (acct != null)
+                {
+                    foreach (var name in new[] { "Equity", "NetLiquidation", "Balance", "AccountBalance", "Cash" })
+                    {
+                        var p = acct.GetType().GetProperty(name);
+                        if (p == null) continue;
+                        try
+                        {
+                            var v = Convert.ToDecimal(p.GetValue(acct));
+                            if (v > 0m) return v;
+                        }
+                        catch { }
+                    }
+                }
+                // 2) Portfolio.* (Equity/Balance/Cash)
+                if (Portfolio != null)
+                {
+                    foreach (var name in new[] { "Equity", "Balance", "Cash", "AccountBalance" })
+                    {
+                        var p = Portfolio.GetType().GetProperty(name);
+                        if (p == null) continue;
+                        try
+                        {
+                            var v = Convert.ToDecimal(p.GetValue(Portfolio));
+                            if (v > 0m) return v;
+                        }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+            return 0m;
+        }
+
+        // Normaliza cadenas para comparar (mayúsculas, sin espacios/guiones, sin acentos)
+        private static string K(string s)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return string.Empty;
+            s = s.ToUpperInvariant();
+            s = s.Replace(" ", "").Replace("-", "").Replace("_", "");
+            s = s.Replace("É","E").Replace("Á","A").Replace("Í","I").Replace("Ó","O").Replace("Ú","U").Replace("Ñ","N");
+            return s;
+        }
+
+        private decimal ResolveTickValueUsd(string securityNameOrCode, string overrides, decimal fallback)
+        {
+            var key = K(securityNameOrCode);
+
+            // 1) Overrides de la UI: "MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10;MICROEMININASDAQ100=0.5"
+            if (!string.IsNullOrWhiteSpace(overrides))
+            {
+                foreach (var pair in overrides.Split(new[] {';'}, StringSplitOptions.RemoveEmptyEntries))
+                {
+                    var kv = pair.Split('=');
+                    if (kv.Length != 2) continue;
+                    var k = K(kv[0]);
+                    var vRaw = kv[1].Trim().Replace(',', '.');
+                    if (!decimal.TryParse(vRaw, NumberStyles.Any, CultureInfo.InvariantCulture, out var v)) continue;
+
+                    // Coincidencia amplia: si el nombre/código contiene la clave normalizada
+                    if (key.Contains(k)) return v;
+                }
+            }
+
+            // 2) Heurísticas por si el broker no da el código del símbolo
+            if (key.Contains("MICROEMININASDAQ") || key.StartsWith("MNQ")) return 0.5m;
+            if (key.StartsWith("NQ")) return 5m;
+            if (key.StartsWith("MES")) return 1.25m;
+            if (key.StartsWith("ES")) return 12.5m;
+            if (key.Contains("MICROGOLD") || key.StartsWith("MGC")) return 1m;
+            if (key.StartsWith("GC")) return 10m;
+
+            return fallback;
+        }
+
+        private decimal ResolveTickValueUSD()
+        {
+            return ResolveTickValueUsd(Security?.ToString() ?? "", TickValueOverrides ?? "", FallbackTickValueUsd);
+        }
+
         // Devuelve el objeto Position nativo de ATAS (para usar ClosePosition del TradingManager).
         private object GetAtasPositionObject()
         {
@@ -491,6 +619,14 @@ namespace MyAtas.Strategies
         protected override void OnCalculate(int bar, decimal value)
         {
             if (!IsActivated) return;
+
+            // Refresca equity en UI (1×/s)
+            if (DateTime.UtcNow >= _nextEquityProbeAt)
+            {
+                AccountEquitySnapshot = ReadAccountEquityUSD();
+                _nextEquityProbeAt = DateTime.UtcNow.AddSeconds(1);
+                if (EnableLogging) DebugLog.W("RM/SNAP", $"Equity≈{AccountEquitySnapshot:F2} USD");
+            }
 
             // Heartbeat del estado de Stop-to-Flat (visible en logs)
             if (EnableLogging && IsFirstTickOf(bar))
@@ -716,6 +852,9 @@ namespace MyAtas.Strategies
         {
             try
             {
+                AccountEquitySnapshot = ReadAccountEquityUSD();
+                if (EnableLogging) DebugLog.W("RM/SNAP", $"Equity init Ã¢â€ °Ë† {AccountEquitySnapshot:F2} USD");
+
                 _stopToFlat = false;
                 _rmStopGraceUntil = DateTime.MinValue;
                 _nextStopSweepAt   = DateTime.MinValue;
@@ -896,7 +1035,13 @@ namespace MyAtas.Strategies
                 // Instrumento (fallbacks)
                 var tickSize = FallbackTickSize;
                 try { tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize); } catch { }
-                var tickValue = FallbackTickValueUsd;
+
+                var secName = (Security?.ToString() ?? string.Empty);
+                var tickValueResolved = ResolveTickValueUsd(secName, TickValueOverrides, FallbackTickValueUsd);
+                var tickValue = tickValueResolved;
+
+                if (EnableLogging)
+                    DebugLog.W("RM/TICK", $"tickSize={tickSize} tickValueUSD={tickValue} symbolKey='{secName}' overrides='{TickValueOverrides}'");
 
                 // precio de entrada: order Ã¢â€ â€™ avgPrice posiciÃƒÂ³n Ã¢â€ â€™ vela previa (Close)
                 var entryPx = _pendingEntryPrice;
@@ -1010,36 +1155,61 @@ namespace MyAtas.Strategies
                         DebugLog.W("RM/PLAN", $"Built plan: totalQty={plan.TotalQty} stop={plan.StopLoss?.Price:F2} tps={plan.TakeProfits?.Count} reason={plan.Reason}");
                 }
 
-                if (plan.TotalQty <= 0) { if (EnableLogging) DebugLog.W("RM/PLAN", "qty<=0 Ã¢â€ â€™ no attach"); _pendingAttach = false; return; }
+                // ===== TARGET QTY por modo de dimensionado =====
+                var riskPerContract = Math.Max(1, approxStopTicks) * tickValue; // USD por contrato
+                int targetQty;
+                if (SizingMode == RmSizingMode.Manual)
+                {
+                    targetQty = Math.Clamp(ManualQty, Math.Max(1, MinQty), Math.Max(1, MaxQty));
+                    if (EnableLogging) DebugLog.W("RM/SIZING", $"TARGET QTY (Manual) = {targetQty}");
+                }
+                else
+                {
+                    decimal budgetUsd = 0m;
+                    if (SizingMode == RmSizingMode.FixedRiskUSD)
+                        budgetUsd = Math.Max(0m, RiskPerTradeUsd);
+                    else // PercentAccount
+                    {
+                        var equity = AccountEquityOverride > 0m ? AccountEquityOverride : AccountEquitySnapshot;
+                        budgetUsd = Math.Max(0m, Math.Round(equity * (RiskPercentOfAccount / 100m), 2));
+                    }
 
-                // 3bis) ENFORCEMENT DE CANTIDAD (si procede)
+                    if (EnableLogging) DebugLog.W("RM/SIZING", $"Risk budget = {budgetUsd:F2} USD | risk/contract = {riskPerContract:F2} USD");
+                    targetQty = (int)Math.Floor(budgetUsd / Math.Max(0.01m, riskPerContract));
+                    targetQty = Math.Clamp(targetQty, Math.Max(0, MinQty), Math.Max(1, MaxQty));
+                    if (targetQty <= 0)
+                    {
+                        if (Underfunded == MyAtas.Risk.Models.UnderfundedPolicy.Min1)
+                        {
+                            targetQty = 1;
+                            if (EnableLogging) DebugLog.W("RM/SIZING", "Underfunded Ã¢â€ â€™ forcing qty=1");
+                        }
+                        else
+                        {
+                            if (EnableLogging) DebugLog.W("RM/SIZING", "Underfunded Ã¢â€ â€™ qty=0, abort attach");
+                            _pendingAttach = false; return;
+                        }
+                    }
+                    if (EnableLogging) DebugLog.W("RM/SIZING", $"TARGET QTY (Risk mode) = {targetQty}");
+                }
+
+                // ===== ENFORCEMENT (si procede) sobre targetQty calculada arriba =====
                 if (EnforceManualQty)
                 {
                     var currentNet = Math.Abs(ReadNetPosition());
                     var filledHint = Math.Max(0, _pendingFillQty);
                     var qSeen = Math.Max(currentNet, filledHint);
-                    var targetQty = Math.Max(1, plan.TotalQty); // ahora plan.TotalQty = ManualQty (o qty por riesgo)
                     var delta = targetQty - qSeen;
-
                     if (EnableLogging) DebugLog.W("RM/ENTRY",
-                        $"ENFORCE CHECK: target={targetQty} (from plan/UI) | seen={qSeen} (net={currentNet}, fillHint={filledHint}) | delta={delta}");
-
+                        $"ENFORCE CHECK: target={targetQty} | seen={qSeen} (net={currentNet}, fillHint={filledHint}) | delta={delta}");
                     if (delta > 0)
                     {
                         var side = dir > 0 ? OrderDirections.Buy : OrderDirections.Sell;
-                        if (EnableLogging)
-                            DebugLog.W("RM/ENTRY", $"ENFORCE TRIGGER: sending MARKET {side} +{delta}");
+                        if (EnableLogging) DebugLog.W("RM/ENTRY", $"ENFORCE TRIGGER: MARKET {side} +{delta}");
                         SubmitRmMarket(side, delta);
                     }
-                    else
-                    {
-                        if (EnableLogging) DebugLog.W("RM/ENTRY", $"ENFORCE SKIP: No delta needed (target={targetQty} already met by seen={qSeen})");
-                    }
                 }
-                else
-                {
-                    if (EnableLogging) DebugLog.W("RM/ENTRY", "ENFORCE DISABLED: EnforceManualQty=false");
-                }
+                else if (EnableLogging) DebugLog.W("RM/ENTRY", "ENFORCE DISABLED: EnforceManualQty=false");
 
                 var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Cover side for brackets: coverSide={coverSide} (dir={dir})");
@@ -1047,15 +1217,21 @@ namespace MyAtas.Strategies
                 // OCO 1:1 por TP Ã¢â‚¬â€ cada TP lleva su propio trozo de SL
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Starting bracket loop: TakeProfits.Count={plan.TakeProfits.Count}");
 
-                for (int idx = 0; idx < plan.TakeProfits.Count; idx++)
+                // Reparto de cantidades por splits (sin ceros)
+                var splitQty = _RmSplitHelper.SplitQty(targetQty, tpSplits);
+                if (EnableLogging) DebugLog.W("RM/SPLIT", $"targetQty={targetQty} Ã¢â€ â€™ splitQty=[{string.Join(",", splitQty)}]");
+
+                for (int idx = 0; idx < plan.TakeProfits.Count && idx < splitQty.Length; idx++)
                 {
+                    var q = splitQty[idx];
+                    if (q <= 0) { if (EnableLogging) DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: skip (qty=0)"); continue; }
                     var tp = plan.TakeProfits[idx];
                     var ocoId = Guid.NewGuid().ToString("N");
                     var slPriceToUse = overrideStopPx ?? plan.StopLoss.Price;
-                    SubmitRmStop(ocoId, coverSide, tp.Quantity, slPriceToUse);
-                    SubmitRmLimit(ocoId, coverSide, tp.Quantity, tp.Price);
+                    SubmitRmStop(ocoId, coverSide, q, slPriceToUse);
+                    SubmitRmLimit(ocoId, coverSide, q, tp.Price);
                     if (EnableLogging)
-                        DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: OCO SL {tp.Quantity}@{slPriceToUse:F2} + TP {tp.Quantity}@{tp.Price:F2} (dir={(dir>0?"LONG":"SHORT")})");
+                        DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: OCO SL {q}@{slPriceToUse:F2} + TP {q}@{tp.Price:F2} (dir={(dir>0?"LONG":"SHORT")})");
                 }
 
                 _pendingAttach = false;
