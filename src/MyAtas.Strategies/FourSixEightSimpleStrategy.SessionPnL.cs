@@ -138,7 +138,9 @@ namespace MyAtas.Strategies
         {
             try
             {
-                foreach (var name in new[] { "AvgPrice", "AveragePrice", "AvgFillPrice", "Price" })
+                // Para Stop/Limit orders filled en REPLAY, AvgPrice/Price pueden ser 0
+                // Pero TriggerPrice (Stop orders) o Price (Limit orders) tienen el valor correcto
+                foreach (var name in new[] { "AvgPrice", "AveragePrice", "AvgFillPrice", "TriggerPrice", "Price" })
                 {
                     var p = order?.GetType().GetProperty(name);
                     if (p == null) continue;
