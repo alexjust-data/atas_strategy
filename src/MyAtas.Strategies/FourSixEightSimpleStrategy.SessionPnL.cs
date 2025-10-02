@@ -43,6 +43,97 @@ namespace MyAtas.Strategies
             }
         }
 
+        /// <summary>
+        /// Lee posición actual con NetQty y AvgPrice (copia de RiskManager.Manual.cs líneas 531-660)
+        /// </summary>
+        private (int NetQty, decimal AvgPrice) ReadPositionSnapshot()
+        {
+            try
+            {
+                if (Portfolio == null || Security == null)
+                    return (0, 0m);
+
+                // 0) PRIMERO: TradingManager.Position (CUENTA seleccionada)
+                try
+                {
+                    var tm = this.TradingManager;
+                    var tmPos = tm?.GetType().GetProperty("Position")?.GetValue(tm);
+                    if (tmPos != null)
+                    {
+                        int netQty = 0; decimal avgPrice = 0m;
+                        foreach (var name in new[] { "Net", "Amount", "Qty", "Position" })
+                        {
+                            var p = tmPos.GetType().GetProperty(name);
+                            if (p != null)
+                            {
+                                var v = p.GetValue(tmPos);
+                                if (v != null) { netQty = Convert.ToInt32(v); break; }
+                            }
+                        }
+                        foreach (var name in new[] { "AveragePrice", "AvgPrice", "EntryPrice", "Price" })
+                        {
+                            var p = tmPos.GetType().GetProperty(name);
+                            if (p != null)
+                            {
+                                var v = p.GetValue(tmPos);
+                                if (v != null) { avgPrice = Convert.ToDecimal(v); if (avgPrice > 0m) break; }
+                            }
+                        }
+                        if (EnableDetailedRiskLogging && (netQty != 0 || avgPrice > 0m))
+                            DebugLog.W("468/SNAP", $"TM.Position net={netQty} avg={avgPrice:F2}");
+                        return (netQty, avgPrice);
+                    }
+                } catch { /* fallback */ }
+
+                // 1) Portfolio.GetPosition(Security)
+                try
+                {
+                    var getPos = Portfolio.GetType().GetMethod("GetPosition", new[] { Security.GetType() });
+                    if (getPos != null)
+                    {
+                        var pos = getPos.Invoke(Portfolio, new object[] { Security });
+                        if (pos != null)
+                        {
+                            var netQty = 0;
+                            var avgPrice = 0m;
+
+                            foreach (var name in new[] { "Net", "Amount", "Qty", "Position" })
+                            {
+                                var p = pos.GetType().GetProperty(name);
+                                if (p != null)
+                                {
+                                    var v = p.GetValue(pos);
+                                    if (v != null) { netQty = Convert.ToInt32(v); break; }
+                                }
+                            }
+
+                            foreach (var name in new[] { "AveragePrice", "AvgPrice", "EntryPrice", "Price" })
+                            {
+                                var p = pos.GetType().GetProperty(name);
+                                if (p != null)
+                                {
+                                    var v = p.GetValue(pos);
+                                    if (v != null) { avgPrice = Convert.ToDecimal(v); if (avgPrice > 0m) break; }
+                                }
+                            }
+
+                            if (EnableDetailedRiskLogging && (netQty != 0 || avgPrice > 0m))
+                                DebugLog.W("468/SNAP", $"pos avgPrice={avgPrice:F2} net={netQty} (source=Portfolio.GetPosition)");
+                            return (netQty, avgPrice);
+                        }
+                    }
+                }
+                catch { /* seguir al fallback */ }
+
+                // Fallback final
+                return (0, 0m);
+            }
+            catch
+            {
+                return (0, 0m);
+            }
+        }
+
         private decimal ExtractAvgFillPriceFromOrder(Order order)
         {
             try

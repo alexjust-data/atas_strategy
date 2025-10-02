@@ -551,13 +551,48 @@ namespace MyAtas.Strategies
                         _postEntryFlatBlockUntil = DateTime.UtcNow.AddMilliseconds(Math.Max(AntiFlatMs * 2, 800));
                         DebugLog.W("468/ORD", $"POST-ENTRY FLAT BLOCK armed for {Math.Max(AntiFlatMs * 2, 800)}ms");
 
-                        // === Session P&L: Track position entry ===
+                        // === Session P&L: Track position entry (TRIPLE FALLBACK como RiskManager) ===
                         try
                         {
                             var filledQty = GetFilledQtyFromOrder(order);
-                            if (filledQty > 0 && _entryDir != 0 && _entryPrice > 0m)
+
+                            // Intentar obtener precio de entry de múltiples fuentes (igual que RiskManager.Manual.cs líneas 1103-1126)
+                            var entryPriceForTracking = _entryPrice; // Primero intentar desde _entryPrice (ya capturado)
+
+                            if (entryPriceForTracking <= 0m)
                             {
-                                TrackPositionEntry(_entryPrice, filledQty, _entryDir);
+                                // Fallback 1: Intentar desde el order directamente
+                                entryPriceForTracking = ExtractAvgFillPriceFromOrder(order);
+                                if (EnableDetailedRiskLogging && entryPriceForTracking > 0m)
+                                    DebugLog.W("468/PNL", $"Entry price from _entryPrice=0, using order avgPrice={entryPriceForTracking:F2}");
+                            }
+
+                            if (entryPriceForTracking <= 0m)
+                            {
+                                // Fallback 2: leer desde posición actual (ReadPositionSnapshot)
+                                var snapForEntry = ReadPositionSnapshot();
+                                entryPriceForTracking = snapForEntry.AvgPrice;
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"Entry price from order=0, trying position avgPrice={entryPriceForTracking:F2}");
+                            }
+
+                            if (entryPriceForTracking <= 0m)
+                            {
+                                // Fallback 3: usar precio de la última barra (mejor aproximación)
+                                entryPriceForTracking = GetLastPriceSafe();
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"Entry price from position=0, using last bar price={entryPriceForTracking:F2}");
+                            }
+
+                            // Ahora SÍ llamar a TrackPositionEntry si tenemos precio y qty válidos
+                            if (entryPriceForTracking > 0m && filledQty > 0 && _entryDir != 0)
+                            {
+                                TrackPositionEntry(entryPriceForTracking, filledQty, _entryDir);
+                            }
+                            else
+                            {
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"SKIP TrackPositionEntry: entryPx={entryPriceForTracking:F2} fillQty={filledQty} _entryDir={_entryDir}");
                             }
                         }
                         catch (Exception ex)
