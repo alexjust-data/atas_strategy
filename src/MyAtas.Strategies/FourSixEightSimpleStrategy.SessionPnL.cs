@@ -77,7 +77,7 @@ namespace MyAtas.Strategies
                 if (_sessionPositionQty != 0 && _entryPrice > 0m)
                 {
                     var lastPrice = GetLastPriceSafe();
-                    var tickValue = ResolveTickValueUSD();
+                    var tickValue = EffectiveTickValue > 0m ? EffectiveTickValue : 0.5m; // Usar EffectiveTickValue actualizado
                     var tickSize = InternalTickSize;
 
                     // P&L = (priceDiff / tickSize) × tickValue × abs(qty)
@@ -87,14 +87,14 @@ namespace MyAtas.Strategies
                     var ticks = priceDiff / tickSize;
                     unrealizedPnL = ticks * tickValue * Math.Abs(_sessionPositionQty);
 
-                    if (Math.Abs(unrealizedPnL) > 0.01m)
+                    if (EnableDetailedRiskLogging && Math.Abs(unrealizedPnL) > 0.01m)
                         DebugLog.W("468/PNL", $"Unrealized: qty={_sessionPositionQty} entry={_entryPrice:F2} last={lastPrice:F2} priceDiff={priceDiff:F2} ticks={ticks:F2} tickVal={tickValue:F2} → unrealized={unrealizedPnL:F2}");
                 }
 
                 // Session P&L = Realized + Unrealized
                 SessionPnL = _sessionRealizedPnL + unrealizedPnL;
 
-                if (Math.Abs(SessionPnL) > 0.01m || Math.Abs(unrealizedPnL) > 0.01m)
+                if (EnableDetailedRiskLogging && (Math.Abs(SessionPnL) > 0.01m || Math.Abs(unrealizedPnL) > 0.01m))
                     DebugLog.W("468/PNL", $"SessionPnL={SessionPnL:F2} (Realized={_sessionRealizedPnL:F2} Unrealized={unrealizedPnL:F2})");
             }
             catch (Exception ex)
@@ -116,7 +116,8 @@ namespace MyAtas.Strategies
                     // Nueva posición
                     _sessionPositionQty = qty * direction;  // signed: +LONG / -SHORT
                     // NO sobrescribir _entryPrice si ya tiene valor (fue capturado por UpdateEntryPriceFromOrder)
-                    DebugLog.W("468/PNL", $"Position entry: Price={entryPrice:F2} Qty={qty} Dir={direction} → Tracking started (using _entryPrice={_entryPrice:F2})");
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/PNL", $"Position entry: Price={entryPrice:F2} Qty={qty} Dir={direction} → Tracking started (using _entryPrice={_entryPrice:F2})");
                 }
                 else
                 {
@@ -124,7 +125,8 @@ namespace MyAtas.Strategies
                     var totalQty = Math.Abs(_sessionPositionQty) + Math.Abs(qty);
                     _entryPrice = (_entryPrice * Math.Abs(_sessionPositionQty) + entryPrice * Math.Abs(qty)) / totalQty;
                     _sessionPositionQty = totalQty * direction;
-                    DebugLog.W("468/PNL", $"Position add: NewEntry={entryPrice:F2} Qty={qty} → AvgEntry={_entryPrice:F2} TotalQty={totalQty}");
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/PNL", $"Position add: NewEntry={entryPrice:F2} Qty={qty} → AvgEntry={_entryPrice:F2} TotalQty={totalQty}");
                 }
             }
             catch (Exception ex)
@@ -142,11 +144,12 @@ namespace MyAtas.Strategies
             {
                 if (_sessionPositionQty == 0 || _entryPrice == 0m)
                 {
-                    DebugLog.W("468/PNL", "TrackPositionClose: No position tracked to close");
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/PNL", "TrackPositionClose: No position tracked to close");
                     return;
                 }
 
-                var tickValue = ResolveTickValueUSD();
+                var tickValue = EffectiveTickValue > 0m ? EffectiveTickValue : 0.5m; // Usar EffectiveTickValue actualizado
                 var tickSize = InternalTickSize;
 
                 // Calcular P&L de la porción cerrada
@@ -158,14 +161,16 @@ namespace MyAtas.Strategies
 
                 _sessionRealizedPnL += tradePnL;
 
-                DebugLog.W("468/PNL", $"Position close: Entry={_entryPrice:F2} Exit={exitPrice:F2} Qty={qty} Dir={direction} → P&L={tradePnL:F2} (Total Realized={_sessionRealizedPnL:F2})");
+                if (EnableDetailedRiskLogging)
+                    DebugLog.W("468/PNL", $"Position close: Entry={_entryPrice:F2} Exit={exitPrice:F2} Qty={qty} Dir={direction} → P&L={tradePnL:F2} (Total Realized={_sessionRealizedPnL:F2})");
 
                 // Actualizar posición restante
                 _sessionPositionQty = Math.Abs(_sessionPositionQty) - Math.Abs(qty);
                 if (_sessionPositionQty == 0)
                 {
                     // Posición completamente cerrada - NO resetear _entryPrice aquí porque puede haber otro trade en la sesión
-                    DebugLog.W("468/PNL", "Position fully closed");
+                    if (EnableDetailedRiskLogging)
+                        DebugLog.W("468/PNL", "Position fully closed");
                 }
             }
             catch (Exception ex)

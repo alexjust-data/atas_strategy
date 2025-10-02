@@ -195,30 +195,36 @@ namespace MyAtas.Strategies
 
         // ====================== RISK MANAGEMENT PARAMETERS ======================
 
-        // --- Position Sizing --- (HIDDEN: Will be migrated to external Risk Manager)
-        [Browsable(false)] // Hidden: External RM will handle position sizing
+        // --- Position Sizing ---
         [Category("Risk Management/Position Sizing"), DisplayName("Position Sizing Mode")]
+        [Description("Manual: usa Quantity fijo. FixedRiskUSD: calcula qty para arriesgar X USD. PercentAccount: calcula qty para arriesgar Y% de cuenta.")]
         public PositionSizingMode PositionSizingMode { get; set; } = PositionSizingMode.Manual;
 
-        [Browsable(false)]
         [Category("Risk Management/Position Sizing"), DisplayName("Risk per trade (USD)")]
+        [Description("USD que quieres arriesgar por trade cuando usas mode FixedRiskUSD")]
         public decimal RiskPerTradeUsd { get; set; } = 100.0m;
 
-        [Browsable(false)]
         [Category("Risk Management/Position Sizing"), DisplayName("Risk % of account")]
+        [Description("Porcentaje de la cuenta a arriesgar por trade cuando usas mode PercentAccount")]
         public decimal RiskPercentOfAccount { get; set; } = 0.5m;
 
-        [Browsable(false)]
-        [Category("Risk Management/Position Sizing"), DisplayName("Manual account equity override")]
+        [Category("Risk Management/Position Sizing"), DisplayName("Manual account equity override (USD)")]
+        [Description("Si >0, usa este valor como equity en lugar del detectado automáticamente")]
         public decimal ManualAccountEquityOverride { get; set; } = 0.0m;
 
-        [Browsable(false)]
-        [Category("Risk Management/Position Sizing"), DisplayName("Tick value overrides (SYM=V)")]
-        public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5";
+        [Category("Risk Management/Position Sizing"), DisplayName("Tick value overrides (SYM=V;...)")]
+        [Description("Tick values manuales por símbolo: MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10")]
+        public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10";
 
-        [Browsable(false)]
         [Category("Risk Management/Position Sizing"), DisplayName("Enable detailed risk logging")]
+        [Description("Activa logs detallados de cálculos de position sizing y risk management")]
         public bool EnableDetailedRiskLogging { get; set; } = false;
+
+        // --- Position Sizing Diagnostics (Read-only) ---
+        [Category("Risk Management/Position Sizing"), DisplayName("Account equity snapshot (USD)")]
+        [ReadOnly(true)]
+        [Description("Equity detectado automáticamente de la cuenta (actualizado cada 1s)")]
+        public decimal AccountEquitySnapshot { get; private set; } = 0m;
 
         // --- Breakeven ---
         [Category("Risk Management/Breakeven"), DisplayName("Breakeven mode")]
@@ -384,6 +390,9 @@ namespace MyAtas.Strategies
         // ====================== CORE ======================
         protected override void OnCalculate(int bar, decimal value)
         {
+            // --- Position Sizing: Actualizar equity y diagnostics periódicamente (1x/s) ---
+            UpdateAccountEquityPeriodically();
+
             // --- Session P&L: Inicializar equity la primera vez ---
             if (_sessionStartingEquity == 0m)
             {
@@ -391,17 +400,17 @@ namespace MyAtas.Strategies
                 if (ManualAccountEquityOverride > 0m)
                 {
                     _sessionStartingEquity = ManualAccountEquityOverride;
-                    DebugLog.W("468/PNL", $"Session started with OVERRIDE equity: {_sessionStartingEquity:F2} USD");
+                    if (EnableDetailedRiskLogging) DebugLog.W("468/PNL", $"Session started with OVERRIDE equity: {_sessionStartingEquity:F2} USD");
                 }
                 else if (EffectiveAccountEquity > 0m)
                 {
                     _sessionStartingEquity = EffectiveAccountEquity;
-                    DebugLog.W("468/PNL", $"Session started with effective equity: {_sessionStartingEquity:F2} USD");
+                    if (EnableDetailedRiskLogging) DebugLog.W("468/PNL", $"Session started with effective equity: {_sessionStartingEquity:F2} USD");
                 }
                 else
                 {
                     _sessionStartingEquity = 10000m;
-                    DebugLog.W("468/PNL", $"Session started with DEFAULT equity: {_sessionStartingEquity:F2} USD");
+                    if (EnableDetailedRiskLogging) DebugLog.W("468/PNL", $"Session started with DEFAULT equity: {_sessionStartingEquity:F2} USD");
                 }
             }
 

@@ -259,6 +259,20 @@ namespace MyAtas.Strategies
             _lastExecUid = _pending.Value.Uid;
             _pending = null;
 
+            // === Position Sizing: Calcular quantity basado en riesgo ===
+            // Necesitamos entry price y stop price para calcular
+            var entryPx = GetCandle(bar).Open; // Entry en apertura de N+1
+            var (slPx, tpList) = BuildBracketPrices(dir, signalBar, bar);
+
+            // Calcular quantity usando Position Sizing
+            var calculatedQty = CalculatePositionSize(entryPx, slPx, dir);
+
+            // Usar el qty calculado (overridea el qty que venía del parámetro)
+            qty = calculatedQty;
+
+            if (EnableDetailedRiskLogging)
+                DebugLog.W("468/SIZE", $"ExecuteEntry: mode={PositionSizingMode} entryPx={entryPx:F2} slPx={slPx:F2} dir={dir} → qty={qty}");
+
             DebugLog.Critical("468/ORD",
                 $"ENTRY SENT: dir={(dir>0?"Buy":"Sell")} qty={qty} bar={bar} (signal N={signalBar})");
 
