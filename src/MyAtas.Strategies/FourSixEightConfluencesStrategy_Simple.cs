@@ -608,13 +608,25 @@ namespace MyAtas.Strategies
                             var exitPrice = ExtractAvgFillPriceFromOrder(order);
                             var filledQty = GetFilledQtyFromOrder(order);
 
+                            if (EnableDetailedRiskLogging)
+                                DebugLog.W("468/PNL", $"TP/SL FILL detected: {comment} exitPrice={exitPrice:F2} filledQty={filledQty} _entryDir={_entryDir}");
+
                             // Fallback: si exitPrice es 0, usar order.Price
                             if (exitPrice <= 0m)
+                            {
                                 exitPrice = order.Price;
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"Using order.Price as fallback: {exitPrice:F2}");
+                            }
 
                             if (exitPrice > 0m && filledQty > 0 && _entryDir != 0)
                             {
                                 TrackPositionClose(exitPrice, filledQty, _entryDir);
+                            }
+                            else
+                            {
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"SKIP TrackPositionClose: exitPx={exitPrice:F2} fillQty={filledQty} _entryDir={_entryDir}");
                             }
                         }
                         catch (Exception ex)
