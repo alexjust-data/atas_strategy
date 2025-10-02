@@ -884,21 +884,20 @@ namespace MyAtas.Strategies
 
         private int GetFilledQtyFromOrder(object order)
         {
-            try
+            // Igual que RiskManager.Manual.cs ExtractFilledQty (línea 802-818)
+            foreach (var name in new[] { "Filled", "FilledQuantity", "Quantity", "QuantityToFill", "Volume", "Lots" })
             {
-                foreach (var name in new[] { "Filled", "FilledQuantity", "Executed", "QtyFilled" })
+                try
                 {
                     var p = order.GetType().GetProperty(name);
                     if (p == null) continue;
-                    var v = Math.Abs(Convert.ToDecimal(p.GetValue(order)));
-                    if (v > 0) return (int)Math.Round(v);
+                    var v = p.GetValue(order);
+                    if (v == null) continue;
+                    var q = Convert.ToInt32(v);
+                    if (q > 0) return q;
                 }
+                catch { }
             }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/POS", $"GetFilledQtyFromOrder failed: {ex.Message}");
-            }
-            DebugLog.W("468/POS", "GetNetPosition: returning 0 (no position found)");
             return 0;
         }
 
