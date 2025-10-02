@@ -1558,16 +1558,26 @@ namespace MyAtas.Strategies
                 }
 
                 // Armar el BE (vigilancia del TP trigger para mover SL a breakeven)
-                if (BreakEvenMode != RmBeMode.Off && plan.TakeProfits != null && plan.TakeProfits.Count > 0)
+                if (BreakEvenMode != RmBeMode.Off)
                 {
-                    var tpIdx = Math.Clamp(BeTriggerTp, 1, Math.Min(3, plan.TakeProfits.Count)) - 1;
-                    _beTargetPx = plan.TakeProfits[tpIdx].Price;  // precio objetivo que vamos a vigilar (virtual o real)
+                    // Calcular precio de TP basándonos en el R múltiple configurado (no en el array filtrado)
+                    var tpTrigger = Math.Clamp(BeTriggerTp, 1, 3);
+                    decimal tpRMultiple = tpTrigger == 1 ? TP1R : (tpTrigger == 2 ? TP2R : TP3R);
+
+                    // Calcular distancia R desde el stop
+                    var slPx = plan.StopLoss?.Price ?? 0m;
+                    var r = dir > 0 ? (entryPx - slPx) : (slPx - entryPx);
+                    if (r <= 0) r = tickSize; // fallback
+
+                    // Precio de TP = entry ± (R × múltiple)
+                    var tpPxRaw = entryPx + (dir > 0 ? (tpRMultiple * r) : -(tpRMultiple * r));
+                    _beTargetPx = ShrinkPrice(tpPxRaw);  // tick-safe
                     _beDirHint  = dir;
                     _beArmed    = true;
                     _beDone     = false;
 
                     if (EnableLogging)
-                        DebugLog.W("RM/BE", $"ARMED Ã¢â€ â€™ mode={BreakEvenMode} triggerTP={tpIdx + 1} tpPx={_beTargetPx:F2} dir={(_beDirHint>0?"LONG":"SHORT")}");
+                        DebugLog.W("RM/BE", $"ARMED → mode={BreakEvenMode} triggerTP={tpTrigger} R={tpRMultiple} tpPx={_beTargetPx:F2} dir={(_beDirHint>0?"LONG":"SHORT")}");
                 }
                 else
                 {
