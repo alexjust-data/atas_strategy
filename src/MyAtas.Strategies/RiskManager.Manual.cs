@@ -217,6 +217,11 @@ namespace MyAtas.Strategies
         // === Breakeven helpers ===
         private int _beDirHint = 0; // +1/-1 al armar (por si net no está disponible aún)
 
+        // Tracking de extremos desde el momento de armar BE (evita usar datos históricos de barra)
+        private decimal _beArmedAtPrice = 0m;  // Precio cuando se armó BE (baseline)
+        private decimal _beMaxReached = 0m;    // Máximo alcanzado DESPUÉS de armar BE
+        private decimal _beMinReached = 0m;    // Mínimo alcanzado DESPUÉS de armar BE
+
         private decimal ComputeBePrice(int dir, decimal entryPx, decimal tickSize)
         {
             var off = Math.Max(0, BeOffsetTicks) * tickSize;
@@ -463,6 +468,7 @@ namespace MyAtas.Strategies
             _pendingPrevBarIdxAtFill = -1;
             _pendingFillQty = 0;
             _beArmed = false; _beDone = false; _beTargetPx = 0m;
+            _beArmedAtPrice = _beMaxReached = _beMinReached = 0m;  // Limpiar tracking BE
             if (EnableLogging) DebugLog.W("RM/GATE", $"ResetAttachState: {reason}");
         }
 
@@ -1576,12 +1582,28 @@ namespace MyAtas.Strategies
                     _beArmed    = true;
                     _beDone     = false;
 
+                    // Capturar precio ACTUAL al armar BE (baseline para tracking)
+                    try
+                    {
+                        var currentCandle = GetCandle(Math.Max(0, CurrentBar - 1));
+                        _beArmedAtPrice = currentCandle?.Close ?? entryPx;
+                        _beMaxReached = 0m;  // Se inicializará en primer tick de GetLastPriceTriplet
+                        _beMinReached = 0m;
+                    }
+                    catch
+                    {
+                        _beArmedAtPrice = entryPx;
+                        _beMaxReached = 0m;
+                        _beMinReached = 0m;
+                    }
+
                     if (EnableLogging)
-                        DebugLog.W("RM/BE", $"ARMED → mode={BreakEvenMode} triggerTP={tpTrigger} R={tpRMultiple} tpPx={_beTargetPx:F2} dir={(_beDirHint>0?"LONG":"SHORT")}");
+                        DebugLog.W("RM/BE", $"ARMED → mode={BreakEvenMode} triggerTP={tpTrigger} R={tpRMultiple} tpPx={_beTargetPx:F2} baseline={_beArmedAtPrice:F2} dir={(_beDirHint>0?"LONG":"SHORT")}");
                 }
                 else
                 {
                     _beArmed = _beDone = false; _beTargetPx = 0m; _beDirHint = 0;
+                    _beArmedAtPrice = _beMaxReached = _beMinReached = 0m;
                 }
 
                 _pendingAttach = false;
@@ -1712,7 +1734,22 @@ namespace MyAtas.Strategies
             {
                 var barIdx = Math.Max(0, Math.Min(CurrentBar - 1, CurrentBar));
                 var c = GetCandle(barIdx);
-                if (c != null) return (c.Close, c.High, c.Low);
+                if (c == null) return (0m, 0m, 0m);
+
+                // Si BE no está armado, usar datos normales de barra
+                if (!_beArmed || _beArmedAtPrice == 0m)
+                    return (c.Close, c.High, c.Low);
+
+                // BE armado: trackear extremos DESDE que se armó (no usar datos históricos)
+                // Actualizar máximo/mínimo alcanzado DESPUÉS de armar
+                if (_beMaxReached == 0m) _beMaxReached = _beArmedAtPrice;  // Inicializar si es primer tick
+                if (_beMinReached == 0m) _beMinReached = _beArmedAtPrice;
+
+                // Trackear extremos desde baseline
+                _beMaxReached = Math.Max(_beMaxReached, c.High);
+                _beMinReached = Math.Min(_beMinReached, c.Low);
+
+                return (c.Close, _beMaxReached, _beMinReached);
             }
             catch { }
             return (0m, 0m, 0m);
