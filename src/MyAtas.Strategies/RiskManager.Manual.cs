@@ -13,7 +13,8 @@ namespace MyAtas.Strategies
 {
     // Enums externos para serializaciÃƒÂ³n correcta de ATAS
     public enum RmSizingMode { Manual, FixedRiskUSD, PercentAccount }
-    public enum RmBeMode { Off, OnTP1Touch, OnTP1Fill }
+    // Mantiene compat. binaria pero aclara intención:
+    public enum RmBeMode { Off, OnTPTouch, OnTPFill }
     public enum RmTrailMode { Off, BarByBar, TpToTp }
     public enum RmStopPlacement { ByTicks, PrevBarOppositeExtreme }  // modo de colocaciÃƒÂ³n del SL
     public enum RmPrevBarOffsetSide { Outside, Inside }              // NEW: lado del offset (fuera/dentro)
@@ -179,7 +180,7 @@ namespace MyAtas.Strategies
 
         // =================== Breakeven ===================
         [Category("Breakeven"), DisplayName("Mode")]
-        public RmBeMode BreakEvenMode { get; set; } = RmBeMode.OnTP1Touch;
+        public RmBeMode BreakEvenMode { get; set; } = RmBeMode.OnTPTouch;
 
         [Category("Breakeven"), DisplayName("BE trigger TP (1..3)")]
         [Description("Qué TP dispara el paso a breakeven (1, 2 o 3). Funciona también en modo virtual sin TP real.")]
@@ -222,8 +223,8 @@ namespace MyAtas.Strategies
             return dir > 0 ? ShrinkPrice(entryPx + off) : ShrinkPrice(entryPx - off);
         }
 
-        // REEMPLAZA todos los SL (propios) de cada OCO por un SL al precio 'newStopPx'.
-        // Para mantener los OCO con sus TPs, se cancela el SL antiguo y se reabre el SL con el MISMO OCO y qty.
+        // Mueve todos los SL a 'newStopPx' preservando TPs:
+        // 1) intenta MODIFICAR in-place; 2) si no se puede, cancela SL+TP y recrea ambos.
         private void MoveAllRmStopsTo(decimal newStopPx, string reason = "BE")
         {
             try
@@ -248,7 +249,7 @@ namespace MyAtas.Strategies
                         slsByOco[o.OCOGroup ?? ""] = o;
                 }
 
-                int replaced = 0;
+                int replaced = 0, recreated = 0, modified = 0;
                 foreach (var kv in tpsByOco)
                 {
                     var oco = kv.Key;
@@ -257,7 +258,15 @@ namespace MyAtas.Strategies
                     var qty = Math.Max(0, slOld.QuantityToFill);
                     if (qty <= 0) continue;
 
-                    try { CancelOrder(slOld); } catch { /* tolerante */ }
+                    // 1) MODIFICAR in-place si la API lo permite
+                    if (TryModifyStopInPlace(slOld, newStopPx)) { modified++; continue; }
+
+                    // 2) Fallback: cancelar SL+TP y recrear pareja completa
+                    var tpOld = kv.Value;
+                    var tpPx  = tpOld?.Price ?? 0m;
+                    var tpQty = Math.Max(0, tpOld?.QuantityToFill ?? 0);
+                    try { CancelOrder(slOld); } catch { }
+                    try { if (tpOld != null) CancelOrder(tpOld); } catch { }
 
                     var side = slOld.Direction; // ya es la cara "cover" correcta
                     var slNew = new Order
@@ -276,15 +285,129 @@ namespace MyAtas.Strategies
                     TrySetCloseOnTrigger(slNew);
                     OpenOrder(slNew);
                     replaced++;
+
+                    if (tpQty > 0 && tpPx > 0m)
+                    {
+                        var tpNew = new Order
+                        {
+                            Portfolio      = Portfolio,
+                            Security       = Security,
+                            Direction      = side,
+                            Type           = OrderTypes.Limit,
+                            Price          = tpPx,
+                            QuantityToFill = tpQty,
+                            OCOGroup       = oco,
+                            IsAttached     = true,
+                            Comment        = $"{OwnerPrefix}TP:{Guid.NewGuid():N}"
+                        };
+                        TrySetReduceOnly(tpNew);
+                        OpenOrder(tpNew);
+                        recreated++;
+                    }
                 }
 
                 if (EnableLogging)
-                    DebugLog.W("RM/BE", $"Moved SLs to {newStopPx:F2} (pairs updated={replaced}) reason={reason}");
+                    DebugLog.W("RM/BE", $"Moved SLs to {newStopPx:F2} (modified={modified} replaced={replaced} tpRecreated={recreated}) reason={reason}");
             }
             catch (Exception ex)
             {
                 DebugLog.W("RM/BE", $"MoveAllRmStopsTo EX: {ex.Message}");
             }
+        }
+
+        // Intenta modificar un STOP existente sin tocar su OCO (evita matar el TP).
+        private bool TryModifyStopInPlace(Order stopOrder, decimal newStopPx)
+        {
+            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"TryModifyStopInPlace ENTER: order={stopOrder?.Comment} oldTrigger={stopOrder?.TriggerPrice:F2} newTrigger={newStopPx:F2}");
+            try
+            {
+                var tm = this.TradingManager;
+                if (tm == null)
+                {
+                    if (EnableLogging) DebugLog.W("RM/BE/MOD", "TradingManager is NULL → return false");
+                    return false;
+                }
+
+                var tmt = tm.GetType();
+                if (EnableLogging) DebugLog.W("RM/BE/MOD", $"TradingManager type: {tmt.Name}");
+
+                // Escanear todos los métodos disponibles
+                var allMethods = tmt.GetMethods();
+                if (EnableLogging) DebugLog.W("RM/BE/MOD", $"TradingManager has {allMethods.Length} total methods");
+
+                foreach (var name in new[] { "ModifyOrder", "ChangeOrder", "UpdateOrder" })
+                {
+                    if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Searching for method: {name}");
+                    var matches = allMethods.Where(m => m.Name.Equals(name, StringComparison.OrdinalIgnoreCase)).ToList();
+                    if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Found {matches.Count} methods matching '{name}'");
+
+                    foreach (var mi in matches)
+                    {
+                        var ps = mi.GetParameters();
+                        if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Method {mi.Name} has {ps.Length} parameters: {string.Join(", ", ps.Select(p => $"{p.ParameterType.Name} {p.Name}"))}");
+
+                        // Firma simple: (Order, decimal triggerPrice)
+                        if (ps.Length == 2 && ps[0].ParameterType.IsAssignableFrom(stopOrder.GetType()) && ps[1].ParameterType == typeof(decimal))
+                        {
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"MATCH: Simple signature (Order, decimal) → invoking {mi.Name}");
+                            var result = mi.Invoke(tm, new object[] { stopOrder, newStopPx });
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Invocation result: {result} → return true");
+                            return true;
+                        }
+
+                        // Firma multi-parámetro: (Order oldOrder, Order newOrder, bool, bool)
+                        if (ps.Length >= 2 && ps.Length <= 6
+                            && ps[0].ParameterType.IsAssignableFrom(stopOrder.GetType())
+                            && ps[1].ParameterType.IsAssignableFrom(stopOrder.GetType()))
+                        {
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"MATCH: (Order, Order, ...) signature → creating modified order");
+
+                            // Crear orden modificada clonando la original
+                            var modifiedOrder = new Order
+                            {
+                                Portfolio      = stopOrder.Portfolio,
+                                Security       = stopOrder.Security,
+                                Direction      = stopOrder.Direction,
+                                Type           = stopOrder.Type,
+                                TriggerPrice   = newStopPx,  // ← AQUÍ EL NUEVO TRIGGER
+                                Price          = stopOrder.Price,
+                                QuantityToFill = stopOrder.QuantityToFill,
+                                OCOGroup       = stopOrder.OCOGroup,
+                                IsAttached     = stopOrder.IsAttached,
+                                Comment        = stopOrder.Comment
+                            };
+
+                            // Intentar copiar ReduceOnly si está disponible
+                            TrySetReduceOnly(modifiedOrder);
+                            TrySetCloseOnTrigger(modifiedOrder);
+
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Created modified order: trigger {stopOrder.TriggerPrice:F2} → {newStopPx:F2}");
+
+                            var args = new object[ps.Length];
+                            args[0] = stopOrder;       // oldOrder
+                            args[1] = modifiedOrder;   // newOrder con nuevo TriggerPrice
+                            for (int i = 2; i < ps.Length; i++)
+                            {
+                                args[i] = ps[i].ParameterType == typeof(bool) ? true
+                                       : (ps[i].HasDefaultValue ? ps[i].DefaultValue : null);
+                            }
+
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Args: oldOrder={stopOrder.Comment} newTrigger={newStopPx:F2} + {ps.Length-2} bools");
+                            var result = mi.Invoke(tm, args);
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Invocation result: {result} → return true");
+                            return true;
+                        }
+                    }
+                }
+
+                if (EnableLogging) DebugLog.W("RM/BE/MOD", "NO modify methods found → return false (will use cancel+recreate)");
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/BE/MOD", $"EXCEPTION: {ex.GetType().Name} - {ex.Message}");
+                if (EnableLogging && ex.InnerException != null) DebugLog.W("RM/BE/MOD", $"INNER: {ex.InnerException.Message}");
+            }
+            return false;
         }
 
         private RiskEngine _engine;
@@ -773,13 +896,14 @@ namespace MyAtas.Strategies
                 if (EnableLogging) DebugLog.W("RM/ERR", $"OnCalculate net/check EX: {ex.Message}");
             }
 
-            // 4) Limpia solo si realmente estamos "idle" (sin attach armado ni brackets)
+            // 4) Limpia solo si realmente estamos "idle" (sin attach armado/BE ni brackets) con hysteresis
             try
             {
                 var net = Math.Abs(ReadNetPosition());
-                var hasLive = HasLiveRmBrackets();
+                var hasLive = HasLiveRmBrackets(includeNone: true);
                 var justArmed = _pendingAttach && (DateTime.UtcNow - _lastAttachArmAt).TotalMilliseconds < (AttachProtectMs + 400);
-                if (net == 0 && !hasLive && !justArmed)
+                // No limpies si hay BE armado: evita desarmarlo por snapshots 0
+                if (!_beArmed && net == 0 && !hasLive && !justArmed)
                 {
                     ResetAttachState("flat idle");
                     if (_postCloseUntil < DateTime.UtcNow)
@@ -791,19 +915,30 @@ namespace MyAtas.Strategies
             // === BE por TOUCH de precio (funciona con TP real o virtual) ===
             try
             {
-                if (_beArmed && !_beDone && BreakEvenMode == RmBeMode.OnTP1Touch)
+                if (_beArmed && !_beDone && BreakEvenMode == RmBeMode.OnTPTouch)
                 {
                     var snap = ReadPositionSnapshot();
-                    if (Math.Abs(snap.NetQty) != 0 && _beTargetPx > 0m)
+                    // inPos robusto: acepta net de snapshot, net previo, o "en gracia" si Virtual BE
+                    var inPos = Math.Abs(snap.NetQty) != 0 || Math.Abs(_prevNet) != 0;
+                    if (!inPos && VirtualBreakEven) inPos = true;
+
+                    if (inPos && _beTargetPx > 0m)
                     {
                         var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
-                        var last = GetLastPriceSafe();
-                        var dir  = Math.Sign(snap.NetQty != 0 ? snap.NetQty : _beDirHint);
+                        var (last, hi, lo) = GetLastPriceTriplet();
+                        var dir = Math.Sign(snap.NetQty != 0 ? snap.NetQty : (_prevNet != 0 ? _prevNet : _beDirHint));
 
-                        var touched = dir > 0 ? (last >= _beTargetPx) : (last <= _beTargetPx);
+                        // Toque intrabar: LONG usa High, SHORT usa Low
+                        bool touched = dir > 0 ? (hi >= _beTargetPx) : (lo <= _beTargetPx);
+
+                        if (EnableLogging)
+                            DebugLog.W("RM/BE/TRACE",
+                                $"inPos={inPos} dir={(dir > 0 ? "LONG" : "SHORT")} tgt={_beTargetPx:F2} last={last:F2} hi={hi:F2} lo={lo:F2} touched={touched}");
+
                         if (touched)
                         {
-                            var bePx = ComputeBePrice(dir, snap.AvgPrice > 0m ? snap.AvgPrice : last, tickSize);
+                            var refPx = snap.AvgPrice > 0m ? snap.AvgPrice : last;
+                            var bePx = ComputeBePrice(dir, refPx, tickSize);
                             if (EnableLogging) DebugLog.W("RM/BE", $"TOUCH trigger @ {_beTargetPx:F2} Ã¢â€ â€™ move SL to BE {bePx:F2}");
                             MoveAllRmStopsTo(bePx, "BE touch");
                             _beDone = true;
@@ -930,7 +1065,7 @@ namespace MyAtas.Strategies
             // === BE por FILL real del TP ===
             try
             {
-                if (_beArmed && !_beDone && BreakEvenMode == RmBeMode.OnTP1Fill)
+                if (_beArmed && !_beDone && BreakEvenMode == RmBeMode.OnTPFill)
                 {
                     var c = order?.Comment ?? "";
                     var st = order.Status();
@@ -1561,8 +1696,20 @@ namespace MyAtas.Strategies
             catch { return 0m; }
         }
 
+        private (decimal Last, decimal High, decimal Low) GetLastPriceTriplet()
+        {
+            try
+            {
+                var barIdx = Math.Max(0, Math.Min(CurrentBar - 1, CurrentBar));
+                var c = GetCandle(barIdx);
+                if (c != null) return (c.Close, c.High, c.Low);
+            }
+            catch { }
+            return (0m, 0m, 0m);
+        }
+
         // ==== Helpers: RM brackets detection & cleanup ====
-        private bool HasLiveRmBrackets()
+        private bool HasLiveRmBrackets(bool includeNone = false)
         {
             try
             {
@@ -1575,7 +1722,8 @@ namespace MyAtas.Strategies
                     var st = o.Status();
                     // Consider LIVE only when actively working according to ATAS enum:
                     // Placed (working) or PartlyFilled (still has remainder). Ignore None/Filled/Canceled.
-                    if (!o.Canceled && (st == OrderStatus.Placed || st == OrderStatus.PartlyFilled))
+                    // Considera temporalmente "None" como working si así lo pedimos (latencia de registro)
+                    if (!o.Canceled && (st == OrderStatus.Placed || st == OrderStatus.PartlyFilled || (includeNone && st == OrderStatus.None)))
                         return true;
                 }
             }
