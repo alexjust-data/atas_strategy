@@ -140,6 +140,12 @@ namespace MyAtas.Strategies
         [Category("Position Sizing"), DisplayName("Account equity override (USD)")]
         public decimal AccountEquityOverride { get; set; } = 0m;
 
+        // === Session P&L Tracking ===
+        [Category("Position Sizing"), DisplayName("Session P&L (USD)")]
+        [System.ComponentModel.ReadOnly(true)]
+        [Description("Ganancia/pérdida acumulada desde que se activó la estrategia. Se resetea al desactivar.")]
+        public decimal SessionPnL { get; private set; } = 0m;
+
         [Category("Position Sizing"), DisplayName("Tick value overrides (SYM=V;...)")]
         public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10";
 
@@ -221,6 +227,12 @@ namespace MyAtas.Strategies
         private decimal _beArmedAtPrice = 0m;  // Precio cuando se armó BE (baseline)
         private decimal _beMaxReached = 0m;    // Máximo alcanzado DESPUÉS de armar BE
         private decimal _beMinReached = 0m;    // Mínimo alcanzado DESPUÉS de armar BE
+
+        // === Session P&L tracking ===
+        private decimal _sessionStartingEquity = 0m;  // Equity inicial al activar estrategia
+        private decimal _currentPositionEntryPrice = 0m;  // Precio promedio de entrada actual
+        private int _currentPositionQty = 0;  // Cantidad de posición actual (signed: +LONG / -SHORT)
+        private decimal _sessionRealizedPnL = 0m;  // P&L realizado acumulado desde activación
 
         private decimal ComputeBePrice(int dir, decimal entryPx, decimal tickSize)
         {
@@ -833,6 +845,31 @@ namespace MyAtas.Strategies
                 AccountEquitySnapshot = ReadAccountEquityUSD();
                 _nextEquityProbeAt = DateTime.UtcNow.AddSeconds(1);
                 if (EnableLogging) DebugLog.W("RM/SNAP", $"Equity≈{AccountEquitySnapshot:F2} USD");
+
+                // Inicializar session starting equity la primera vez
+                if (_sessionStartingEquity == 0m)
+                {
+                    // Priorizar AccountEquityOverride si está configurado
+                    if (AccountEquityOverride > 0m)
+                    {
+                        _sessionStartingEquity = AccountEquityOverride;
+                        if (EnableLogging) DebugLog.W("RM/PNL", $"Session started with OVERRIDE equity: {_sessionStartingEquity:F2} USD");
+                    }
+                    else if (AccountEquitySnapshot > 0m)
+                    {
+                        _sessionStartingEquity = AccountEquitySnapshot;
+                        if (EnableLogging) DebugLog.W("RM/PNL", $"Session started with detected equity: {_sessionStartingEquity:F2} USD");
+                    }
+                    else
+                    {
+                        // Último fallback: usar 10000 USD como base
+                        _sessionStartingEquity = 10000m;
+                        if (EnableLogging) DebugLog.W("RM/PNL", $"Session started with DEFAULT equity (no account data): {_sessionStartingEquity:F2} USD");
+                    }
+                }
+
+                // Actualizar Session P&L = Realized + Unrealized
+                UpdateSessionPnL();
             }
 
             // Heartbeat del estado de Stop-to-Flat (visible en logs)
@@ -1061,6 +1098,33 @@ namespace MyAtas.Strategies
                 if (EnableLogging)
                     DebugLog.W("RM/ORD", $"Manual order DETECTED Ã¢â€ â€™ pendingAttach=true | dir={_pendingDirHint} fillQty={_pendingFillQty} entryPx={_pendingEntryPrice:F2}");
 
+                // === Track position entry for P&L ===
+                // Intentar obtener precio de entry de múltiples fuentes
+                var entryPriceForTracking = _pendingEntryPrice;
+                if (entryPriceForTracking <= 0m)
+                {
+                    // Fallback 1: leer desde posición actual
+                    var snapForEntry = ReadPositionSnapshot();
+                    entryPriceForTracking = snapForEntry.AvgPrice;
+                    if (EnableLogging) DebugLog.W("RM/PNL", $"Entry price from order=0, trying position avgPrice={entryPriceForTracking:F2}");
+                }
+
+                if (entryPriceForTracking <= 0m)
+                {
+                    // Fallback 2: usar precio de la última barra (mejor aproximación)
+                    entryPriceForTracking = GetLastPriceSafe();
+                    if (EnableLogging) DebugLog.W("RM/PNL", $"Entry price from position=0, using last bar price={entryPriceForTracking:F2}");
+                }
+
+                if (entryPriceForTracking > 0m && _pendingFillQty > 0)
+                {
+                    TrackPositionEntry(entryPriceForTracking, _pendingFillQty, _pendingDirHint);
+                }
+                else
+                {
+                    if (EnableLogging) DebugLog.W("RM/PNL", $"SKIP TrackPositionEntry: entryPx={entryPriceForTracking:F2} fillQty={_pendingFillQty}");
+                }
+
                 TryAttachBracketsNow(); // intenta en el mismo tick; si el gate decide WAIT, ya lo reintentarÃƒÂ¡ OnCalculate
             }
             catch (Exception ex)
@@ -1092,6 +1156,50 @@ namespace MyAtas.Strategies
                 }
             }
             catch { /* tolerante */ }
+
+            // === Track TP/SL fills for P&L ===
+            try
+            {
+                var c = order?.Comment ?? "";
+                var st = order.Status();
+                if ((c.StartsWith(OwnerPrefix + "TP:") || c.StartsWith(OwnerPrefix + "SL:"))
+                    && (st == OrderStatus.Filled || st == OrderStatus.PartlyFilled))
+                {
+                    if (EnableLogging) DebugLog.W("RM/PNL", $"TP/SL fill detected: comment={c} status={st}");
+
+                    var exitPrice = ExtractAvgFillPrice(order);
+                    var filledQty = ExtractFilledQty(order);
+
+                    if (EnableLogging) DebugLog.W("RM/PNL", $"Exit details: price={exitPrice:F2} qty={filledQty}");
+
+                    // Fallback: si exitPrice es 0, usar order.Price
+                    if (exitPrice <= 0m)
+                    {
+                        exitPrice = order.Price;
+                        if (EnableLogging) DebugLog.W("RM/PNL", $"Using order.Price as fallback: {exitPrice:F2}");
+                    }
+
+                    if (exitPrice > 0m && filledQty > 0)
+                    {
+                        // Dirección: TP/SL son órdenes de cierre, así que están en dirección opuesta a la posición
+                        // Si fue LONG → TP/SL son SELL → dir original = +1
+                        // Si fue SHORT → TP/SL son BUY → dir original = -1
+                        var orderDir = ExtractDirFromOrder(order);
+                        var positionDir = -orderDir;  // invertir porque es orden de cierre
+
+                        if (EnableLogging) DebugLog.W("RM/PNL", $"Calling TrackPositionClose: exitPx={exitPrice:F2} qty={filledQty} dir={positionDir}");
+                        TrackPositionClose(exitPrice, filledQty, positionDir);
+                    }
+                    else
+                    {
+                        if (EnableLogging) DebugLog.W("RM/PNL", $"SKIP TrackPositionClose: exitPx={exitPrice:F2} qty={filledQty}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/PNL", $"Track TP/SL fill EX: {ex.Message}");
+            }
         }
 
         // New: capture newly seen orders too (fires when order is registered)
@@ -1167,6 +1275,14 @@ namespace MyAtas.Strategies
                 if (EnableLogging) DebugLog.W("RM/STOP", "OnStopped Ã¢â€ â€™ strategy stopped (final)");
                 _stopToFlat = false;
                 _rmStopGraceUntil = DateTime.MinValue;
+
+                // Reset Session P&L tracking
+                if (EnableLogging) DebugLog.W("RM/PNL", $"Session ended - Final P&L: {SessionPnL:F2} USD (Realized: {_sessionRealizedPnL:F2})");
+                _sessionStartingEquity = 0m;
+                _currentPositionEntryPrice = 0m;
+                _currentPositionQty = 0;
+                _sessionRealizedPnL = 0m;
+                SessionPnL = 0m;
             }
             catch { }
         }
@@ -2107,6 +2223,114 @@ namespace MyAtas.Strategies
             catch (Exception ex)
             {
                 DebugLog.W("RM/STOP", $"EnsureFlattenOutstanding EX: {ex.Message}");
+            }
+        }
+
+        // ====================== Session P&L Tracking ======================
+
+        private void UpdateSessionPnL()
+        {
+            try
+            {
+                // Usar nuestras variables de tracking internas en lugar de ReadPositionSnapshot()
+                // porque ReadPositionSnapshot() puede devolver 0 en replay/simulación
+                var currentQty = _currentPositionQty;
+                var avgPrice = _currentPositionEntryPrice;
+
+                // Calcular P&L no realizado de posición abierta
+                decimal unrealizedPnL = 0m;
+                if (currentQty != 0 && avgPrice > 0m)
+                {
+                    var lastPrice = GetLastPriceSafe();
+                    var tickValue = ResolveTickValueUSD();
+                    var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+
+                    // P&L = (LastPrice - AvgPrice) × Qty × (TickValue / TickSize)
+                    // Para SHORT: P&L = (AvgPrice - LastPrice) × Qty × (TickValue / TickSize)
+                    var priceDiff = currentQty > 0 ? (lastPrice - avgPrice) : (avgPrice - lastPrice);
+                    var ticks = priceDiff / tickSize;
+                    unrealizedPnL = ticks * tickValue * Math.Abs(currentQty);
+
+                    if (EnableLogging && Math.Abs(unrealizedPnL) > 0.01m)
+                        DebugLog.W("RM/PNL", $"Unrealized calc: currentQty={currentQty} entry={avgPrice:F2} last={lastPrice:F2} priceDiff={priceDiff:F2} ticks={ticks:F2} tickVal={tickValue:F2} → unrealized={unrealizedPnL:F2}");
+                }
+
+                // Session P&L = Realized + Unrealized
+                SessionPnL = _sessionRealizedPnL + unrealizedPnL;
+
+                if (EnableLogging && (Math.Abs(SessionPnL) > 0.01m || Math.Abs(unrealizedPnL) > 0.01m))
+                    DebugLog.W("RM/PNL", $"SessionPnL={SessionPnL:F2} (Realized={_sessionRealizedPnL:F2} Unrealized={unrealizedPnL:F2})");
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/PNL", $"UpdateSessionPnL EX: {ex.Message}");
+            }
+        }
+
+        private void TrackPositionClose(decimal exitPrice, int qty, int direction)
+        {
+            try
+            {
+                if (_currentPositionQty == 0 || _currentPositionEntryPrice == 0m)
+                {
+                    if (EnableLogging) DebugLog.W("RM/PNL", "TrackPositionClose: No position tracked to close");
+                    return;
+                }
+
+                var tickValue = ResolveTickValueUSD();
+                var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+
+                // Calcular P&L de la posición cerrada
+                // Para LONG: P&L = (ExitPrice - EntryPrice) × Qty × (TickValue / TickSize)
+                // Para SHORT: P&L = (EntryPrice - ExitPrice) × Qty × (TickValue / TickSize)
+                var priceDiff = direction > 0 ? (exitPrice - _currentPositionEntryPrice) : (_currentPositionEntryPrice - exitPrice);
+                var ticks = priceDiff / tickSize;
+                var tradePnL = ticks * tickValue * Math.Abs(qty);
+
+                _sessionRealizedPnL += tradePnL;
+
+                if (EnableLogging)
+                    DebugLog.W("RM/PNL", $"Position close: Entry={_currentPositionEntryPrice:F2} Exit={exitPrice:F2} Qty={qty} Dir={direction} → P&L={tradePnL:F2} (Total Realized={_sessionRealizedPnL:F2})");
+
+                // Actualizar posición actual
+                _currentPositionQty = Math.Abs(_currentPositionQty) - Math.Abs(qty);
+                if (_currentPositionQty == 0)
+                {
+                    _currentPositionEntryPrice = 0m;
+                    if (EnableLogging) DebugLog.W("RM/PNL", "Position fully closed");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionClose EX: {ex.Message}");
+            }
+        }
+
+        private void TrackPositionEntry(decimal entryPrice, int qty, int direction)
+        {
+            try
+            {
+                if (_currentPositionQty == 0)
+                {
+                    // Nueva posición
+                    _currentPositionEntryPrice = entryPrice;
+                    _currentPositionQty = qty * direction;  // signed: +LONG / -SHORT
+                    if (EnableLogging)
+                        DebugLog.W("RM/PNL", $"Position entry: Price={entryPrice:F2} Qty={qty} Dir={direction} → Tracking started");
+                }
+                else
+                {
+                    // Incremento de posición existente (promedio ponderado)
+                    var totalQty = Math.Abs(_currentPositionQty) + Math.Abs(qty);
+                    _currentPositionEntryPrice = (_currentPositionEntryPrice * Math.Abs(_currentPositionQty) + entryPrice * Math.Abs(qty)) / totalQty;
+                    _currentPositionQty = totalQty * direction;
+                    if (EnableLogging)
+                        DebugLog.W("RM/PNL", $"Position add: NewEntry={entryPrice:F2} Qty={qty} → AvgEntry={_currentPositionEntryPrice:F2} TotalQty={totalQty}");
+                }
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionEntry EX: {ex.Message}");
             }
         }
 
