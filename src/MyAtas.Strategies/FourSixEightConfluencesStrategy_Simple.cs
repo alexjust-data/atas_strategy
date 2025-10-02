@@ -208,8 +208,14 @@ namespace MyAtas.Strategies
         [Description("Porcentaje de la cuenta a arriesgar por trade cuando usas mode PercentAccount")]
         public decimal RiskPercentOfAccount { get; set; } = 0.5m;
 
-        [Category("Risk Management/Position Sizing"), DisplayName("Manual account equity override (USD)")]
-        [Description("Si >0, usa este valor como equity en lugar del detectado automáticamente")]
+        // --- Account Equity (igual que RiskManager.Manual.cs líneas 134-141) ---
+        [Category("Risk Management/Position Sizing"), DisplayName("Account equity (USD)")]
+        [ReadOnly(true)]
+        [Description("Equity detectado automáticamente de Portfolio (actualizado cada 1s)")]
+        public decimal AccountEquitySnapshot { get; private set; } = 0m;
+
+        [Category("Risk Management/Position Sizing"), DisplayName("Account equity override (USD)")]
+        [Description("Si >0, usa este valor en lugar del detectado automáticamente. Si 0, usa detección automática.")]
         public decimal ManualAccountEquityOverride { get; set; } = 0.0m;
 
         [Category("Risk Management/Position Sizing"), DisplayName("Tick value overrides (SYM=V;...)")]
@@ -219,12 +225,6 @@ namespace MyAtas.Strategies
         [Category("Risk Management/Position Sizing"), DisplayName("Enable detailed risk logging")]
         [Description("Activa logs detallados de cálculos de position sizing y risk management")]
         public bool EnableDetailedRiskLogging { get; set; } = false;
-
-        // --- Position Sizing Diagnostics (Read-only) ---
-        [Category("Risk Management/Position Sizing"), DisplayName("Account equity snapshot (USD)")]
-        [ReadOnly(true)]
-        [Description("Equity detectado automáticamente de la cuenta (actualizado cada 1s)")]
-        public decimal AccountEquitySnapshot { get; private set; } = 0m;
 
         // --- Breakeven ---
         [Category("Risk Management/Breakeven"), DisplayName("Breakeven mode")]
