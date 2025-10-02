@@ -252,6 +252,10 @@ namespace MyAtas.Strategies
         [ReadOnly(true)]
         public decimal EffectiveAccountEquity { get; private set; } = 10000.0m;
 
+        [Category("Risk Management/Diagnostics"), DisplayName("Session P&L (USD)")]
+        [ReadOnly(true)]
+        public decimal SessionPnL { get; private set; } = 0m;
+
         // ====================== EXTERNAL RISK MANAGEMENT INTEGRATION ======================
         [Category("Risk Management/Integration"), DisplayName("External risk controls SL/Trail")]
         public bool ExternalRiskControlsStops { get; set; } = false;
@@ -362,9 +366,48 @@ namespace MyAtas.Strategies
             }
         }
 
+        protected override void OnStopped()
+        {
+            try
+            {
+                DebugLog.Separator("STRATEGY STOPPED");
+                // Reset Session P&L tracking
+                ResetSessionPnL();
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/STR", $"OnStopped EX: {ex.Message}");
+            }
+            base.OnStopped();
+        }
+
         // ====================== CORE ======================
         protected override void OnCalculate(int bar, decimal value)
         {
+            // --- Session P&L: Inicializar equity la primera vez ---
+            if (_sessionStartingEquity == 0m)
+            {
+                // Priorizar ManualAccountEquityOverride si está configurado
+                if (ManualAccountEquityOverride > 0m)
+                {
+                    _sessionStartingEquity = ManualAccountEquityOverride;
+                    DebugLog.W("468/PNL", $"Session started with OVERRIDE equity: {_sessionStartingEquity:F2} USD");
+                }
+                else if (EffectiveAccountEquity > 0m)
+                {
+                    _sessionStartingEquity = EffectiveAccountEquity;
+                    DebugLog.W("468/PNL", $"Session started with effective equity: {_sessionStartingEquity:F2} USD");
+                }
+                else
+                {
+                    _sessionStartingEquity = 10000m;
+                    DebugLog.W("468/PNL", $"Session started with DEFAULT equity: {_sessionStartingEquity:F2} USD");
+                }
+            }
+
+            // --- Session P&L: Actualizar en tiempo real ---
+            UpdateSessionPnL();
+
             // --- Heartbeat ---
             try
             {
@@ -498,7 +541,44 @@ namespace MyAtas.Strategies
                         try { UpdateEntryPriceFromOrder(order); } catch { }
                         _postEntryFlatBlockUntil = DateTime.UtcNow.AddMilliseconds(Math.Max(AntiFlatMs * 2, 800));
                         DebugLog.W("468/ORD", $"POST-ENTRY FLAT BLOCK armed for {Math.Max(AntiFlatMs * 2, 800)}ms");
+
+                        // === Session P&L: Track position entry ===
+                        try
+                        {
+                            var filledQty = GetFilledQtyFromOrder(order);
+                            if (filledQty > 0 && _entryDir != 0 && _entryPrice > 0m)
+                            {
+                                TrackPositionEntry(_entryPrice, filledQty, _entryDir);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            DebugLog.W("468/PNL", $"TrackPositionEntry failed: {ex.Message}");
+                        }
                     }
+                    // Track TP/SL fills for P&L calculation
+                    else if (comment.StartsWith("468TP:") || comment.StartsWith("468SL:"))
+                    {
+                        try
+                        {
+                            var exitPrice = ExtractAvgFillPriceFromOrder(order);
+                            var filledQty = GetFilledQtyFromOrder(order);
+
+                            // Fallback: si exitPrice es 0, usar order.Price
+                            if (exitPrice <= 0m)
+                                exitPrice = order.Price;
+
+                            if (exitPrice > 0m && filledQty > 0 && _entryDir != 0)
+                            {
+                                TrackPositionClose(exitPrice, filledQty, _entryDir);
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            DebugLog.W("468/PNL", $"TrackPositionClose failed: {ex.Message}");
+                        }
+                    }
+
                     // Disparar BE por FILL de TP si está configurado
                     try { CheckBreakEvenTrigger_OnOrderChanged(order, status); } catch { }
 
