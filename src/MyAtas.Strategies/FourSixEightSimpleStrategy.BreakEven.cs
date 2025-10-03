@@ -285,5 +285,134 @@ namespace MyAtas.Strategies
             try { return (string)o?.GetType().GetProperty("OCOGroup")?.GetValue(o); }
             catch { return null; }
         }
+
+        // ====================== VIRTUAL BREAKEVEN ======================
+        // Hook: disparo por TOUCH de TP VIRTUAL calculado en R-multiples (no requiere orden TP real)
+        private void CheckVirtualBreakEvenTouch_OnCalculate(int bar)
+        {
+            try
+            {
+                // Solo procesar si modo es OnTPVirtualTouch
+                if (BreakevenMode != BreakevenMode.OnTPVirtualTouch)
+                {
+                    DebugLog.W("468/VBE", $"SKIP VBE: mode={BreakevenMode}");
+                    return;
+                }
+
+                // Si BE ya disparado, skip
+                if (_virtualBeDone)
+                {
+                    DebugLog.W("468/VBE", "SKIP VBE: already done");
+                    return;
+                }
+
+                // Si no hay trade activo, skip
+                if (!_tradeActive || _entryDir == 0)
+                {
+                    DebugLog.W("468/VBE", $"SKIP VBE: tradeActive={_tradeActive} dir={_entryDir}");
+                    return;
+                }
+
+                // Throttle: 1x por barra
+                if (bar == _virtualBeTouchBar)
+                {
+                    DebugLog.W("468/VBE", $"SKIP VBE: already handled bar={bar}");
+                    return;
+                }
+
+                // Throttle: tiempo mínimo entre checks
+                if (_virtualBeTouchAt != DateTime.MinValue && (DateTime.UtcNow - _virtualBeTouchAt).TotalMilliseconds < 250)
+                {
+                    DebugLog.W("468/VBE", "SKIP VBE: throttled");
+                    return;
+                }
+
+                // Si no está armado, skip (se arma en TryAttachBracketsNow tras crear brackets)
+                if (!_virtualBeArmed)
+                {
+                    DebugLog.W("468/VBE", "SKIP VBE: not armed yet (waiting for brackets)");
+                    return;
+                }
+
+                // Verificar touch del TP virtual
+                var cndl = GetCandle(bar);
+                bool touched = _entryDir > 0
+                    ? (cndl.High >= _virtualBeTargetPx)
+                    : (cndl.Low <= _virtualBeTargetPx);
+
+                DebugLog.W("468/VBE", $"TOUCH TEST: virtualTP={_virtualBeTargetPx:F2} barHL=[{cndl.Low:F2},{cndl.High:F2}] touched={touched}");
+
+                if (!touched) return;
+
+                // TOUCH DETECTADO → disparar BE
+                DebugLog.W("468/VBE", $"VIRTUAL TP TOUCH DETECTED: price={_virtualBeTargetPx:F2} bar={bar}");
+
+                if (ActivateBreakEven($"Virtual TP{VirtualBeTriggerTpIndex} touch"))
+                {
+                    _virtualBeTouchBar = bar;
+                    _virtualBeTouchAt = DateTime.UtcNow;
+                    _virtualBeDone = true;
+                }
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/VBE", $"CheckVirtualBreakEvenTouch EX: {ex.Message}");
+            }
+        }
+
+        // Calcula y arma el TP virtual basado en R-multiples
+        private void ArmVirtualBreakEven()
+        {
+            try
+            {
+                if (_entryPrice <= 0m)
+                {
+                    DebugLog.W("468/VBE", "ARM ABORT: _entryPrice=0");
+                    return;
+                }
+
+                // FIXED: Usar _virtualBeStopPx guardado en TryAttachBracketsNow (evita race condition con GetActiveSLs)
+                if (_virtualBeStopPx <= 0m)
+                {
+                    DebugLog.W("468/VBE", $"ARM ABORT: _virtualBeStopPx=0 (not set yet)");
+                    return;
+                }
+
+                // Calcular R (distancia entry → SL)
+                decimal r = _entryDir > 0
+                    ? (_entryPrice - _virtualBeStopPx)   // LONG: entry está arriba, SL abajo
+                    : (_virtualBeStopPx - _entryPrice);  // SHORT: SL arriba, entry abajo
+
+                if (r <= 0m)
+                {
+                    DebugLog.W("468/VBE", $"ARM ABORT: R={r:F2} (invalid)");
+                    return;
+                }
+
+                // Obtener R-multiple según VirtualBeTriggerTpIndex (1, 2, o 3)
+                decimal tpRMultiple = VirtualBeTriggerTpIndex switch
+                {
+                    1 => VirtualTp1R,
+                    2 => VirtualTp2R,
+                    3 => VirtualTp3R,
+                    _ => VirtualTp1R
+                };
+
+                // Calcular precio de TP virtual: entry ± (R × múltiple)
+                decimal tpPxRaw = _entryDir > 0
+                    ? _entryPrice + (tpRMultiple * r)
+                    : _entryPrice - (tpRMultiple * r);
+
+                _virtualBeTargetPx = RoundToTick(tpPxRaw);
+                _virtualBeArmed = true;
+                _virtualBeDone = false;
+
+                DebugLog.W("468/VBE", $"ARMED → entry={_entryPrice:F2} sl={_virtualBeStopPx:F2} R={r:F2} mult={tpRMultiple} → virtualTP={_virtualBeTargetPx:F2} (TP{VirtualBeTriggerTpIndex})");
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/VBE", $"ArmVirtualBreakEven EX: {ex.Message}");
+            }
+        }
     }
 }

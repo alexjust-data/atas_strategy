@@ -12,6 +12,7 @@
     <ProjectReference Include="..\MyAtas.Shared\MyAtas.Shared.csproj" />
     <ProjectReference Include="..\MyAtas.Indicators\MyAtas.Indicators.csproj" />
     <ProjectReference Include="..\MyAtas.Risk\MyAtas.Risk.csproj" />
+    <ProjectReference Include="..\MyAtas.Bridges\MyAtas.Bridges.csproj" />
   </ItemGroup>
 
   <ItemGroup>

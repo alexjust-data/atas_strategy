@@ -8,6 +8,7 @@ using ATAS.DataFeedsCore;
 using MyAtas.Shared;
 using MyAtas.Risk.Engine;
 using MyAtas.Risk.Models;
+using MyAtas.Bridges;
 
 namespace MyAtas.Strategies
 {
@@ -212,8 +213,25 @@ namespace MyAtas.Strategies
         [Category("Diagnostics"), DisplayName("Enable logging")]
         public bool EnableLogging { get; set; } = true;
 
+        // =================== MT5 Bridge ===================
+        [Category("MT5"), DisplayName("Bridge to MT5")]
+        public bool BridgeToMt5Enabled { get; set; } = true;
+
+        [Category("MT5"), DisplayName("MT5 Symbol (NQ)")]
+        public string Mt5SymbolNq { get; set; } = "NAS100.fs";
+
+        [Category("MT5"), DisplayName("MT5 Symbol (ES)")]
+        public string Mt5SymbolEs { get; set; } = "S&P.fs";
+
+        [Category("MT5"), DisplayName("Risk % (EA)")]
+        public double Mt5RiskPercent { get; set; } = 0.50; // 0.50% por trade
+
         // =================== Internal Helpers ===================
         private int _lastSeenBar = -1;
+
+        // ===== MT5 Bridge =====
+        private Mt5SocketClient _mt5;
+        private int _mt5Seq = 0;
 
         // === Breakeven: estado mínimo requerido por ResetAttachState / gates ===
         private bool   _beArmed     = false;
@@ -1236,6 +1254,18 @@ namespace MyAtas.Strategies
                 _rmStopGraceUntil = DateTime.MinValue;
                 _nextStopSweepAt   = DateTime.MinValue;
                 if (EnableLogging) DebugLog.W("RM/STOP", "Started Ã¢â€ â€™ reset stop-to-flat flags");
+
+                // MT5 Bridge: inicializar socket
+                if (BridgeToMt5Enabled && _mt5 == null)
+                {
+                    _mt5 = new Mt5SocketClient();
+                    _mt5.OnAckLine += (line) =>
+                    {
+                        if (EnableLogging) DebugLog.W("MT5/ACK", line);
+                        // Si quieres, aquí parseas el JSON de ACK y correlacionas clientOrderId
+                    };
+                    if (EnableLogging) DebugLog.W("MT5", "Socket ATAS→Gateway conectado.");
+                }
             }
             catch { }
         }
@@ -1260,6 +1290,14 @@ namespace MyAtas.Strategies
                 if (EnableLogging) DebugLog.W("RM/STOP", $"ClosePosition attempt (TM) result={tmClosed}");
                 // 3) Fallback garantizado: EnsureFlattenOutstanding no duplica y no-op si net==0
                 EnsureFlattenOutstanding("OnStopping");
+
+                // MT5 Bridge: cerrar socket
+                if (_mt5 != null)
+                {
+                    _mt5.Dispose();
+                    _mt5 = null;
+                    if (EnableLogging) DebugLog.W("MT5", "Socket ATAS→Gateway cerrado.");
+                }
             }
             catch (Exception ex)
             {
@@ -1539,6 +1577,60 @@ namespace MyAtas.Strategies
                     if (EnableLogging)
                         DebugLog.W("RM/PLAN", $"Built plan: totalQty={plan.TotalQty} stop={plan.StopLoss?.Price:F2} tps={plan.TakeProfits?.Count} reason={plan.Reason}");
                 }
+
+                // ======= MT5 BRIDGE: enviar entrada a MT5 por % de equity =======
+                try
+                {
+                    if (BridgeToMt5Enabled && _mt5 != null)
+                    {
+                        // 1) Determinar símbolo MT5 destino según el símbolo ATAS
+                        var src = Security?.ToString() ?? "";
+                        string dst = src.Contains("NQ", StringComparison.OrdinalIgnoreCase) ? Mt5SymbolNq : Mt5SymbolEs;
+
+                        // 2) SL que usará el EA para calcular lotes por % de cuenta
+                        double? slForEa = null;
+                        if (overrideStopPx.HasValue && overrideStopPx.Value > 0m)
+                            slForEa = (double)overrideStopPx.Value;
+                        else
+                        {
+                            // Fallback: usa un SL por defecto en ticks si no hubo override
+                            var fallbackTicks = Math.Max(1, DefaultStopTicks);
+                            var tickSizeDouble = Security?.TickSize != null ? (double)Security.TickSize : 0.25;
+                            var sign = dir > 0 ? -1 : +1;
+                            var raw = (double)entryPx + sign * fallbackTicks * tickSizeDouble;
+                            slForEa = raw;
+                        }
+
+                        // 3) Primer TP opcional (no es crítico para el EA)
+                        double? tpForEa = null;
+                        if (plan.TakeProfits != null && plan.TakeProfits.Count > 0)
+                            tpForEa = (double)plan.TakeProfits[0].Price;
+
+                        // 4) clientOrderId único
+                        string id = $"RM-{DateTime.UtcNow:yyyyMMdd-HHmmss-fff}-{_mt5Seq++:000}";
+
+                        // 5) Enviar; el EA ignorará qty_lots y calculará lotes con risk_mode="percentAccount"
+                        _mt5.SendNewMarketOrder(
+                            clientOrderId: id,
+                            symbolSrc: src,
+                            symbolDst: dst,
+                            dir: dir,
+                            slPrice: slForEa,
+                            tpPrice: tpForEa,
+                            riskMode: "percentAccount",
+                            riskValue: Mt5RiskPercent,
+                            comment: "ATAS468"
+                        );
+
+                        if (EnableLogging)
+                            DebugLog.W("MT5/SEND", $"NEW_ORDER {id} dir={(dir>0?"BUY":"SELL")} dst={dst} SL={slForEa:F2} TP={tpForEa?.ToString("F2") ?? "null"} risk%={Mt5RiskPercent}");
+                    }
+                }
+                catch (Exception ex)
+                {
+                    DebugLog.W("MT5/ERR", "SendNewMarketOrder EX: " + ex.Message);
+                }
+                // ======= /MT5 BRIDGE =======
 
                 // ===== "LA UI MANDA": Si EnforceManualQty está activo, usar ManualQty =====
                 var manualTarget = Math.Max(MinQty, ManualQty);

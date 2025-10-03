@@ -17,7 +17,7 @@ namespace MyAtas.Strategies
 
     // ====================== RISK MANAGEMENT ENUMS ======================
     public enum PositionSizingMode { Manual, FixedRiskUSD, PercentOfAccount }
-    public enum BreakevenMode { Disabled, Manual, OnTPFill }
+    public enum BreakevenMode { Disabled, Manual, OnTPFill, OnTPVirtualTouch }
 
     [DisplayName("468 – Simple Strategy (GL close + 2 confluences) - FIXED")]
     public partial class FourSixEightSimpleStrategy : ChartStrategy
@@ -59,7 +59,14 @@ namespace MyAtas.Strategies
             _entryPrice = 0m;
             _beLastTouchBar = -1;
             _beLastTouchAt = DateTime.MinValue;
-            DebugLog.W("468/POS", $"ATOMIC FLAT CLEANUP: {reason} → cleared fills/cache/childSign");
+            // Reset Virtual BE state
+            _virtualBeArmed = false;
+            _virtualBeDone = false;
+            _virtualBeTargetPx = 0m;
+            _virtualBeStopPx = 0m;
+            _virtualBeTouchBar = -1;
+            _virtualBeTouchAt = DateTime.MinValue;
+            DebugLog.W("468/POS", $"ATOMIC FLAT CLEANUP: {reason} → cleared fills/cache/childSign/virtualBE");
         }
 
         // --- Helper: ¿estado terminal? (no deben contarse como activos) ---
@@ -245,6 +252,23 @@ namespace MyAtas.Strategies
         [Category("Risk Management/Breakeven"), DisplayName("Trigger on TP3 touch/fill")]
         public bool TriggerOnTP3TouchFill { get; set; } = false;
 
+        // --- Virtual Breakeven ---
+        [Category("Risk Management/Breakeven"), DisplayName("Virtual BE: TP index (1-3)")]
+        [Description("Qué TP virtual dispara BE (1=TP1, 2=TP2, 3=TP3). Solo funciona con modo OnTPVirtualTouch.")]
+        public int VirtualBeTriggerTpIndex { get; set; } = 1;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Virtual BE: TP1 R-multiple")]
+        [Description("Distancia en R del TP1 virtual (ej: 1.0 = 1R desde entry).")]
+        public decimal VirtualTp1R { get; set; } = 1.0m;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Virtual BE: TP2 R-multiple")]
+        [Description("Distancia en R del TP2 virtual (ej: 2.0 = 2R desde entry).")]
+        public decimal VirtualTp2R { get; set; } = 2.0m;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Virtual BE: TP3 R-multiple")]
+        [Description("Distancia en R del TP3 virtual (ej: 3.0 = 3R desde entry).")]
+        public decimal VirtualTp3R { get; set; } = 3.0m;
+
         // --- Diagnostics (Read-only) ---
         [Category("Risk Management/Diagnostics"), DisplayName("Effective tick value (USD/tick)")]
         [ReadOnly(true)]
@@ -286,6 +310,15 @@ namespace MyAtas.Strategies
         [Category("Risk Management/Diagnostics"), DisplayName("Zombie-cancel guard (ms)")]
         [Description("Tiempo mínimo tras crear brackets durante el cual NO se permite cancelar por detección de zombie basado en net==0.")]
         public int ZombieCancelGuardMs { get; set; } = 4000;
+
+        // --- DEFERRAL DE FILLS SOSPECHOSOS ---
+        [Category("Risk Management/Diagnostics"), DisplayName("Min stop-fill age (ms)")]
+        [Description("Edad mínima de una orden SL/TP antes de aceptar su fill como real. Fills más jóvenes se difieren para confirmación.")]
+        public int MinStopFillAgeMs { get; set; } = 60;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("Fill confirm delay (ms)")]
+        [Description("Tiempo de espera para confirmar un fill sospechoso antes de procesarlo o descartarlo.")]
+        public int FillConfirmMs { get; set; } = 300;
 
         // ====================== EXTERNAL RISK MANAGEMENT INTEGRATION ======================
         [Category("Risk Management/Integration"), DisplayName("External risk controls SL/Trail")]
@@ -334,6 +367,28 @@ namespace MyAtas.Strategies
         // Cooldown management
         private int _cooldownUntilBar = -1;   // bar index hasta el que no se permite re-entrada
         private int _lastFlatBar = -1;        // último bar en el que quedamos planos
+
+        // ===== VIRTUAL BREAKEVEN =====
+        private bool _virtualBeArmed = false;           // true cuando se calcula TP virtual tras entrada
+        private bool _virtualBeDone = false;            // true cuando ya se disparó BE virtual
+        private decimal _virtualBeTargetPx = 0m;        // precio del TP virtual calculado (en R-multiples)
+        private decimal _virtualBeStopPx = 0m;          // precio del SL usado para calcular R
+        private int _virtualBeTouchBar = -1;            // bar donde se detectó touch (throttle 1x/bar)
+        private DateTime _virtualBeTouchAt = DateTime.MinValue; // timestamp throttle
+
+        // ===== DEFERRAL DE FILLS SOSPECHOSOS =====
+        private readonly Dictionary<string, DateTime> _orderBirth = new(); // comment → timestamp cuando pasa a Placed
+        private readonly Dictionary<string, SuspectFill> _suspectFills = new(); // comment → datos del fill sospechoso
+        private readonly HashSet<string> _processedFills = new(); // evitar doble procesamiento
+
+        private sealed class SuspectFill
+        {
+            public string Comment;
+            public int Qty;
+            public int DirSign;
+            public decimal Price;
+            public DateTime DeferUntil;
+        }
 
         private struct Pending { public Guid Uid; public int BarId; public int Dir; }
 
@@ -419,6 +474,9 @@ namespace MyAtas.Strategies
         // ====================== CORE ======================
         protected override void OnCalculate(int bar, decimal value)
         {
+            // === DEFERRAL: Procesar fills sospechosos PRIMERO ===
+            try { ProcessSuspectFills(); } catch { }
+
             // --- Position Sizing: Actualizar equity y diagnostics periódicamente (1x/s) ---
             UpdateAccountEquityPeriodically();
 
@@ -483,6 +541,14 @@ namespace MyAtas.Strategies
             }
             catch { /* best-effort */ }
 
+            // --- VIRTUAL BE TOUCH: comprobar si se ha tocado el TP virtual (solo si modo OnTPVirtualTouch) ---
+            try
+            {
+                if (_tradeActive && (_entryDir != 0))
+                    CheckVirtualBreakEvenTouch_OnCalculate(bar);
+            }
+            catch { /* best-effort */ }
+
             // --- Reconciliación controlada (1x por barra y fuera de anti-flat) ---
             if (EnableReconciliation && bar != _lastReconcileBar && IsFirstTickOf(bar))
             {
@@ -507,7 +573,8 @@ namespace MyAtas.Strategies
                                   (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds >= Math.Max(0, AntiFlatMs);
                     bool barsOk = (_antiFlatUntilBar < 0) || (bar > _antiFlatUntilBar);
 
-                    if (_tradeActive && netWD == 0 && !HasAnyActiveOrders() && timeOk && barsOk)
+                    // GATE: Bloquear flat cleanup si hay fills sospechosos pendientes
+                    if (_tradeActive && netWD == 0 && !HasAnyActiveOrders() && timeOk && barsOk && _suspectFills.Count == 0)
                     {
                         _tradeActive = false;
                         _bracketsPlaced = false;
@@ -520,6 +587,13 @@ namespace MyAtas.Strategies
                         _entryPrice = 0m;
                         _beLastTouchBar = -1;
                         _beLastTouchAt = DateTime.MinValue;
+                        // Reset Virtual BE state
+                        _virtualBeArmed = false;
+                        _virtualBeDone = false;
+                        _virtualBeTargetPx = 0m;
+                        _virtualBeStopPx = 0m;
+                        _virtualBeTouchBar = -1;
+                        _virtualBeTouchAt = DateTime.MinValue;
                         _flatStreak = 0;
                         _lastFlatRead = DateTime.MinValue;
                         DebugLog.W("468/ORD", "Trade lock RELEASED by watchdog (flat & no active orders)");
@@ -530,8 +604,9 @@ namespace MyAtas.Strategies
 
             // <<< PATCH 1: HEARTBEAT RELEASE (final) >>>
             // Libera sólo si TAMBIÉN NetByFills()==0 para evitar falsos planos tras parciales (TP1).
+            // GATE: Bloquear flat cleanup si hay fills sospechosos pendientes
             if (_tradeActive && !HasAnyActiveOrders() && GetNetPosition() == 0 && NetByFills() == 0
-                && DateTime.UtcNow >= _postEntryFlatBlockUntil)
+                && DateTime.UtcNow >= _postEntryFlatBlockUntil && _suspectFills.Count == 0)
             {
                 DebugLog.W("468/ORD",
                     $"FLAT CONFIRMED (heartbeat): net=0 netByFills=0 tpActive={CountActiveTPs()} slActive={CountActiveSLs()}");
@@ -544,6 +619,13 @@ namespace MyAtas.Strategies
                 // Reset BreakEven state
                 _breakevenApplied = false;
                 _entryPrice = 0m;
+                // Reset Virtual BE state
+                _virtualBeArmed = false;
+                _virtualBeDone = false;
+                _virtualBeTargetPx = 0m;
+                _virtualBeStopPx = 0m;
+                _virtualBeTouchBar = -1;
+                _virtualBeTouchAt = DateTime.MinValue;
                 _flatStreak = 0;
                 _lastFlatRead = DateTime.MinValue;
                 _lastFlatBar = CurrentBar;
@@ -568,6 +650,18 @@ namespace MyAtas.Strategies
                 var comment = order?.Comment ?? "no-comment";
                 var before  = _liveOrders.Count;
                 DebugLog.W("468/ORD", $"OnOrderChanged: {comment} status={status} state={state} active={isActive} liveCount={before}");
+
+                // === DEFERRAL: Marcar nacimiento cuando orden pasa a Placed ===
+                if (status == OrderStatus.Placed && (comment.StartsWith("468SL:") || comment.StartsWith("468TP:") || comment.StartsWith("468ENTRY:")))
+                {
+                    _orderBirth[comment] = DateTime.UtcNow;
+                }
+
+                // === DEFERRAL: Limpiar al terminar ===
+                if ((status == OrderStatus.Canceled || status == OrderStatus.Filled) && _orderBirth.ContainsKey(comment))
+                {
+                    _orderBirth.Remove(comment);
+                }
 
                 // Track order fills for enhanced position detection
                 if (status == OrderStatus.Filled || status == OrderStatus.PartlyFilled)
@@ -632,13 +726,53 @@ namespace MyAtas.Strategies
                     // Track TP/SL fills for P&L calculation
                     else if (comment.StartsWith("468TP:") || comment.StartsWith("468SL:"))
                     {
+                        // === DEFERRAL: Verificar edad del fill antes de procesar ===
+                        var now = DateTime.UtcNow;
+                        var bornAt = _orderBirth.TryGetValue(comment, out var t0) ? t0 : DateTime.MinValue;
+                        var ageMs = bornAt == DateTime.MinValue ? int.MaxValue : (int)(now - t0).TotalMilliseconds;
+
+                        // Evitar doble procesamiento
+                        if (_processedFills.Contains(comment))
+                        {
+                            if (EnableDetailedRiskLogging)
+                                DebugLog.W("468/ORD", $"SKIP duplicate fill processing: {comment}");
+                            return;
+                        }
+
+                        // SI el fill es demasiado joven → DEFERIR
+                        if (ageMs < MinStopFillAgeMs)
+                        {
+                            var filledQty = GetFilledQtyFromOrder(order);
+                            int sign;
+                            if (!_childSign.TryGetValue(comment, out sign))
+                                sign = comment.StartsWith("468ENTRY:") ? _entryDir : -_entryDir;
+
+                            _suspectFills[comment] = new SuspectFill
+                            {
+                                Comment = comment,
+                                Qty = Math.Abs(filledQty),
+                                DirSign = sign,
+                                Price = order.Price,
+                                DeferUntil = now.AddMilliseconds(Math.Max(100, FillConfirmMs))
+                            };
+
+                            // Congelar flat block hasta confirmación
+                            _postEntryFlatBlockUntil = DateTime.UtcNow.AddMilliseconds(
+                                Math.Max(FillConfirmMs, AntiFlatMs)
+                            );
+
+                            DebugLog.W("468/ORD", $"SUSPECT FILL deferred: {comment} age={ageMs}ms (<{MinStopFillAgeMs}ms) - will confirm in {FillConfirmMs}ms");
+                            return; // NO procesar TrackOrderFill ni P&L ni failsafe
+                        }
+
+                        // SI edad >= MinStopFillAgeMs → Procesar normalmente
                         try
                         {
                             var exitPrice = ExtractAvgFillPriceFromOrder(order);
                             var filledQty = GetFilledQtyFromOrder(order);
 
                             if (EnableDetailedRiskLogging)
-                                DebugLog.W("468/PNL", $"TP/SL FILL detected: {comment} exitPrice={exitPrice:F2} filledQty={filledQty} _entryDir={_entryDir}");
+                                DebugLog.W("468/PNL", $"TP/SL FILL detected: {comment} exitPrice={exitPrice:F2} filledQty={filledQty} _entryDir={_entryDir} age={ageMs}ms");
 
                             // Fallback: si exitPrice es 0, usar order.Price
                             if (exitPrice <= 0m)
@@ -657,6 +791,8 @@ namespace MyAtas.Strategies
                                 if (EnableDetailedRiskLogging)
                                     DebugLog.W("468/PNL", $"SKIP TrackPositionClose: exitPx={exitPrice:F2} fillQty={filledQty} _entryDir={_entryDir}");
                             }
+
+                            _processedFills.Add(comment);
                         }
                         catch (Exception ex)
                         {
@@ -667,27 +803,10 @@ namespace MyAtas.Strategies
                     // Disparar BE por FILL de TP si está configurado
                     try { CheckBreakEvenTrigger_OnOrderChanged(order, status); } catch { }
 
-                    // Failsafe: si un SL se llena, cancela cualquier TP activo (evita LIMITs huérfanos)
+                    // Failsafe: si un SL se llena, cancela todas las órdenes hijas del mismo trade (por stamp)
                     if ((comment.StartsWith("468SL:")) && (status == OrderStatus.Filled))
                     {
-                        int cancelled = 0;
-                        try
-                        {
-                            foreach (var o in _liveOrders)
-                            {
-                                if (o == null) continue;
-                                var st2 = o.Status();
-                                if ((o.Comment?.StartsWith("468TP:") ?? false)
-                                    && o.State == OrderStates.Active
-                                    && st2 != OrderStatus.Filled
-                                    && st2 != OrderStatus.Canceled)
-                                {
-                                    try { CancelOrder(o); cancelled++; } catch { }
-                                }
-                            }
-                        }
-                        catch { }
-                        DebugLog.W("468/ORD", $"SL filled -> TP failsafe CANCEL ALL: {cancelled}");
+                        CancelChildrenByStamp(comment);
                     }
                 }
                 else if (status == OrderStatus.Canceled)
@@ -746,6 +865,12 @@ namespace MyAtas.Strategies
                                 $"signalBar={_lastSignalBar} antiFlatMs={AntiFlatMs} confirmFlatReads={ConfirmFlatReads}");
                             _lastFlatRead = DateTime.MinValue;
                             DebugLog.W("468/STR", $"BRACKETS ATTACHED (from net={net})");
+
+                            // *** VIRTUAL BE: Armar DESPUÉS de crear brackets (ahora SL y entry están disponibles) ***
+                            if (BreakevenMode == BreakevenMode.OnTPVirtualTouch && !_virtualBeArmed)
+                            {
+                                ArmVirtualBreakEven();
+                            }
                         }
                         else
                         {
@@ -813,12 +938,14 @@ namespace MyAtas.Strategies
                     DebugLog.W("468/ORD", $"ANTI-FLAT: net=0 detected but not confirmed yet (streak={_flatStreak}, policy={AntiFlatPolicy})");
                 }
 
-                // <<< PHANTOM FIX: RELEASE INCONDICIONAL AL FINAL DE OnOrderChanged >>>
-                // *** CRÍTICO: Este es el lugar donde detectamos el net fantasma tras BE ***
-                if (_tradeActive && netNow == 0 && !HasAnyActiveOrders() && NetByFills() == 0)
+                // <<< DEFERRAL FIX: BLOQUE INCONDICIONAL DESACTIVADO >>>
+                // Este bloque causaba cleanup prematuro con fills fantasma, dejando órdenes huérfanas.
+                // La confirmación de flat ahora se hace SOLO vía watchdog/heartbeat con gates.
+                // GATE: Solo activar si NO hay fills sospechosos pendientes
+                if (_tradeActive && netNow == 0 && !HasAnyActiveOrders() && NetByFills() == 0 && _suspectFills.Count == 0)
                 {
                     DebugLog.W("468/ORD",
-                        $"FLAT CONFIRMED (OnOrderChanged): net=0 netByFills=0 tpActive={CountActiveTPs()} slActive={CountActiveSLs()}");
+                        $"FLAT CONFIRMED (OnOrderChanged): net=0 netByFills=0 tpActive={CountActiveTPs()} slActive={CountActiveSLs()} suspectFills={_suspectFills.Count}");
                     // *** PHANTOM FIX: Limpieza atómica completa ***
                     AtomicFlatCleanup("OnOrderChanged final check");
                     _lastFlatBar = CurrentBar;
@@ -1673,6 +1800,128 @@ namespace MyAtas.Strategies
             for (int i = 1; i <= last; i++)
                 rma = (rma * (len - 1) + GetCandle(i).Close) / len;
             return rma;
+        }
+
+        // ====================== DEFERRAL DE FILLS SOSPECHOSOS ======================
+
+        /// <summary>
+        /// Procesa fills sospechosos diferidos, confirmándolos o descartándolos según su estado actual
+        /// </summary>
+        private void ProcessSuspectFills()
+        {
+            if (_suspectFills.Count == 0) return;
+
+            var now = DateTime.UtcNow;
+            var toRemove = new List<string>();
+
+            foreach (var kv in _suspectFills)
+            {
+                var comm = kv.Key;
+                var suspect = kv.Value;
+
+                // Esperar hasta DeferUntil
+                if (now < suspect.DeferUntil) continue;
+
+                // Buscar orden actual en _liveOrders o this.Orders
+                var order = (_liveOrders?.FirstOrDefault(o => o?.Comment == comm))
+                            ?? this.Orders?.FirstOrDefault(o => o?.Comment == comm);
+
+                var st = order?.Status();
+
+                if (st == OrderStatus.Filled)
+                {
+                    // CONFIRMADO: El fill era real, procesar ahora
+                    try
+                    {
+                        // Procesar como fill real (P&L, netByFills, etc.)
+                        if (order != null)
+                        {
+                            TrackOrderFill(order, "Filled");
+
+                            var exitPrice = ExtractAvgFillPriceFromOrder(order);
+                            var filledQty = GetFilledQtyFromOrder(order);
+
+                            if (exitPrice <= 0m) exitPrice = order.Price;
+
+                            if (exitPrice > 0m && filledQty > 0 && _entryDir != 0)
+                            {
+                                TrackPositionClose(exitPrice, filledQty, _entryDir);
+                            }
+
+                            _processedFills.Add(comm);
+
+                            // Si es SL, ejecutar failsafe
+                            if (comm.StartsWith("468SL:"))
+                            {
+                                CancelChildrenByStamp(comm);
+                            }
+
+                            DebugLog.W("468/ORD", $"SUSPECT FILL confirmed: {comm} exitPrice={exitPrice:F2} qty={filledQty}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugLog.W("468/ORD", $"SUSPECT FILL confirm failed: {comm} - {ex.Message}");
+                    }
+
+                    toRemove.Add(comm);
+                }
+                else
+                {
+                    // DESCARTADO: No quedó en Filled, era un fill fantasma
+                    DebugLog.W("468/ORD", $"SUSPECT FILL dropped (phantom): {comm} finalState={st}");
+                    toRemove.Add(comm);
+                }
+            }
+
+            // Limpiar fills procesados/descartados
+            foreach (var k in toRemove)
+            {
+                _suspectFills.Remove(k);
+            }
+        }
+
+        /// <summary>
+        /// Extrae el timestamp del comment de una orden (ej: "468SL:145124:532dc5" → "145124")
+        /// </summary>
+        private static string ExtractStamp(string comment)
+        {
+            if (string.IsNullOrEmpty(comment)) return "";
+            var parts = comment.Split(':');
+            return parts.Length >= 2 ? parts[1] : "";
+        }
+
+        /// <summary>
+        /// Cancela todas las órdenes hijas (TP/SL) del mismo trade (mismo stamp) que el SL que se ejecutó
+        /// </summary>
+        private void CancelChildrenByStamp(string slComment)
+        {
+            var stamp = ExtractStamp(slComment);
+            if (string.IsNullOrEmpty(stamp)) return;
+
+            int cancelled = 0;
+            try
+            {
+                foreach (var o in _liveOrders.ToList())
+                {
+                    if (o == null) continue;
+
+                    var c2 = o.Comment ?? "";
+                    var st2 = o.Status();
+                    bool sameStamp = ExtractStamp(c2) == stamp;
+                    bool isChild = c2.StartsWith("468TP:") || c2.StartsWith("468SL:");
+                    bool nonTerminal = st2 != OrderStatus.Filled && st2 != OrderStatus.Canceled;
+
+                    if (isChild && sameStamp && nonTerminal)
+                    {
+                        try { CancelOrder(o); cancelled++; }
+                        catch { }
+                    }
+                }
+            }
+            catch { }
+
+            DebugLog.W("468/ORD", $"SL filled → CHILDREN CANCEL (stamp={stamp}): {cancelled}");
         }
     }
 }

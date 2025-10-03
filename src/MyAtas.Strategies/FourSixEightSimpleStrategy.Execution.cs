@@ -126,6 +126,9 @@ namespace MyAtas.Strategies
             // Marcar timestamp para guard anti-zombie
             _lastBracketsAttachedAt = DateTime.UtcNow;
 
+            // Guardar SL price para Virtual BE (evita race condition con GetActiveSLs)
+            _virtualBeStopPx = slPx;
+
             DebugLog.W("468/ORD", $"BRACKETS ATTACHED: tp={qtySplit.Count} sl={qtySplit.Count} total={totalQty} (SL={slPx:F2} | TPs={string.Join(",", tpList.Take(qtySplit.Count).Select(x=>x.ToString("F2")))})");
             DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Take(qtySplit.Count).Select(x=>x.ToString("F2")))} | Split=[{string.Join(",", qtySplit)}] | Total={totalQty}");
         }

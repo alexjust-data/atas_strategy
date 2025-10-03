@@ -231,10 +231,19 @@ namespace MyAtas.Strategies
                     var now = DateTime.UtcNow;
                     var msSinceBracketsAttached = (now - _lastBracketsAttachedAt).TotalMilliseconds;
 
+                    // *** BLINDAJE #1: Si netByFills indica posición real, NO es flat real → reset _flatSince ***
+                    if (fillsSum != 0)
+                    {
+                        DebugLog.W("468/STR", $"ZOMBIE CANCEL ABORTED: broker=0 but netByFills={fillsSum} → NOT FLAT (broker latency detected)");
+                        _flatSince = DateTime.MinValue; // CRITICAL: reset flat tracking
+                        return false; // no cancelar, reintenta
+                    }
+
                     // Guard period: NO cancelar si brackets recién creados
                     if (msSinceBracketsAttached < ZombieCancelGuardMs)
                     {
                         DebugLog.W("468/STR", $"ZOMBIE CANCEL SUPPRESSED: net=0 but brackets recently created ({msSinceBracketsAttached:F0}ms < guard {ZombieCancelGuardMs}ms) - likely broker latency");
+                        _flatSince = DateTime.MinValue; // CRITICAL: reset flat tracking durante guard
                         return false; // reintenta en próximo tick, sin cancelar
                     }
 
@@ -243,6 +252,16 @@ namespace MyAtas.Strategies
                         _flatSince = now;
 
                     var msFlatConfirmed = (now - _flatSince).TotalMilliseconds;
+
+                    // *** BLINDAJE #2: Limitar el tiempo máximo de flat tracking a 60 segundos ***
+                    // Si _flatSince es muy antiguo (>60s), resetear para evitar timestamps corruptos
+                    if (msFlatConfirmed > 60000)
+                    {
+                        DebugLog.W("468/STR", $"ZOMBIE CANCEL: _flatSince is stale ({msFlatConfirmed:F0}ms) → resetting to NOW");
+                        _flatSince = now;
+                        msFlatConfirmed = 0;
+                    }
+
                     if (msFlatConfirmed < 800) // Mínimo 800ms de flat continuo
                     {
                         DebugLog.W("468/STR", $"ZOMBIE CANCEL DELAYED: net=0 only for {msFlatConfirmed:F0}ms, waiting for confirmation...");
@@ -250,14 +269,22 @@ namespace MyAtas.Strategies
                     }
 
                     // OK, definitivamente son zombies
-                    DebugLog.W("468/STR", $"ZOMBIE CANCEL: broker=0 for {msFlatConfirmed:F0}ms but live orders present -> cancelling...");
+                    DebugLog.W("468/STR", $"ZOMBIE CANCEL: broker=0 for {msFlatConfirmed:F0}ms but live orders present → cancelling...");
                     CancelAllLiveActiveOrders();
                     DebugLog.W("468/STR", "RETRY NEXT TICK: keeping pending for re-check after zombie cancel");
                     return false; // reintenta en el próximo tick
                 }
                 else
                 {
-                    // Reset flat tracking si ya no estamos flat
+                    // Reset flat tracking si ya no estamos flat (broker reporta net!=0)
+                    _flatSince = DateTime.MinValue;
+                }
+
+                // *** BLINDAJE #3: TAMBIÉN resetear _flatSince si netByFills indica posición activa ***
+                // (protección adicional en caso de que broker=0 pero fills!=0 y NO hay live orders aún)
+                if (fillsSum != 0 && _flatSince != DateTime.MinValue)
+                {
+                    DebugLog.W("468/STR", $"FLAT TRACKING RESET: netByFills={fillsSum} → clearing stale _flatSince");
                     _flatSince = DateTime.MinValue;
                 }
 
