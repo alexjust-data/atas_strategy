@@ -110,18 +110,20 @@ namespace MyAtas.Strategies
             }
 
             // Reparto de cantidad entre TPs habilitados (p.ej., 3→[2,1] si enabled=2)
-            var qtySplit = SplitQtyForTPs(totalQty, enabled); // ya existe en tu código
+            var qtySplit = SplitQtyForTPs(totalQty, enabled);
 
-            for (int i = 0; i < enabled; i++)
+            // FIX: Iterar solo qtySplit.Count veces, no enabled veces
+            // Cuando totalQty < enabled, qtySplit tendrá menos elementos
+            for (int i = 0; i < qtySplit.Count; i++)
             {
-                int legQty = Math.Max(1, qtySplit[i]);
+                int legQty = qtySplit[i];
                 var oco = Guid.NewGuid().ToString("N");
                 SubmitStop(oco, coverSide, legQty, slPx);
                 SubmitLimit(oco, coverSide, legQty, tpList[i]);
             }
 
-            DebugLog.W("468/ORD", $"BRACKETS ATTACHED: tp={enabled} sl=1 total={totalQty} (SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))})");
-            DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))} | Split=[{string.Join(",", qtySplit)}] | Total={totalQty}");
+            DebugLog.W("468/ORD", $"BRACKETS ATTACHED: tp={qtySplit.Count} sl={qtySplit.Count} total={totalQty} (SL={slPx:F2} | TPs={string.Join(",", tpList.Take(qtySplit.Count).Select(x=>x.ToString("F2")))})");
+            DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Take(qtySplit.Count).Select(x=>x.ToString("F2")))} | Split=[{string.Join(",", qtySplit)}] | Total={totalQty}");
         }
 
         private (decimal slPx, List<decimal> tpList) BuildBracketPrices(int dir, int signalBar, int execBar)
@@ -172,9 +174,16 @@ namespace MyAtas.Strategies
         {
             var q = new List<int>();
             if (nTps <= 0) { q.Add(totalQty); return q; }
-            int baseQ = Math.Max(1, totalQty / nTps);
-            int rem = totalQty - baseQ * nTps;
-            for (int i = 0; i < nTps; i++) q.Add(baseQ + (i < rem ? 1 : 0));
+
+            // FIX: Cuando totalQty < nTps, crear solo totalQty brackets
+            // Ejemplo: totalQty=2, nTps=3 → crear solo 2 brackets [1,1]
+            int actualBrackets = Math.Min(totalQty, nTps);
+            int baseQ = totalQty / actualBrackets;
+            int rem = totalQty % actualBrackets;
+
+            for (int i = 0; i < actualBrackets; i++)
+                q.Add(baseQ + (i < rem ? 1 : 0));
+
             return q;
         }
 
