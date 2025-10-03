@@ -225,12 +225,40 @@ namespace MyAtas.Strategies
                 }
 
                 // Si net=0 pero hay órdenes activas "zombie", CANCELA en broker
+                // GUARD: NO cancelar si acabamos de crear brackets (protección anti-latencia)
                 if (portfolioNet == 0 && positionsNet == 0 && live)
                 {
-                    DebugLog.W("468/STR", "ZOMBIE CANCEL: broker=0 but live orders present -> cancelling...");
+                    var now = DateTime.UtcNow;
+                    var msSinceBracketsAttached = (now - _lastBracketsAttachedAt).TotalMilliseconds;
+
+                    // Guard period: NO cancelar si brackets recién creados
+                    if (msSinceBracketsAttached < ZombieCancelGuardMs)
+                    {
+                        DebugLog.W("468/STR", $"ZOMBIE CANCEL SUPPRESSED: net=0 but brackets recently created ({msSinceBracketsAttached:F0}ms < guard {ZombieCancelGuardMs}ms) - likely broker latency");
+                        return false; // reintenta en próximo tick, sin cancelar
+                    }
+
+                    // Confirmación de flat por tiempo continuo (evita spikes de latencia)
+                    if (_flatSince == DateTime.MinValue)
+                        _flatSince = now;
+
+                    var msFlatConfirmed = (now - _flatSince).TotalMilliseconds;
+                    if (msFlatConfirmed < 800) // Mínimo 800ms de flat continuo
+                    {
+                        DebugLog.W("468/STR", $"ZOMBIE CANCEL DELAYED: net=0 only for {msFlatConfirmed:F0}ms, waiting for confirmation...");
+                        return false;
+                    }
+
+                    // OK, definitivamente son zombies
+                    DebugLog.W("468/STR", $"ZOMBIE CANCEL: broker=0 for {msFlatConfirmed:F0}ms but live orders present -> cancelling...");
                     CancelAllLiveActiveOrders();
                     DebugLog.W("468/STR", "RETRY NEXT TICK: keeping pending for re-check after zombie cancel");
                     return false; // reintenta en el próximo tick
+                }
+                else
+                {
+                    // Reset flat tracking si ya no estamos flat
+                    _flatSince = DateTime.MinValue;
                 }
 
                 // Caso normal: bloquea si realmente hay net ≠ 0 o hay actividad

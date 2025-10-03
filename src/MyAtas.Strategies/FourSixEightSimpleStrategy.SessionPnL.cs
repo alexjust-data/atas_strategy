@@ -208,9 +208,17 @@ namespace MyAtas.Strategies
                 {
                     // Nueva posición
                     _sessionPositionQty = qty * direction;  // signed: +LONG / -SHORT
+
+                    // Actualizar contadores de trades
+                    TotalTrades++;
+                    if (direction > 0)
+                        LongTrades++;
+                    else
+                        ShortTrades++;
+
                     // NO sobrescribir _entryPrice si ya tiene valor (fue capturado por UpdateEntryPriceFromOrder)
                     if (EnableDetailedRiskLogging)
-                        DebugLog.W("468/PNL", $"Position entry: Price={entryPrice:F2} Qty={qty} Dir={direction} → Tracking started (using _entryPrice={_entryPrice:F2})");
+                        DebugLog.W("468/PNL", $"Position entry: Price={entryPrice:F2} Qty={qty} Dir={direction} → Tracking started (using _entryPrice={_entryPrice:F2}) [Trade #{TotalTrades}]");
                 }
                 else
                 {
@@ -254,8 +262,17 @@ namespace MyAtas.Strategies
 
                 _sessionRealizedPnL += tradePnL;
 
+                // Actualizar P&L separado por LONG/SHORT
+                if (direction > 0)
+                    LongPnL += tradePnL;
+                else
+                    ShortPnL += tradePnL;
+
                 if (EnableDetailedRiskLogging)
-                    DebugLog.W("468/PNL", $"Position close: Entry={_entryPrice:F2} Exit={exitPrice:F2} Qty={qty} Dir={direction} → P&L={tradePnL:F2} (Total Realized={_sessionRealizedPnL:F2})");
+                {
+                    DebugLog.W("468/PNL", $"P&L CALC: priceDiff={priceDiff:F2} tickSize={tickSize:F4} ticks={ticks:F2} tickValue={tickValue:F2} qty={Math.Abs(qty)}");
+                    DebugLog.W("468/PNL", $"Position close: Entry={_entryPrice:F2} Exit={exitPrice:F2} Qty={qty} Dir={direction} → P&L=${tradePnL:F2} (Total=${_sessionRealizedPnL:F2} | LONG=${LongPnL:F2} SHORT=${ShortPnL:F2})");
+                }
 
                 // Actualizar posición restante
                 _sessionPositionQty = Math.Abs(_sessionPositionQty) - Math.Abs(qty);
@@ -280,11 +297,16 @@ namespace MyAtas.Strategies
         {
             try
             {
-                DebugLog.W("468/PNL", $"Session ended - Final P&L: {SessionPnL:F2} USD (Realized: {_sessionRealizedPnL:F2})");
+                DebugLog.W("468/PNL", $"Session ended - Final: Trades={TotalTrades} (L={LongTrades} S={ShortTrades}) | P&L=${SessionPnL:F2} (L=${LongPnL:F2} S=${ShortPnL:F2})");
                 _sessionStartingEquity = 0m;
                 _sessionPositionQty = 0;
                 _sessionRealizedPnL = 0m;
                 SessionPnL = 0m;
+                TotalTrades = 0;
+                LongTrades = 0;
+                ShortTrades = 0;
+                LongPnL = 0m;
+                ShortPnL = 0m;
             }
             catch (Exception ex)
             {

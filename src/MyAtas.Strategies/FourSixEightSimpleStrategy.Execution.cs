@@ -105,6 +105,7 @@ namespace MyAtas.Strategies
             {
                 // Sin TPs activos → SL único por la qty completa
                 SubmitStop(null, coverSide, totalQty, slPx);
+                _lastBracketsAttachedAt = DateTime.UtcNow; // Guard anti-zombie
                 DebugLog.W("468/ORD", $"BRACKETS ATTACHED: tp=0 sl=1 total={totalQty} (SL-only @ {slPx:F2})");
                 return;
             }
@@ -121,6 +122,9 @@ namespace MyAtas.Strategies
                 SubmitStop(oco, coverSide, legQty, slPx);
                 SubmitLimit(oco, coverSide, legQty, tpList[i]);
             }
+
+            // Marcar timestamp para guard anti-zombie
+            _lastBracketsAttachedAt = DateTime.UtcNow;
 
             DebugLog.W("468/ORD", $"BRACKETS ATTACHED: tp={qtySplit.Count} sl={qtySplit.Count} total={totalQty} (SL={slPx:F2} | TPs={string.Join(",", tpList.Take(qtySplit.Count).Select(x=>x.ToString("F2")))})");
             DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Take(qtySplit.Count).Select(x=>x.ToString("F2")))} | Split=[{string.Join(",", qtySplit)}] | Total={totalQty}");

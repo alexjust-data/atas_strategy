@@ -262,6 +262,31 @@ namespace MyAtas.Strategies
         [ReadOnly(true)]
         public decimal SessionPnL { get; private set; } = 0m;
 
+        [Category("Risk Management/Diagnostics"), DisplayName("Total Trades")]
+        [ReadOnly(true)]
+        public int TotalTrades { get; private set; } = 0;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("LONG Trades")]
+        [ReadOnly(true)]
+        public int LongTrades { get; private set; } = 0;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("SHORT Trades")]
+        [ReadOnly(true)]
+        public int ShortTrades { get; private set; } = 0;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("LONG P&L (USD)")]
+        [ReadOnly(true)]
+        public decimal LongPnL { get; private set; } = 0m;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("SHORT P&L (USD)")]
+        [ReadOnly(true)]
+        public decimal ShortPnL { get; private set; } = 0m;
+
+        // --- ZOMBIE CANCEL GUARD ---
+        [Category("Risk Management/Diagnostics"), DisplayName("Zombie-cancel guard (ms)")]
+        [Description("Tiempo mínimo tras crear brackets durante el cual NO se permite cancelar por detección de zombie basado en net==0.")]
+        public int ZombieCancelGuardMs { get; set; } = 4000;
+
         // ====================== EXTERNAL RISK MANAGEMENT INTEGRATION ======================
         [Category("Risk Management/Integration"), DisplayName("External risk controls SL/Trail")]
         public bool ExternalRiskControlsStops { get; set; } = false;
@@ -301,6 +326,10 @@ namespace MyAtas.Strategies
         private readonly Dictionary<string, int> _orderFills = new(); // track our fills
         private readonly Dictionary<string, int> _childSign = new(); // robust sign tracking for fills
         private DateTime _postEntryFlatBlockUntil = DateTime.MinValue; // suprime confirmación de flat tras ENTRY
+
+        // Zombie cancel guards
+        private DateTime _lastBracketsAttachedAt = DateTime.MinValue; // cuándo terminamos de adjuntar brackets
+        private DateTime _flatSince = DateTime.MinValue;              // desde cuándo vemos net==0 de forma continua
 
         // Cooldown management
         private int _cooldownUntilBar = -1;   // bar index hasta el que no se permite re-entrada
