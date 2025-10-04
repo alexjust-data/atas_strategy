@@ -459,9 +459,23 @@ namespace MyAtas.Strategies
         public decimal AccountEquityOverride { get; set; } = 0m;
 
         // === Session P&L Tracking ===
+        [Category("Position Sizing"), DisplayName("Include unrealized in Session P&L")]
+        [Description("Si está activo, Session P&L incluye P&L no realizado (posición abierta). Si está inactivo, solo muestra P&L realizado.")]
+        public bool IncludeUnrealizedInSession { get; set; } = true;
+
+        [Category("Position Sizing"), DisplayName("Realized P&L (USD)")]
+        [System.ComponentModel.ReadOnly(true)]
+        [Description("P&L realizado (cerrado) desde que se activó la estrategia. Monótono, no 'baila'.")]
+        public decimal SessionPnLRealized => _sessionRealizedPnL;
+
+        [Category("Position Sizing"), DisplayName("Unrealized P&L (USD)")]
+        [System.ComponentModel.ReadOnly(true)]
+        [Description("P&L no realizado de la posición abierta actual. Este valor 'baila' con el mercado.")]
+        public decimal SessionUnrealized { get; private set; } = 0m;
+
         [Category("Position Sizing"), DisplayName("Session P&L (USD)")]
         [System.ComponentModel.ReadOnly(true)]
-        [Description("Ganancia/pÃ©rdida acumulada desde que se activÃ³ la estrategia. Se resetea al desactivar.")]
+        [Description("Total = Realized + Unrealized (si 'Include unrealized' está activo). Se resetea al desactivar.")]
         public decimal SessionPnL { get; private set; } = 0m;
 
         [Category("Position Sizing"), DisplayName("Tick value overrides (SYM=V;...)")]
@@ -3029,11 +3043,13 @@ namespace MyAtas.Strategies
                         DebugLog.W("RM/PNL", $"Unrealized calc: currentQty={currentQty} entry={avgPrice:F2} last={lastPrice:F2} priceDiff={priceDiff:F2} ticks={ticks:F2} tickVal={tickValue:F2} â†’ unrealized={unrealizedPnL:F2}");
                 }
 
-                // Session P&L = Realized + Unrealized
-                SessionPnL = _sessionRealizedPnL + unrealizedPnL;
+                // Actualizar propiedades separadas
+                SessionUnrealized = Math.Round(unrealizedPnL, 2);
+                SessionPnL = Math.Round(_sessionRealizedPnL
+                               + (IncludeUnrealizedInSession ? SessionUnrealized : 0m), 2);
 
                 if (EnableLogging && (Math.Abs(SessionPnL) > 0.01m || Math.Abs(unrealizedPnL) > 0.01m))
-                    DebugLog.W("RM/PNL", $"SessionPnL={SessionPnL:F2} (Realized={_sessionRealizedPnL:F2} Unrealized={unrealizedPnL:F2})");
+                    DebugLog.W("RM/PNL", $"SessionPnL={SessionPnL:F2} (Realized={_sessionRealizedPnL:F2} Unrealized={unrealizedPnL:F2} IncludeUnreal={IncludeUnrealizedInSession})");
             }
             catch (Exception ex)
             {
@@ -3066,12 +3082,19 @@ namespace MyAtas.Strategies
                 if (EnableLogging)
                     DebugLog.W("RM/PNL", $"Position close: Entry={_currentPositionEntryPrice:F2} Exit={exitPrice:F2} Qty={qty} Dir={direction} â†’ P&L={tradePnL:F2} (Total Realized={_sessionRealizedPnL:F2})");
 
-                // Actualizar posiciÃ³n actual
-                _currentPositionQty = Math.Abs(_currentPositionQty) - Math.Abs(qty);
-                if (_currentPositionQty == 0)
+                // Actualizar posición actual conservando el signo (LONG/SHORT)
+                var remainingAbs = Math.Abs(_currentPositionQty) - Math.Abs(qty);
+                if (remainingAbs <= 0)
                 {
+                    _currentPositionQty = 0;
                     _currentPositionEntryPrice = 0m;
                     if (EnableLogging) DebugLog.W("RM/PNL", "Position fully closed");
+                }
+                else
+                {
+                    var sign = Math.Sign(_currentPositionQty); // +1 long, -1 short
+                    _currentPositionQty = remainingAbs * sign;
+                    if (EnableLogging) DebugLog.W("RM/PNL", $"Position partially closed → remainingQty={_currentPositionQty}");
                 }
             }
             catch (Exception ex)
