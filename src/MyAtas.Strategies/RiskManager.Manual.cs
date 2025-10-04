@@ -16,12 +16,12 @@ using MyAtas.Risk.Models;
 
 namespace MyAtas.Strategies
 {
-    // Enums externos para serializaciÃƒÂ³n correcta de ATAS
+    // Enums externos para serializaciÃƒÆ’Ã‚Â³n correcta de ATAS
     public enum RmSizingMode { Manual, FixedRiskUSD, PercentAccount }
-    // Mantiene compat. binaria pero aclara intención:
+    // Mantiene compat. binaria pero aclara intenciÃ³n:
     public enum RmBeMode { Off, OnTPTouch, OnTPFill }
     public enum RmTrailMode { Off, BarByBar, TpToTp }
-    public enum RmStopPlacement { ByTicks, PrevBarOppositeExtreme }  // modo de colocaciÃƒÂ³n del SL
+    public enum RmStopPlacement { ByTicks, PrevBarOppositeExtreme }  // modo de colocaciÃƒÆ’Ã‚Â³n del SL
     public enum RmPrevBarOffsetSide { Outside, Inside }              // NEW: lado del offset (fuera/dentro)
 
     // --- Volatility floor (solo cuando no hay N-1) ---
@@ -58,7 +58,7 @@ namespace MyAtas.Strategies
             return (rList.ToArray(), sList.ToArray());
         }
 
-        // Reparte 'total' según 'splits' (% normalizados a 100). Último absorbe diferencia.
+        // Reparte 'total' segÃºn 'splits' (% normalizados a 100). Ãšltimo absorbe diferencia.
         public static int[] SplitQty(int total, int[] splits)
         {
             if (total <= 0 || splits == null || splits.Length == 0) return Array.Empty<int>();
@@ -77,9 +77,9 @@ namespace MyAtas.Strategies
                     remain -= q[i];
                 }
             }
-            // Ajuste anti-todo-en-cero: si sumó 0 pero total>0, pon 1 al último
+            // Ajuste anti-todo-en-cero: si sumÃ³ 0 pero total>0, pon 1 al Ãºltimo
             if (q.Sum() == 0 && total > 0) q[^1] = total;
-            // Ajuste si por redondeo sobrepasó:
+            // Ajuste si por redondeo sobrepasÃ³:
             var diff = q.Sum() - total;
             if (diff > 0) q[^1] = Math.Max(0, q[^1] - diff);
             return q;
@@ -128,9 +128,9 @@ namespace MyAtas.Strategies
         public event EventHandler Changed;
         void RaiseChanged() => Changed?.Invoke(this, EventArgs.Empty);
 
-        private TargetRow _tp1 = new TargetRow { Name = "TP1" };
-        private TargetRow _tp2 = new TargetRow { Name = "TP2" };
-        private TargetRow _tp3 = new TargetRow { Name = "TP3" };
+        private TargetRow _tp1 = new TargetRow { Name = "TP1", Active = true, R = 1m, Percent = 0 };
+        private TargetRow _tp2 = new TargetRow { Name = "TP2", Active = true, R = 2m, Percent = 50 };
+        private TargetRow _tp3 = new TargetRow { Name = "TP3", Active = true, R = 3m, Percent = 50 };
 
         public TargetsModel()
         {
@@ -195,7 +195,7 @@ namespace MyAtas.Strategies
         public string ToSummary()
         {
             var act = All().Where(r => r.Active && r.Percent > 0).OrderBy(r => r.R).ToList();
-            if (act.Count == 0) return "— sin targets —";
+            if (act.Count == 0) return "â€” sin targets â€”";
             return string.Join(" | ", act.Select(a => $"{a.Percent}% @ {a.R}R"));
         }
         public void NormalizePercents()
@@ -274,7 +274,7 @@ namespace MyAtas.Strategies
                 }
                 catch
                 {
-                    // Último recurso: 100% @ 1R
+                    // Ãšltimo recurso: 100% @ 1R
                     model.TP1.Active = true; model.TP1.R = 1m; model.TP1.Percent = 100;
                     return model;
                 }
@@ -380,7 +380,7 @@ namespace MyAtas.Strategies
                 {
                     var bs = (BindingSource)_grid.DataSource; var r = (BindingList<TargetRow>)bs.DataSource;
                     var act = r.Where(x=>x.Active && x.Percent>0).ToList();
-                    if (act.Count == 0) { MessageBox.Show("Activa al menos un target (>0%).", "Validación", MessageBoxButtons.OK, MessageBoxIcon.Warning); e.Cancel = true; return; }
+                    if (act.Count == 0) { MessageBox.Show("Activa al menos un target (>0%).", "ValidaciÃ³n", MessageBoxButtons.OK, MessageBoxIcon.Warning); e.Cancel = true; return; }
                     var sum = act.Sum(x=>x.Percent);
                     if (sum != 100) {
                         for (int i=0;i<act.Count;i++) act[i].Percent = (int)Math.Round(100m*act[i].Percent/Math.Max(1,sum));
@@ -396,7 +396,7 @@ namespace MyAtas.Strategies
         }
     }
 
-    // Nota: esqueleto "safe". No envÃ¯Â¿Â½a ni cancela Ã¯Â¿Â½rdenes.
+    // Nota: esqueleto "safe". No envÃƒÂ¯Ã‚Â¿Ã‚Â½a ni cancela ÃƒÂ¯Ã‚Â¿Ã‚Â½rdenes.
     public class RiskManagerManualStrategy : ChartStrategy
     {
         // =================== Activation ===================
@@ -413,14 +413,14 @@ namespace MyAtas.Strategies
         public string OwnerPrefix { get; set; } = "RM:";
 
         [Category("Activation"), DisplayName("Enforce manual qty on entry")]
-        [Description("Si la entrada manual ejecuta menos contratos que el objetivo calculado por el RM, la estrategia enviarÃƒÂ¡ una orden a mercado por la diferencia (delta).")]
+        [Description("Si la entrada manual ejecuta menos contratos que el objetivo calculado por el RM, la estrategia enviarÃƒÆ’Ã‚Â¡ una orden a mercado por la diferencia (delta).")]
         public bool EnforceManualQty { get; set; } = true;
 
         [Category("Position Sizing"), DisplayName("Mode")]
-        public RmSizingMode SizingMode { get; set; } = RmSizingMode.Manual;
+        public RmSizingMode SizingMode { get; set; } = RmSizingMode.FixedRiskUSD;
 
         [Category("Position Sizing"), DisplayName("Manual qty")]
-        [Description("Cantidad objetivo de la ESTRATEGIA. Si difiere de la qty del ChartTrader y 'Enforce manual qty' estÃƒÂ¡ activo, el RM ajustarÃƒÂ¡ con orden a mercado.")]
+        [Description("Cantidad objetivo de la ESTRATEGIA. Si difiere de la qty del ChartTrader y 'Enforce manual qty' estÃƒÆ’Ã‚Â¡ activo, el RM ajustarÃƒÆ’Ã‚Â¡ con orden a mercado.")]
         public int ManualQty { get; set; } = 1;
 
         [Category("Position Sizing"), DisplayName("Risk per trade (USD)")]
@@ -429,15 +429,12 @@ namespace MyAtas.Strategies
         [Category("Position Sizing"), DisplayName("Risk % of account")]
         public decimal RiskPercentOfAccount { get; set; } = 0.5m;
 
-        [Browsable(false)]
         [Category("Position Sizing"), DisplayName("Default stop (ticks)")]
         public int DefaultStopTicks { get; set; } = 12;
 
-        [Browsable(false)]
         [Category("Position Sizing"), DisplayName("Fallback tick size")]
         public decimal FallbackTickSize { get; set; } = 0.25m;
 
-        [Browsable(false)]
         [Category("Position Sizing"), DisplayName("Fallback tick value (USD)")]
         public decimal FallbackTickValueUsd { get; set; } = 12.5m;
 
@@ -462,67 +459,10 @@ namespace MyAtas.Strategies
         public decimal AccountEquityOverride { get; set; } = 0m;
 
         // === Session P&L Tracking ===
-        [Category("Diagnostics/Session stats"), DisplayName("Session P&L (USD)")]
+        [Category("Position Sizing"), DisplayName("Session P&L (USD)")]
         [System.ComponentModel.ReadOnly(true)]
-        [Description("Ganancia/pérdida acumulada desde que se activó la estrategia. Se resetea al desactivar.")]
+        [Description("Ganancia/pÃ©rdida acumulada desde que se activÃ³ la estrategia. Se resetea al desactivar.")]
         public decimal SessionPnL { get; private set; } = 0m;
-
-        // ===== Session Stats (UI) =====
-        [Category("Diagnostics/Session stats"), DisplayName("Win trades"), System.ComponentModel.ReadOnly(true)]
-        public int WinTrades => _wins;
-        [Category("Diagnostics/Session stats"), DisplayName("Loss trades"), System.ComponentModel.ReadOnly(true)]
-        public int LossTrades => _losses;
-        [Category("Diagnostics/Session stats"), DisplayName("Breakeven trades"), System.ComponentModel.ReadOnly(true)]
-        public int BreakevenTrades => _breakevens;
-
-        [Category("Diagnostics/Session stats"), DisplayName("Win rate (%)"), System.ComponentModel.ReadOnly(true)]
-        public decimal WinRatePct => (WinTrades + LossTrades) > 0
-            ? Math.Round(100m * WinTrades / (WinTrades + LossTrades), 2)
-            : 0m;
-
-        [Category("Diagnostics/Session stats"), DisplayName("Best trade (USD)"), System.ComponentModel.ReadOnly(true)]
-        public decimal BestTradeUsd => _bestTrade;
-        [Category("Diagnostics/Session stats"), DisplayName("Worst trade (USD)"), System.ComponentModel.ReadOnly(true)]
-        public decimal WorstTradeUsd => _worstTrade;
-
-        [Category("Diagnostics/Session stats"), DisplayName("Avg trade (USD)"), System.ComponentModel.ReadOnly(true)]
-        public decimal AvgTradeUsd => (WinTrades + LossTrades + BreakevenTrades) > 0
-            ? Math.Round(_sumTradeUsd / (WinTrades + LossTrades + BreakevenTrades), 2)
-            : 0m;
-
-        [Category("Diagnostics/Session stats"), DisplayName("Expectancy / trade (USD)"), System.ComponentModel.ReadOnly(true)]
-        public decimal ExpectancyUsd
-        {
-            get
-            {
-                var wins = WinTrades; var losses = LossTrades;
-                if (wins + losses == 0) return 0m;
-                var avgWin  = wins   > 0 ? (_sumWinsUsd  / wins)   : 0m;
-                var avgLoss = losses > 0 ? (_sumLossUsd / losses)  : 0m;
-                var p       = WinRatePct / 100m;
-                return Math.Round(p * avgWin - (1m - p) * Math.Abs(avgLoss), 2);
-            }
-        }
-
-        [Category("Diagnostics/Session stats"), DisplayName("Max drawdown (USD)"), System.ComponentModel.ReadOnly(true)]
-        public decimal MaxDrawdownUsd { get; private set; } = 0m;
-
-        [Category("Diagnostics/Session stats"), DisplayName("LONG P&L (USD)"), System.ComponentModel.ReadOnly(true)]
-        public decimal LongPnL { get => _longPnL; private set => _longPnL = value; }
-        [Category("Diagnostics/Session stats"), DisplayName("SHORT P&L (USD)"), System.ComponentModel.ReadOnly(true)]
-        public decimal ShortPnL { get => _shortPnL; private set => _shortPnL = value; }
-
-        [Category("Diagnostics/Session stats"), DisplayName("Total R (∑R)"), System.ComponentModel.ReadOnly(true)]
-        public decimal TotalR => Math.Round(_totalR, 2);
-        [Category("Diagnostics/Session stats"), DisplayName("Avg R / trade"), System.ComponentModel.ReadOnly(true)]
-        public decimal AvgR => (WinTrades + LossTrades + BreakevenTrades) > 0
-            ? Math.Round(_totalR / (WinTrades + LossTrades + BreakevenTrades), 3)
-            : 0m;
-
-        [Category("Diagnostics/Session stats"), DisplayName("Avg hold (s)"), System.ComponentModel.ReadOnly(true)]
-        public int AvgHoldSeconds => (WinTrades + LossTrades + BreakevenTrades) > 0
-            ? (int)Math.Round(_sumHold.TotalSeconds / (WinTrades + LossTrades + BreakevenTrades))
-            : 0;
 
         [Category("Position Sizing"), DisplayName("Tick value overrides (SYM=V;...)")]
         public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10";
@@ -592,7 +532,7 @@ namespace MyAtas.Strategies
                     int p2 = n >= 2 ? Math.Max(0, act[1].Percent) : 0;
                     int p3 = n >= 3 ? Math.Max(0, act[2].Percent) : 0;
 
-                    // Normaliza a 100 (último absorbe)
+                    // Normaliza a 100 (Ãºltimo absorbe)
                     var list = new System.Collections.Generic.List<int> { p1, p2, p3 }.GetRange(0, n);
                     var sum = list.Sum();
                     if (sum != 100 && n > 0)
@@ -660,10 +600,10 @@ namespace MyAtas.Strategies
         {
             if (!VolFloorEnabled || tickSize <= 0m || overrideStopPx == null) return;
 
-            // ¿Se usó N porque no había N-1 en el momento del fill?
+            // Â¿Se usÃ³ N porque no habÃ­a N-1 en el momento del fill?
             bool usedN = (_pendingAnchorBarAtFill >= 0 && _pendingPrevBarIdxAtFill >= 0)
                             ? _pendingAnchorBarAtFill != _pendingPrevBarIdxAtFill
-                            : true; // si no tenemos tracking claro, tratar como "usó N"
+                            : true; // si no tenemos tracking claro, tratar como "usÃ³ N"
             if (VolFloorOnlyIfNoPrev && !usedN) return;
 
             int curTicks = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - overrideStopPx.Value) / tickSize));
@@ -682,7 +622,7 @@ namespace MyAtas.Strategies
 
             if (EnableLogging)
                 DebugLog.W("RM/VOLFLOOR",
-                    $"ENFORCED: curTicks={curTicks} → minTicks={minTicks} newSL={overrideStopPx.Value:F2}");
+                    $"ENFORCED: curTicks={curTicks} â†’ minTicks={minTicks} newSL={overrideStopPx.Value:F2}");
         }
 
         [Browsable(false)] public int PresetTPs { get; set; } = 2;
@@ -699,15 +639,15 @@ namespace MyAtas.Strategies
         public RmStopPlacement StopPlacementMode { get; set; } = RmStopPlacement.PrevBarOppositeExtreme;
 
         [Category("Stops & TPs"), DisplayName("Prev-bar offset (ticks)")]
-        [Description("Holgura aÃƒÂ±adida al extremo de la vela N-1 (1 = un tick mÃƒÂ¡s allÃƒÂ¡ del High/Low).")]
-        public int PrevBarOffsetTicks { get; set; } = 1;
+        [Description("Holgura aÃƒÆ'Ã‚Â±adida al extremo de la vela N-1 (1 = un tick mÃƒÆ'Ã‚Â¡s allÃƒÆ'Ã‚Â¡ del High/Low).")]
+        public int PrevBarOffsetTicks { get; set; } = 3;
 
         [Category("Stops & TPs"), DisplayName("Prev-bar offset side")]
-        [Description("Outside: fuera del extremo (mÃƒÂ¡s allÃƒÂ¡ del High/Low). Inside: dentro del rango de la vela.")]
+        [Description("Outside: fuera del extremo (mÃƒÆ’Ã‚Â¡s allÃƒÆ’Ã‚Â¡ del High/Low). Inside: dentro del rango de la vela.")]
         public RmPrevBarOffsetSide PrevBarOffsetSide { get; set; } = RmPrevBarOffsetSide.Outside;
 
-        [Category("Stops & TPs"), DisplayName("N-1 debe coincidir con la dirección de entrada")]
-        [Description("Si activo, N-1 solo se usa si su color coincide con la dirección (LONG→verde, SHORT→rojo). Evita usar barras contra-tendencia.")]
+        [Category("Stops & TPs"), DisplayName("N-1 debe coincidir con la direcciÃ³n de entrada")]
+        [Description("Si activo, N-1 solo se usa si su color coincide con la direcciÃ³n (LONGâ†’verde, SHORTâ†’rojo). Evita usar barras contra-tendencia.")]
         public bool PrevBarMustMatchEntryDir { get; set; } = true;
 
         [Browsable(false)]
@@ -721,7 +661,7 @@ namespace MyAtas.Strategies
             public CounterTrendGroup(RiskManagerManualStrategy o) => _o = o;
 
             [DisplayName("Offset adicional (ticks)")]
-            [Description("Ticks extra añadidos al SL cuando se usa ancla N (entrada contra-tendencia).")]
+            [Description("Ticks extra aÃ±adidos al SL cuando se usa ancla N (entrada contra-tendencia).")]
             public int OffsetTicks
             {
                 get => _o.CounterTrendExtraOffsetTicks;
@@ -778,14 +718,14 @@ namespace MyAtas.Strategies
                 set => _o.VolFloorWindow = value;
             }
 
-            [DisplayName("Métrica")]
+            [DisplayName("MÃ©trica")]
             public RmVolMetric Metrica
             {
                 get => _o.VolFloorMetric;
                 set => _o.VolFloorMetric = value;
             }
 
-            [DisplayName("Factor ×")]
+            [DisplayName("Factor Ã—")]
             public decimal Factor
             {
                 get => _o.VolFloorFactor;
@@ -793,12 +733,12 @@ namespace MyAtas.Strategies
             }
 
             public override string ToString()
-                => Activo ? $"{Metrica} {VentanaBarras}×{Factor}" : "Desactivado";
+                => Activo ? $"{Metrica} {VentanaBarras}Ã—{Factor}" : "Desactivado";
         }
 
         // Campo + propiedad expuesta para el PropertyGrid
         private VolFloorGroup _volFloorUI;
-        [Category("Stops & TPs"), DisplayName("Ticks mínimos del Stop Loss del SL por volatilidad")]
+        [Category("Stops & TPs"), DisplayName("Ticks mÃ­nimos del Stop Loss del SL por volatilidad")]
         [DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
         public VolFloorGroup VolatilityFloor => _volFloorUI ??= new VolFloorGroup(this);
 
@@ -807,7 +747,7 @@ namespace MyAtas.Strategies
         public RmBeMode BreakEvenMode { get; set; } = RmBeMode.OnTPTouch;
 
         [Category("Breakeven"), DisplayName("BE trigger TP (1..3)")]
-        [Description("Qué TP dispara el paso a breakeven (1, 2 o 3). Funciona también en modo virtual sin TP real.")]
+        [Description("QuÃ© TP dispara el paso a breakeven (1, 2 o 3). Funciona tambiÃ©n en modo virtual sin TP real.")]
         public int BeTriggerTp { get; set; } = 1;
 
         [Category("Breakeven"), DisplayName("BE offset (ticks)")]
@@ -833,39 +773,24 @@ namespace MyAtas.Strategies
         // =================== Internal Helpers ===================
         private int _lastSeenBar = -1;
 
-        // === Breakeven: estado mínimo requerido por ResetAttachState / gates ===
+        // === Breakeven: estado mÃ­nimo requerido por ResetAttachState / gates ===
         private bool   _beArmed     = false;
         private bool   _beDone      = false;
         private decimal _beTargetPx = 0m;
 
         // === Breakeven helpers ===
-        private int _beDirHint = 0; // +1/-1 al armar (por si net no está disponible aún)
+        private int _beDirHint = 0; // +1/-1 al armar (por si net no estÃ¡ disponible aÃºn)
 
-        // Tracking de extremos desde el momento de armar BE (evita usar datos históricos de barra)
-        private decimal _beArmedAtPrice = 0m;  // Precio cuando se armó BE (baseline)
-        private decimal _beMaxReached = 0m;    // Máximo alcanzado DESPUÉS de armar BE
-        private decimal _beMinReached = 0m;    // Mínimo alcanzado DESPUÉS de armar BE
+        // Tracking de extremos desde el momento de armar BE (evita usar datos histÃ³ricos de barra)
+        private decimal _beArmedAtPrice = 0m;  // Precio cuando se armÃ³ BE (baseline)
+        private decimal _beMaxReached = 0m;    // MÃ¡ximo alcanzado DESPUÃ‰S de armar BE
+        private decimal _beMinReached = 0m;    // MÃ­nimo alcanzado DESPUÃ‰S de armar BE
 
         // === Session P&L tracking ===
         private decimal _sessionStartingEquity = 0m;  // Equity inicial al activar estrategia
         private decimal _currentPositionEntryPrice = 0m;  // Precio promedio de entrada actual
-        private int _currentPositionQty = 0;  // Cantidad de posición actual (signed: +LONG / -SHORT)
-        private decimal _sessionRealizedPnL = 0m;  // P&L realizado acumulado desde activación
-
-        // ===== Session Stats (privado) =====
-        private int    _wins = 0, _losses = 0, _breakevens = 0;
-        private int    _winsLong = 0, _winsShort = 0;
-        private decimal _bestTrade = 0m, _worstTrade = 0m;
-        private decimal _sumTradeUsd = 0m;
-        private decimal _realizedCurvePeak = 0m; // equity realizada desde el arranque de sesión
-        private decimal _sessionRealizedUsd = 0m; // acumulado realizado (para curva y drawdown)
-        private decimal _longPnL = 0m, _shortPnL = 0m;
-        private decimal _totalR = 0m, _lastEntryRiskUsd = 0m;
-        private DateTime _lastEntryTimeUtc = DateTime.MinValue;
-        private TimeSpan _sumHold = TimeSpan.Zero;
-        // Para calcular riesgo inicial, tomamos el SL del último plan armado
-        private decimal _lastPlannedStopPrice = 0m;
-        private decimal _sumWinsUsd = 0m, _sumLossUsd = 0m;
+        private int _currentPositionQty = 0;  // Cantidad de posiciÃ³n actual (signed: +LONG / -SHORT)
+        private decimal _sessionRealizedPnL = 0m;  // P&L realizado acumulado desde activaciÃ³n
 
         private decimal ComputeBePrice(int dir, decimal entryPx, decimal tickSize)
         {
@@ -873,15 +798,15 @@ namespace MyAtas.Strategies
             return dir > 0 ? ShrinkPrice(entryPx + off) : ShrinkPrice(entryPx - off);
         }
 
-        // Clamp de seguridad para el BE: nunca por el otro lado del último precio
+        // Clamp de seguridad para el BE: nunca por el otro lado del Ãºltimo precio
         private decimal ClampBeTrigger(decimal proposed)
         {
             var last = GetLastPriceSafe();
             var ts = Security?.TickSize ?? FallbackTickSize;
-            if (_currentPositionQty > 0)        // estamos largos → stop es Sell Stop
-                return Math.Min(proposed, last - ts); // jamás por encima de last
-            else if (_currentPositionQty < 0)   // estamos cortos → stop es Buy Stop
-                return Math.Max(proposed, last + ts); // jamás por debajo de last
+            if (_currentPositionQty > 0)        // estamos largos â†’ stop es Sell Stop
+                return Math.Min(proposed, last - ts); // jamÃ¡s por encima de last
+            else if (_currentPositionQty < 0)   // estamos cortos â†’ stop es Buy Stop
+                return Math.Max(proposed, last + ts); // jamÃ¡s por debajo de last
             return proposed;
         }
 
@@ -986,14 +911,14 @@ namespace MyAtas.Strategies
                 var tm = this.TradingManager;
                 if (tm == null)
                 {
-                    if (EnableLogging) DebugLog.W("RM/BE/MOD", "TradingManager is NULL → return false");
+                    if (EnableLogging) DebugLog.W("RM/BE/MOD", "TradingManager is NULL â†’ return false");
                     return false;
                 }
 
                 var tmt = tm.GetType();
                 if (EnableLogging) DebugLog.W("RM/BE/MOD", $"TradingManager type: {tmt.Name}");
 
-                // Escanear todos los métodos disponibles
+                // Escanear todos los mÃ©todos disponibles
                 var allMethods = tmt.GetMethods();
                 if (EnableLogging) DebugLog.W("RM/BE/MOD", $"TradingManager has {allMethods.Length} total methods");
 
@@ -1011,18 +936,18 @@ namespace MyAtas.Strategies
                         // Firma simple: (Order, decimal triggerPrice)
                         if (ps.Length == 2 && ps[0].ParameterType.IsAssignableFrom(stopOrder.GetType()) && ps[1].ParameterType == typeof(decimal))
                         {
-                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"MATCH: Simple signature (Order, decimal) → invoking {mi.Name}");
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"MATCH: Simple signature (Order, decimal) â†’ invoking {mi.Name}");
                             var result = mi.Invoke(tm, new object[] { stopOrder, newStopPx });
-                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Invocation result: {result} → return true");
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Invocation result: {result} â†’ return true");
                             return true;
                         }
 
-                        // Firma multi-parámetro: (Order oldOrder, Order newOrder, bool, bool)
+                        // Firma multi-parÃ¡metro: (Order oldOrder, Order newOrder, bool, bool)
                         if (ps.Length >= 2 && ps.Length <= 6
                             && ps[0].ParameterType.IsAssignableFrom(stopOrder.GetType())
                             && ps[1].ParameterType.IsAssignableFrom(stopOrder.GetType()))
                         {
-                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"MATCH: (Order, Order, ...) signature → creating modified order");
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"MATCH: (Order, Order, ...) signature â†’ creating modified order");
 
                             // Crear orden modificada clonando la original
                             var modifiedOrder = new Order
@@ -1031,7 +956,7 @@ namespace MyAtas.Strategies
                                 Security       = stopOrder.Security,
                                 Direction      = stopOrder.Direction,
                                 Type           = stopOrder.Type,
-                                TriggerPrice   = newStopPx,  // ← AQUÍ EL NUEVO TRIGGER
+                                TriggerPrice   = newStopPx,  // â† AQUÃ EL NUEVO TRIGGER
                                 Price          = stopOrder.Price,
                                 QuantityToFill = stopOrder.QuantityToFill,
                                 OCOGroup       = stopOrder.OCOGroup,
@@ -1039,11 +964,11 @@ namespace MyAtas.Strategies
                                 Comment        = stopOrder.Comment
                             };
 
-                            // Intentar copiar ReduceOnly si está disponible
+                            // Intentar copiar ReduceOnly si estÃ¡ disponible
                             TrySetReduceOnly(modifiedOrder);
                             TrySetCloseOnTrigger(modifiedOrder);
 
-                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Created modified order: trigger {stopOrder.TriggerPrice:F2} → {newStopPx:F2}");
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Created modified order: trigger {stopOrder.TriggerPrice:F2} â†’ {newStopPx:F2}");
 
                             var args = new object[ps.Length];
                             args[0] = stopOrder;       // oldOrder
@@ -1056,13 +981,13 @@ namespace MyAtas.Strategies
 
                             if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Args: oldOrder={stopOrder.Comment} newTrigger={newStopPx:F2} + {ps.Length-2} bools");
                             var result = mi.Invoke(tm, args);
-                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Invocation result: {result} → return true");
+                            if (EnableLogging) DebugLog.W("RM/BE/MOD", $"Invocation result: {result} â†’ return true");
                             return true;
                         }
                     }
                 }
 
-                if (EnableLogging) DebugLog.W("RM/BE/MOD", "NO modify methods found → return false (will use cancel+recreate)");
+                if (EnableLogging) DebugLog.W("RM/BE/MOD", "NO modify methods found â†’ return false (will use cancel+recreate)");
             }
             catch (Exception ex)
             {
@@ -1075,20 +1000,20 @@ namespace MyAtas.Strategies
         private RiskEngine _engine;
 
         // =================== Stop-to-Flat (RM Close) ===================
-        // Cuando el usuario pulsa el botÃƒÂ³n rojo de ATAS (Stop Strategy),
-        // queremos: cancelar brackets propios y hacer FLATTEN de la posiciÃƒÂ³n.
+        // Cuando el usuario pulsa el botÃƒÆ’Ã‚Â³n rojo de ATAS (Stop Strategy),
+        // queremos: cancelar brackets propios y hacer FLATTEN de la posiciÃƒÆ’Ã‚Â³n.
         private bool _stopToFlat = false;
         private DateTime _rmStopGraceUntil = DateTime.MinValue;     // mientras now<=esto, estamos drenando cancel/fill
         private const int _rmStopGraceMs = 900;                     // holgura post-cancel/flatten (antes 2200)
         private DateTime _nextStopSweepAt = DateTime.MinValue;
-        private const int _stopSweepEveryMs = 250;                  // sweep periÃƒÂ³dico durante el stop
+        private const int _stopSweepEveryMs = 250;                  // sweep periÃƒÆ’Ã‚Â³dico durante el stop
 
         // ==== Diagnostics / Build stamp ====
         private const string BuildStamp = "RM.Manual/stop-to-flat 2025-09-30T22:00Z";
 
         // ==== Post-Close grace & timeouts ====
-        private DateTime _postCloseUntil = DateTime.MinValue; // if now <= this Ã¢â€ â€™ inGrace
-        private readonly int _postCloseGraceMs = 2200;        // un poco mÃƒÂ¡s de holgura tras Close
+        private DateTime _postCloseUntil = DateTime.MinValue; // if now <= this ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ inGrace
+        private readonly int _postCloseGraceMs = 2200;        // un poco mÃƒÆ’Ã‚Â¡s de holgura tras Close
         private readonly int _cleanupWaitMs = 150;            // wait before aggressive cleanup (ms) (antes 300)
         private readonly int _maxRetryMs = 2000;              // absolute escape from WAIT (ms)
 
@@ -1100,16 +1025,16 @@ namespace MyAtas.Strategies
 
         // ==== Attach protection ====
         private DateTime _lastAttachArmAt = DateTime.MinValue;
-        private const int AttachProtectMs = 400;              // proteger el attach mÃƒÂ¡s tiempo (antes 1200)
+        private const int AttachProtectMs = 400;              // proteger el attach mÃƒÆ’Ã‚Â¡s tiempo (antes 1200)
 
-        // --- Estado de net para detectar 0Ã¢â€ â€™Ã¢â€° 0 (entrada) ---
+        // --- Estado de net para detectar 0ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ÃƒÂ¢Ã¢â‚¬Â° 0 (entrada) ---
         private bool _pendingAttach = false;
         private decimal _pendingEntryPrice = 0m;
         private DateTime _pendingSince = DateTime.MinValue;
         private int _pendingDirHint = 0;                 // +1/-1 si logramos leerlo del Order
         private int _pendingFillQty = 0;                 // qty del fill manual (si la API lo expone)
-        private readonly int _attachThrottleMs = 80;     // consolidaciÃƒÂ³n mÃƒÂ­nima (antes 200)
-        private readonly int _attachDeadlineMs = 90;     // fallback rÃƒÂ¡pido si el net no llega (antes 120)
+        private readonly int _attachThrottleMs = 80;     // consolidaciÃƒÆ’Ã‚Â³n mÃƒÆ’Ã‚Â­nima (antes 200)
+        private readonly int _attachDeadlineMs = 90;     // fallback rÃƒÆ’Ã‚Â¡pido si el net no llega (antes 120)
         private readonly System.Collections.Generic.List<Order> _liveOrders = new();
         private readonly object _liveOrdersLock = new();
         // Ancla estructural capturada en el fill
@@ -1134,12 +1059,12 @@ namespace MyAtas.Strategies
             if (EnableLogging) DebugLog.W("RM/GATE", $"ResetAttachState: {reason}");
         }
 
-        // Constructor explÃƒÂ­cito para evitar excepciones durante carga ATAS
+        // Constructor explÃƒÆ’Ã‚Â­cito para evitar excepciones durante carga ATAS
         public RiskManagerManualStrategy()
         {
             try
             {
-                // No inicializar aquÃƒÂ­ para evitar problemas de carga
+                // No inicializar aquÃƒÆ’Ã‚Â­ para evitar problemas de carga
                 _engine = null;
                 _targets = TargetsModel.FromLegacy(PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit);
             }
@@ -1152,7 +1077,7 @@ namespace MyAtas.Strategies
         private void ApplyTargetsToLegacyConfig()
         {
             var act = (_targets ?? new TargetsModel()).ActiveOrdered();
-            // Fallback si vacío: 100% @ 1R
+            // Fallback si vacÃ­o: 100% @ 1R
             if (act.Count == 0) { PresetTPs = 1; TP1R = 1m; TP1pctunit = 100; TP2pctunit = TP3pctunit = 0; _useTargetsV2 = true; return; }
 
             PresetTPs = Math.Clamp(act.Count, 1, 3);
@@ -1164,7 +1089,7 @@ namespace MyAtas.Strategies
             TP1pctunit = act.ElementAtOrDefault(0)?.Percent ?? 0;
             TP2pctunit = act.ElementAtOrDefault(1)?.Percent ?? 0;
             TP3pctunit = act.ElementAtOrDefault(2)?.Percent ?? 0;
-            // Normaliza a 100 por si acaso (último absorbe)
+            // Normaliza a 100 por si acaso (Ãºltimo absorbe)
             var sum = TP1pctunit + TP2pctunit + TP3pctunit;
             if (sum != 100)
             {
@@ -1175,7 +1100,7 @@ namespace MyAtas.Strategies
                 TP2pctunit = PresetTPs >= 2 ? list.ElementAtOrDefault(1) : 0;
                 TP3pctunit = PresetTPs >= 3 ? list.ElementAtOrDefault(2) : 0;
             }
-            // Legacy OFF si usamos Targets: evita solapes en constructores que aún lean legacy
+            // Legacy OFF si usamos Targets: evita solapes en constructores que aÃºn lean legacy
             _useTargetsV2 = true;
 
             if (EnableLogging)
@@ -1360,7 +1285,7 @@ namespace MyAtas.Strategies
             return (0, 0m);
         }
 
-        // Sondea la cuenta real (TradingManager.Account / Portfolio) por reflexión.
+        // Sondea la cuenta real (TradingManager.Account / Portfolio) por reflexiÃ³n.
         // Busca en orden: Equity, NetLiquidation, Balance, AccountBalance, Cash.
         // Devuelve el primer valor > 0m encontrado.
         private decimal ReadAccountEquityUSD()
@@ -1404,13 +1329,13 @@ namespace MyAtas.Strategies
             return 0m;
         }
 
-        // Normaliza cadenas para comparar (mayúsculas, sin espacios/guiones, sin acentos)
+        // Normaliza cadenas para comparar (mayÃºsculas, sin espacios/guiones, sin acentos)
         private static string K(string s)
         {
             if (string.IsNullOrWhiteSpace(s)) return string.Empty;
             s = s.ToUpperInvariant();
             s = s.Replace(" ", "").Replace("-", "").Replace("_", "");
-            s = s.Replace("É","E").Replace("Á","A").Replace("Í","I").Replace("Ó","O").Replace("Ú","U").Replace("Ñ","N");
+            s = s.Replace("Ã‰","E").Replace("Ã","A").Replace("Ã","I").Replace("Ã“","O").Replace("Ãš","U").Replace("Ã‘","N");
             return s;
         }
 
@@ -1429,12 +1354,12 @@ namespace MyAtas.Strategies
                     var vRaw = kv[1].Trim().Replace(',', '.');
                     if (!decimal.TryParse(vRaw, NumberStyles.Any, CultureInfo.InvariantCulture, out var v)) continue;
 
-                    // Coincidencia amplia: si el nombre/código contiene la clave normalizada
+                    // Coincidencia amplia: si el nombre/cÃ³digo contiene la clave normalizada
                     if (key.Contains(k)) return v;
                 }
             }
 
-            // 2) Heurísticas por si el broker no da el código del símbolo
+            // 2) HeurÃ­sticas por si el broker no da el cÃ³digo del sÃ­mbolo
             if (key.Contains("MICROEMININASDAQ") || key.StartsWith("MNQ")) return 0.5m;
             if (key.StartsWith("NQ")) return 5m;
             if (key.StartsWith("MES")) return 1.25m;
@@ -1460,7 +1385,7 @@ namespace MyAtas.Strategies
                 if (getPos != null)
                 {
                     var pos = getPos.Invoke(Portfolio, new object[] { Security });
-                    return pos; // puede ser null si no hay posiciÃƒÂ³n
+                    return pos; // puede ser null si no hay posiciÃƒÆ’Ã‚Â³n
                 }
             }
             catch { }
@@ -1480,7 +1405,7 @@ namespace MyAtas.Strategies
                 }
                 catch { }
             }
-            return 0m; // NADA de GetCandle() aquÃƒÂ­
+            return 0m; // NADA de GetCandle() aquÃƒÆ’Ã‚Â­
         }
 
         private int ExtractFilledQty(Order order)
@@ -1518,22 +1443,51 @@ namespace MyAtas.Strategies
             return 0;
         }
 
+        /// <summary>
+        /// Obtiene el R múltiple del TP configurado para trigger del BE desde el modelo Targets (UI nueva).
+        /// NO depende del % de cobro: aunque sea 0 (TP virtual), devuelve el R correcto.
+        /// </summary>
+        private decimal GetBeRMultipleFromTargets()
+        {
+            try
+            {
+                var tgt = Targets; // Lee desde UI "Targets (clic para editar)"
+                if (tgt == null) return 1m; // Fallback seguro
+
+                // Seleccionar TP según BeTriggerTp (1, 2 o 3)
+                var row = BeTriggerTp switch
+                {
+                    1 => tgt.TP1,
+                    2 => tgt.TP2,
+                    3 => tgt.TP3,
+                    _ => tgt.TP1 // Fallback a TP1
+                };
+
+                var r = row?.R ?? 0m;
+                return r > 0m ? r : 1m; // Fallback si R inválido
+            }
+            catch
+            {
+                return 1m; // Fallback en caso de error
+            }
+        }
+
 
         protected override void OnCalculate(int bar, decimal value)
         {
             if (!IsActivated) return;
 
-            // Refresca equity en UI (1×/s)
+            // Refresca equity en UI (1Ã—/s)
             if (DateTime.UtcNow >= _nextEquityProbeAt)
             {
                 AccountEquitySnapshot = ReadAccountEquityUSD();
                 _nextEquityProbeAt = DateTime.UtcNow.AddSeconds(1);
-                if (EnableLogging) DebugLog.W("RM/SNAP", $"Equity≈{AccountEquitySnapshot:F2} USD");
+                if (EnableLogging) DebugLog.W("RM/SNAP", $"Equityâ‰ˆ{AccountEquitySnapshot:F2} USD");
 
                 // Inicializar session starting equity la primera vez
                 if (_sessionStartingEquity == 0m)
                 {
-                    // Priorizar AccountEquityOverride si está configurado
+                    // Priorizar AccountEquityOverride si estÃ¡ configurado
                     if (AccountEquityOverride > 0m)
                     {
                         _sessionStartingEquity = AccountEquityOverride;
@@ -1546,7 +1500,7 @@ namespace MyAtas.Strategies
                     }
                     else
                     {
-                        // Último fallback: usar 10000 USD como base
+                        // Ãšltimo fallback: usar 10000 USD como base
                         _sessionStartingEquity = 10000m;
                         if (EnableLogging) DebugLog.W("RM/PNL", $"Session started with DEFAULT equity (no account data): {_sessionStartingEquity:F2} USD");
                     }
@@ -1574,7 +1528,7 @@ namespace MyAtas.Strategies
                 if (EnableLogging)
                     DebugLog.W("RM/STOP", $"drain: flat={flat} liveBrackets={live} inGrace={(DateTime.UtcNow <= _rmStopGraceUntil)}");
 
-                // Barrido periÃƒÂ³dico durante el stop: re-cancelar y re-flatten si hace falta (sin duplicar)
+                // Barrido periÃƒÆ’Ã‚Â³dico durante el stop: re-cancelar y re-flatten si hace falta (sin duplicar)
                 var now = DateTime.UtcNow;
                 if (now >= _nextStopSweepAt && now <= _rmStopGraceUntil)
                 {
@@ -1588,7 +1542,7 @@ namespace MyAtas.Strategies
                 // No retornamos de OnCalculate global: simplemente dejamos que no se dispare TryAttachBracketsNow()
             }
 
-            // Fallback por barra si quedÃƒÂ³ pendiente
+            // Fallback por barra si quedÃƒÆ’Ã‚Â³ pendiente
             if (_pendingAttach && (DateTime.UtcNow - _pendingSince).TotalMilliseconds >= _attachThrottleMs)
                 TryAttachBracketsNow();
 
@@ -1607,11 +1561,11 @@ namespace MyAtas.Strategies
                 if ((transitionClose || bracketsEdgeClose) && !debounce)
                 {
                     CancelResidualBrackets("external close detected");
-                    if (!recentAttach) _pendingAttach = false; // <- NO matar attach reciÃƒÂ©n armado
+                    if (!recentAttach) _pendingAttach = false; // <- NO matar attach reciÃƒÆ’Ã‚Â©n armado
                     _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
                     _lastExternalCloseAt = DateTime.UtcNow;
                     if (EnableLogging)
-                        DebugLog.W("RM/GRACE", $"External close Ã¢â€ â€™ grace until={_postCloseUntil:HH:mm:ss.fff}, recentAttach={recentAttach}");
+                        DebugLog.W("RM/GRACE", $"External close ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ grace until={_postCloseUntil:HH:mm:ss.fff}, recentAttach={recentAttach}");
                 }
 
                 // Update prev snapshots for next tick
@@ -1668,8 +1622,8 @@ namespace MyAtas.Strategies
                             var bePx = ComputeBePrice(dir, refPx, tickSize);
                             var newTrigger = ClampBeTrigger(bePx);
                             if (newTrigger != bePx && EnableLogging)
-                                DebugLog.W("RM/BE/SAFE", $"clamp {bePx:F2} → {newTrigger:F2} (last={GetLastPriceSafe():F2})");
-                            if (EnableLogging) DebugLog.W("RM/BE", $"TOUCH trigger @ {_beTargetPx:F2} Ã¢â€ â€™ move SL to BE {newTrigger:F2}");
+                                DebugLog.W("RM/BE/SAFE", $"clamp {bePx:F2} â†’ {newTrigger:F2} (last={GetLastPriceSafe():F2})");
+                            if (EnableLogging) DebugLog.W("RM/BE", $"TOUCH trigger @ {_beTargetPx:F2} ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ move SL to BE {newTrigger:F2}");
                             MoveAllRmStopsTo(newTrigger, "BE touch");
                             _beDone = true;
                         }
@@ -1752,18 +1706,18 @@ namespace MyAtas.Strategies
                     return;
                 }
 
-                // SÃƒÂ³lo nos interesan fills/parciales
+                // SÃƒÆ’Ã‚Â³lo nos interesan fills/parciales
                 if (!(st == OrderStatus.Filled || st == OrderStatus.PartlyFilled))
                 {
                     if (EnableLogging) DebugLog.W("RM/ORD", $"OnOrderChanged SKIP: status={st} (not filled/partly)");
                     return;
                 }
 
-                // Marca attach pendiente; la direcciÃƒÂ³n la deduciremos con el net por barra o ahora mismo
+                // Marca attach pendiente; la direcciÃƒÆ’Ã‚Â³n la deduciremos con el net por barra o ahora mismo
                 _pendingDirHint = ExtractDirFromOrder(order);
                 _pendingFillQty = ExtractFilledQty(order);
 
-                // Solo guardar entryPrice si el order tiene AvgPrice vÃƒÂ¡lido; si no, lo obtendremos de la posiciÃƒÂ³n
+                // Solo guardar entryPrice si el order tiene AvgPrice vÃƒÆ’Ã‚Â¡lido; si no, lo obtendremos de la posiciÃƒÆ’Ã‚Â³n
                 var orderAvgPrice = ExtractAvgFillPrice(order);
                 _pendingEntryPrice = orderAvgPrice > 0m ? orderAvgPrice : 0m;
 
@@ -1777,22 +1731,22 @@ namespace MyAtas.Strategies
 
                     bool prevExists   = prev != null;
                     bool prevSameDir  = prevExists && (
-                        (_pendingDirHint > 0 && prev.Close > prev.Open) ||   // LONG → N-1 debe ser alcista
-                        (_pendingDirHint < 0 && prev.Close < prev.Open)      // SHORT → N-1 debe ser bajista
+                        (_pendingDirHint > 0 && prev.Close > prev.Open) ||   // LONG â†’ N-1 debe ser alcista
+                        (_pendingDirHint < 0 && prev.Close < prev.Open)      // SHORT â†’ N-1 debe ser bajista
                     );
                     bool geometricOk  = prevExists && cur != null && (
                         (_pendingDirHint > 0 && prev.Low  < cur.Low) ||
                         (_pendingDirHint < 0 && prev.High > cur.High)
                     );
 
-                    // Solo usamos N-1 si (existe) y (pasa la geometría) y
+                    // Solo usamos N-1 si (existe) y (pasa la geometrÃ­a) y
                     // (o bien no exigimos coincidencia de color o coincide el color)
                     bool canUsePrev = prevExists && geometricOk &&
                                       (!PrevBarMustMatchEntryDir || prevSameDir);
 
                     // Ancla definitiva
                     int anchorBar = canUsePrev ? (CurrentBar - 2) : (CurrentBar - 1);
-                    _pendingPrevBarIdxAtFill = CurrentBar - 2;  // siempre guardamos dónde estaría N-1
+                    _pendingPrevBarIdxAtFill = CurrentBar - 2;  // siempre guardamos dÃ³nde estarÃ­a N-1
                     _pendingAnchorBarAtFill  = anchorBar;
 
                     var anchor = GetCandle(anchorBar);
@@ -1811,20 +1765,20 @@ namespace MyAtas.Strategies
                     _pendingAnchorHigh = _pendingAnchorLow = 0m;
                 }
 
-                // Armar attach con protecciÃƒÂ³n temporal
+                // Armar attach con protecciÃƒÆ’Ã‚Â³n temporal
                 _pendingAttach = true;
                 _pendingSince = DateTime.UtcNow;
                 _lastAttachArmAt = _pendingSince;
 
                 if (EnableLogging)
-                    DebugLog.W("RM/ORD", $"Manual order DETECTED Ã¢â€ â€™ pendingAttach=true | dir={_pendingDirHint} fillQty={_pendingFillQty} entryPx={_pendingEntryPrice:F2}");
+                    DebugLog.W("RM/ORD", $"Manual order DETECTED ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ pendingAttach=true | dir={_pendingDirHint} fillQty={_pendingFillQty} entryPx={_pendingEntryPrice:F2}");
 
                 // === Track position entry for P&L ===
-                // Intentar obtener precio de entry de múltiples fuentes
+                // Intentar obtener precio de entry de mÃºltiples fuentes
                 var entryPriceForTracking = _pendingEntryPrice;
                 if (entryPriceForTracking <= 0m)
                 {
-                    // Fallback 1: leer desde posición actual
+                    // Fallback 1: leer desde posiciÃ³n actual
                     var snapForEntry = ReadPositionSnapshot();
                     entryPriceForTracking = snapForEntry.AvgPrice;
                     if (EnableLogging) DebugLog.W("RM/PNL", $"Entry price from order=0, trying position avgPrice={entryPriceForTracking:F2}");
@@ -1832,7 +1786,7 @@ namespace MyAtas.Strategies
 
                 if (entryPriceForTracking <= 0m)
                 {
-                    // Fallback 2: usar precio de la última barra (mejor aproximación)
+                    // Fallback 2: usar precio de la Ãºltima barra (mejor aproximaciÃ³n)
                     entryPriceForTracking = GetLastPriceSafe();
                     if (EnableLogging) DebugLog.W("RM/PNL", $"Entry price from position=0, using last bar price={entryPriceForTracking:F2}");
                 }
@@ -1846,7 +1800,7 @@ namespace MyAtas.Strategies
                     if (EnableLogging) DebugLog.W("RM/PNL", $"SKIP TrackPositionEntry: entryPx={entryPriceForTracking:F2} fillQty={_pendingFillQty}");
                 }
 
-                TryAttachBracketsNow(); // intenta en el mismo tick; si el gate decide WAIT, ya lo reintentarÃƒÂ¡ OnCalculate
+                TryAttachBracketsNow(); // intenta en el mismo tick; si el gate decide WAIT, ya lo reintentarÃƒÆ’Ã‚Â¡ OnCalculate
             }
             catch (Exception ex)
             {
@@ -1871,8 +1825,8 @@ namespace MyAtas.Strategies
                             var bePx = ComputeBePrice(dir, snap.AvgPrice > 0m ? snap.AvgPrice : ExtractAvgFillPrice(order), tickSize);
                             var newTrigger = ClampBeTrigger(bePx);
                             if (newTrigger != bePx && EnableLogging)
-                                DebugLog.W("RM/BE/SAFE", $"clamp {bePx:F2} → {newTrigger:F2} (last={GetLastPriceSafe():F2})");
-                            if (EnableLogging) DebugLog.W("RM/BE", $"FILL trigger by TP Ã¢â€ â€™ move SL to BE {newTrigger:F2}");
+                                DebugLog.W("RM/BE/SAFE", $"clamp {bePx:F2} â†’ {newTrigger:F2} (last={GetLastPriceSafe():F2})");
+                            if (EnableLogging) DebugLog.W("RM/BE", $"FILL trigger by TP ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ move SL to BE {newTrigger:F2}");
                             MoveAllRmStopsTo(newTrigger, "BE fill");
                             _beDone = true;
                         }
@@ -1905,9 +1859,9 @@ namespace MyAtas.Strategies
 
                     if (exitPrice > 0m && filledQty > 0)
                     {
-                        // Dirección: TP/SL son órdenes de cierre, así que están en dirección opuesta a la posición
-                        // Si fue LONG → TP/SL son SELL → dir original = +1
-                        // Si fue SHORT → TP/SL son BUY → dir original = -1
+                        // DirecciÃ³n: TP/SL son Ã³rdenes de cierre, asÃ­ que estÃ¡n en direcciÃ³n opuesta a la posiciÃ³n
+                        // Si fue LONG â†’ TP/SL son SELL â†’ dir original = +1
+                        // Si fue SHORT â†’ TP/SL son BUY â†’ dir original = -1
                         var orderDir = ExtractDirFromOrder(order);
                         var positionDir = -orderDir;  // invertir porque es orden de cierre
 
@@ -1954,12 +1908,12 @@ namespace MyAtas.Strategies
             try
             {
                 AccountEquitySnapshot = ReadAccountEquityUSD();
-                if (EnableLogging) DebugLog.W("RM/SNAP", $"Equity init Ã¢â€ °Ë† {AccountEquitySnapshot:F2} USD");
+                if (EnableLogging) DebugLog.W("RM/SNAP", $"Equity init ÃƒÂ¢Ã¢â‚¬ Â°Ã‹â€  {AccountEquitySnapshot:F2} USD");
 
                 _stopToFlat = false;
                 _rmStopGraceUntil = DateTime.MinValue;
                 _nextStopSweepAt   = DateTime.MinValue;
-                if (EnableLogging) DebugLog.W("RM/STOP", "Started Ã¢â€ â€™ reset stop-to-flat flags");
+                if (EnableLogging) DebugLog.W("RM/STOP", "Started ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ reset stop-to-flat flags");
             }
             catch { }
         }
@@ -1971,10 +1925,10 @@ namespace MyAtas.Strategies
                 _stopToFlat = true;
                 _rmStopGraceUntil = DateTime.UtcNow.AddMilliseconds(_rmStopGraceMs);
                 _nextStopSweepAt   = DateTime.UtcNow; // primer barrido inmediato
-                if (EnableLogging) DebugLog.W("RM/STOP", $"OnStopping Ã¢â€ â€™ engage StopToFlat, grace until={_rmStopGraceUntil:HH:mm:ss.fff}");
+                if (EnableLogging) DebugLog.W("RM/STOP", $"OnStopping ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ engage StopToFlat, grace until={_rmStopGraceUntil:HH:mm:ss.fff}");
 
                 // 1) Cancelar brackets + cualquier otra orden viva del instrumento
-                // Evitar limpiar si acabamos de armar attach (protección anti-cancel inmediato)
+                // Evitar limpiar si acabamos de armar attach (protecciÃ³n anti-cancel inmediato)
                 var freshAttach = _pendingAttach &&
                                   (DateTime.UtcNow - _lastAttachArmAt).TotalMilliseconds < (AttachProtectMs + 250);
                 if (!freshAttach)
@@ -1999,14 +1953,14 @@ namespace MyAtas.Strategies
             {
                 DebugLog.W("RM/STOP", $"OnStopping EX: {ex.Message}");
             }
-            // No bloquees aquÃƒÂ­: ATAS seguirÃƒÂ¡ el ciclo; terminamos de drenar en eventos/ticks
+            // No bloquees aquÃƒÆ’Ã‚Â­: ATAS seguirÃƒÆ’Ã‚Â¡ el ciclo; terminamos de drenar en eventos/ticks
         }
 
         protected override void OnStopped()
         {
             try
             {
-                if (EnableLogging) DebugLog.W("RM/STOP", "OnStopped Ã¢â€ â€™ strategy stopped (final)");
+                if (EnableLogging) DebugLog.W("RM/STOP", "OnStopped ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ strategy stopped (final)");
                 _stopToFlat = false;
                 _rmStopGraceUntil = DateTime.MinValue;
 
@@ -2017,14 +1971,6 @@ namespace MyAtas.Strategies
                 _currentPositionQty = 0;
                 _sessionRealizedPnL = 0m;
                 SessionPnL = 0m;
-
-                // ===== Reset Session Stats =====
-                _wins = _losses = _breakevens = _winsLong = _winsShort = 0;
-                _bestTrade = 0m; _worstTrade = 0m; _sumTradeUsd = 0m;
-                _sessionRealizedUsd = 0m; _realizedCurvePeak = 0m; MaxDrawdownUsd = 0m;
-                _longPnL = 0m; _shortPnL = 0m; _totalR = 0m;
-                _sumWinsUsd = 0m; _sumLossUsd = 0m; _sumHold = TimeSpan.Zero;
-                _lastEntryRiskUsd = 0m; _lastPlannedStopPrice = 0m; _lastEntryTimeUtc = DateTime.MinValue;
             }
             catch { }
         }
@@ -2034,7 +1980,7 @@ namespace MyAtas.Strategies
         {
             var outside     = PrevBarOffsetSide == RmPrevBarOffsetSide.Outside;
 
-            // Si por algún motivo no hay ancla, reintenta: N-1 si existe, si no N
+            // Si por algÃºn motivo no hay ancla, reintenta: N-1 si existe, si no N
             decimal hi = _pendingAnchorHigh, lo = _pendingAnchorLow;
             int anchorBar = _pendingAnchorBarAtFill;
             if (hi <= 0m && lo <= 0m)
@@ -2058,7 +2004,7 @@ namespace MyAtas.Strategies
                 : ShrinkPrice(extreme + totalOffset * tickSize);  // SHORT: por encima de la mecha
 
             var dbg = $"anchor={(isAnchorN ? "N" : "N-1")} offBase={PrevBarOffsetTicks} ctExtra={ctExtra} " +
-                      $"totalOff={totalOffset} → SL={structSl:F2}";
+                      $"totalOff={totalOffset} â†’ SL={structSl:F2}";
             return (structSl, dbg);
         }
 
@@ -2082,7 +2028,7 @@ namespace MyAtas.Strategies
                     return;
                 }
                 var netAbs = Math.Abs(ReadNetPosition());
-                // No hacemos return aquí: el gate inferior decidirá si WAIT / ATTACH / FALLBACK
+                // No hacemos return aquÃ­: el gate inferior decidirÃ¡ si WAIT / ATTACH / FALLBACK
 
                 // Si estamos parando, no adjuntar nada (evita re-entradas durante stop)
                 if (_stopToFlat)
@@ -2099,7 +2045,7 @@ namespace MyAtas.Strategies
                 if (EnableLogging)
                     DebugLog.W("RM/ATTACH", $"Pre-check: pendingSince={_pendingSince:HH:mm:ss.fff} inGrace={inGrace} (closeGrace={(now <= _postCloseUntil)} stopGrace={(now <= _rmStopGraceUntil)})");
 
-                // TelemetrÃƒÂ­a de estados de brackets antes del check
+                // TelemetrÃƒÆ’Ã‚Â­a de estados de brackets antes del check
                 LogOrderStateHistogram("pre-attach");
 
                 // 1) Are there live brackets? (only SL:/TP:, ignore ENF)
@@ -2117,7 +2063,7 @@ namespace MyAtas.Strategies
                     {
                         _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs); // bypass
                         if (EnableLogging)
-                            DebugLog.W("RM/GRACE", $"MaxRetry {waitedMs}ms Ã¢â€ â€™ forcing grace & proceeding");
+                            DebugLog.W("RM/GRACE", $"MaxRetry {waitedMs}ms ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ forcing grace & proceeding");
                         // sigue sin return
                     }
                     else if (waitedMs > _cleanupWaitMs)
@@ -2126,20 +2072,20 @@ namespace MyAtas.Strategies
                         _postCloseUntil = DateTime.UtcNow.AddMilliseconds(_postCloseGraceMs);
                         _pendingSince = DateTime.UtcNow;
                         if (EnableLogging)
-                            DebugLog.W("RM/GRACE", $"Cleanup timeout Ã¢â€ â€™ grace reset to {_postCloseUntil:HH:mm:ss.fff}");
+                            DebugLog.W("RM/GRACE", $"Cleanup timeout ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ grace reset to {_postCloseUntil:HH:mm:ss.fff}");
                         return; // reintenta
                     }
                     else
                     {
                         if (EnableLogging)
-                            DebugLog.W("RM/WAIT", $"live brackets Ã¢â€ â€™ retry (waited={waitedMs}ms)");
+                            DebugLog.W("RM/WAIT", $"live brackets ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ retry (waited={waitedMs}ms)");
                         return;
                     }
                 }
                 else if (anyBrackets && inGrace)
                 {
                     if (EnableLogging)
-                        DebugLog.W("RM/GRACE", "post-close grace ACTIVE Ã¢â€ â€™ ignoring live-brackets block");
+                        DebugLog.W("RM/GRACE", "post-close grace ACTIVE ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ ignoring live-brackets block");
                 }
 
                 // 2) Gate: si estamos en GRACE, saltamos el gate y vamos a FALLBACK ya mismo
@@ -2151,36 +2097,36 @@ namespace MyAtas.Strategies
                 {
                     if (Math.Abs(_prevNet) == 0 && Math.Abs(netNow) > 0)
                     {
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"VALID TRANSITION: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms Ã¢â€ â€™ ATTACH");
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"VALID TRANSITION: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ ATTACH");
                     }
                     else
                     {
                         if (gateWaitedMs < _attachDeadlineMs)
                         {
-                            if (EnableLogging) DebugLog.W("RM/GATE", $"WAITING: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms < deadline={_attachDeadlineMs}ms Ã¢â€ â€™ WAIT");
+                            if (EnableLogging) DebugLog.W("RM/GATE", $"WAITING: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms < deadline={_attachDeadlineMs}ms ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ WAIT");
                             return;
                         }
                         if (!(AllowAttachFallback && _pendingDirHint != 0))
                         {
                             _pendingAttach = false;
-                            if (EnableLogging) DebugLog.W("RM/GATE", $"ABORT: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms Ã¢â€ â€™ no fallback allowed");
+                            if (EnableLogging) DebugLog.W("RM/GATE", $"ABORT: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ no fallback allowed");
                             if (EnableLogging) DebugLog.W("RM/ABORT", "flat after TTL");
                             return;
                         }
-                        if (EnableLogging) DebugLog.W("RM/GATE", $"FALLBACK: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms Ã¢â€ â€™ ATTACH(FALLBACK) dirHint={_pendingDirHint}");
+                        if (EnableLogging) DebugLog.W("RM/GATE", $"FALLBACK: prevNet={_prevNet} netNow={netNow} elapsed={gateWaitedMs}ms ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ ATTACH(FALLBACK) dirHint={_pendingDirHint}");
                     }
                 }
                 else
                 {
-                    if (EnableLogging) DebugLog.W("RM/GATE", $"GRACE BYPASS: skipping net gate Ã¢â€ â€™ ATTACH(FALLBACK) dirHint={_pendingDirHint}");
+                    if (EnableLogging) DebugLog.W("RM/GATE", $"GRACE BYPASS: skipping net gate ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ ATTACH(FALLBACK) dirHint={_pendingDirHint}");
                 }
 
                 var dir = Math.Abs(netNow) > 0 ? Math.Sign(netNow) : _pendingDirHint;
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Direction determined: dir={dir} (netNow={netNow}, dirHint={_pendingDirHint})");
 
                 // qty OBJETIVO del plan:
-                //  - Manual  Ã¢â€ â€™ SIEMPRE la UI (ManualQty), no el net/fill
-                //  - Riesgo  Ã¢â€ â€™ la calcularÃƒÂ¡ el engine
+                //  - Manual  ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ SIEMPRE la UI (ManualQty), no el net/fill
+                //  - Riesgo  ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ la calcularÃƒÆ’Ã‚Â¡ el engine
                 int manualQtyToUse = ManualQty;
                 if (SizingMode == RmSizingMode.Manual)
                 {
@@ -2203,7 +2149,7 @@ namespace MyAtas.Strategies
                 if (EnableLogging)
                     DebugLog.W("RM/TICK", $"tickSize={tickSize} tickValueUSD={tickValue} symbolKey='{secName}' overrides='{TickValueOverrides}'");
 
-                // precio de entrada: order Ã¢â€ â€™ avgPrice posiciÃƒÂ³n Ã¢â€ â€™ vela previa (Close)
+                // precio de entrada: order ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ avgPrice posiciÃƒÆ’Ã‚Â³n ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ vela previa (Close)
                 var entryPx = _pendingEntryPrice;
                 if (entryPx <= 0m)
                 {
@@ -2220,7 +2166,7 @@ namespace MyAtas.Strategies
                         entryPx = GetCandle(barIdx).Close;
                         if (EnableLogging) DebugLog.W("RM/PLAN", $"Fallback candle price used: entryPx={entryPx:F2} (bar={barIdx})");
                     } catch { }
-                    if (entryPx <= 0m) { if (EnableLogging) DebugLog.W("RM/PLAN", "No valid entryPx available Ã¢â€ â€™ retry"); return; }
+                    if (entryPx <= 0m) { if (EnableLogging) DebugLog.W("RM/PLAN", "No valid entryPx available ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ retry"); return; }
                 }
 
                 // === STOP por estructura (opcional) ===
@@ -2236,9 +2182,9 @@ namespace MyAtas.Strategies
                         overrideStopPx  = slPx;
                         approxStopTicks = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - slPx) / tickSize));
                         if (EnableLogging)
-                            DebugLog.W("RM/STOPMODE", $"STRUCT SL: {dbg} | ticks≈{approxStopTicks}");
+                            DebugLog.W("RM/STOPMODE", $"STRUCT SL: {dbg} | ticksâ‰ˆ{approxStopTicks}");
 
-                        // === Volatility floor: sólo si (opción ON) y se usó N (no había N-1) ===
+                        // === Volatility floor: sÃ³lo si (opciÃ³n ON) y se usÃ³ N (no habÃ­a N-1) ===
                         EnforceVolatilityFloorIfNeeded(dir, entryPx, ref overrideStopPx, ref approxStopTicks, tickSize);
                     }
                 } catch { /* fallback a DefaultStopTicks */ }
@@ -2283,13 +2229,13 @@ namespace MyAtas.Strategies
                 );
 
                 var engine = GetEngine();
-                if (engine == null) { if (EnableLogging) DebugLog.W("RM/PLAN", "Engine not available Ã¢â€ â€™ abort"); return; }
+                if (engine == null) { if (EnableLogging) DebugLog.W("RM/PLAN", "Engine not available ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ abort"); return; }
 
                 var plan = engine.BuildPlan(ctx, sizingCfg, bracketCfg, out var szReason);
 
                 if (plan == null)
                 {
-                    if (EnableLogging) DebugLog.W("RM/PLAN", "BuildPlan Ã¢â€ â€™ null");
+                    if (EnableLogging) DebugLog.W("RM/PLAN", "BuildPlan ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ null");
                     return;
                 }
                 else
@@ -2298,7 +2244,7 @@ namespace MyAtas.Strategies
                     {
                         DebugLog.W("RM/PLAN", $"Built plan: totalQty={plan.TotalQty} stop={plan.StopLoss?.Price:F2} tps={plan.TakeProfits?.Count} reason={plan.Reason}");
 
-                        // Log de configuración de targets
+                        // Log de configuraciÃ³n de targets
                         var act = (_targets ?? new TargetsModel()).ActiveOrdered().ToList();
                         DebugLog.W("RM/TP", $"PLAN v2={_useTargetsV2} preset={PresetTPs} | " +
                             string.Join(" | ", act.Select((t, i) => $"TP{i + 1}: R={t.R} %={t.Percent} active={t.Active}")));
@@ -2328,23 +2274,23 @@ namespace MyAtas.Strategies
                     var px = tp.Price;
                     if (px <= 0m)
                     {
-                        // Motor no puso precio válido → calcular localmente
+                        // Motor no puso precio vÃ¡lido â†’ calcular localmente
                         var rMult = (i < tpRlocals.Count) ? tpRlocals[i] : (tpRlocals.Count > 0 ? tpRlocals[tpRlocals.Count - 1] : 1m);
                         var raw = dir > 0 ? (entryPx + rMult * rPrice) : (entryPx - rMult * rPrice);
                         px = ShrinkPrice(raw);
-                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"TP[{i}] era 0 → calculado: {px:F2} (R={rMult:F2})");
+                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"TP[{i}] era 0 â†’ calculado: {px:F2} (R={rMult:F2})");
                     }
                     if (px > 0m) safeTps.Add(new MyAtas.Risk.Models.BracketLeg(px, tp.Quantity));
                 }
 
-                // Si no hay TPs válidos, crear uno en 1R con el 100% de qty
+                // Si no hay TPs vÃ¡lidos, crear uno en 1R con el 100% de qty
                 if (safeTps.Count == 0)
                 {
                     var px1 = ShrinkPrice(dir > 0 ? (entryPx + 1m * rPrice) : (entryPx - 1m * rPrice));
                     if (px1 > 0m)
                     {
                         safeTps.Add(new MyAtas.Risk.Models.BracketLeg(px1, Math.Max(1, plan.TotalQty)));
-                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"No TPs válidos → creado 1 TP en 1R: {px1:F2}");
+                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"No TPs vÃ¡lidos â†’ creado 1 TP en 1R: {px1:F2}");
                     }
                 }
 
@@ -2352,10 +2298,7 @@ namespace MyAtas.Strategies
                 if (safeTps.Count > 0)
                     plan = new MyAtas.Risk.Models.RiskPlan(plan.TotalQty, plan.StopLoss, safeTps, plan.OcoPolicy, plan.Reason + " [TP-safe]");
 
-                // Guardar stop del plan final para stats de R
-                _lastPlannedStopPrice = plan.StopLoss?.Price ?? 0m;
-
-                // ===== "LA UI MANDA": Si EnforceManualQty está activo, usar ManualQty =====
+                // ===== "LA UI MANDA": Si EnforceManualQty estÃ¡ activo, usar ManualQty =====
                 var manualTarget = Math.Max(MinQty, ManualQty);
                 var targetForEnforce = EnforceManualQty ? manualTarget : plan.TotalQty;
 
@@ -2370,7 +2313,7 @@ namespace MyAtas.Strategies
                     var sum = Math.Max(1, s1 + s2 + s3);
                     int q1 = (int)Math.Floor(q * s1 / (decimal)sum);
                     int q2 = (int)Math.Floor(q * s2 / (decimal)sum);
-                    int q3 = q - q1 - q2; // "resto" al último para evitar qty=0
+                    int q3 = q - q1 - q2; // "resto" al Ãºltimo para evitar qty=0
 
                     // Extraer precios del plan antes de reconstruir
                     var tp1Px = plan.TakeProfits.Count > 0 ? plan.TakeProfits[0].Price : 0m;
@@ -2394,7 +2337,7 @@ namespace MyAtas.Strategies
 
                     if (EnableLogging)
                     {
-                        DebugLog.W("RM/PLAN", $"LA UI MANDA: Overriding plan qty {plan.TotalQty}→{q}, splits=[{q1},{q2},{q3}]");
+                        DebugLog.W("RM/PLAN", $"LA UI MANDA: Overriding plan qty {plan.TotalQty}â†’{q}, splits=[{q1},{q2},{q3}]");
                         DebugLog.W("RM/SPLIT", $"QTY ENFORCE -> q=[{string.Join(",", newTps.Select(t => t.Quantity))}] (planCount={newTps.Count})");
                     }
                 }
@@ -2426,11 +2369,11 @@ namespace MyAtas.Strategies
                         if (Underfunded == MyAtas.Risk.Models.UnderfundedPolicy.Min1)
                         {
                             targetQty = 1;
-                            if (EnableLogging) DebugLog.W("RM/SIZING", "Underfunded Ã¢â€ â€™ forcing qty=1");
+                            if (EnableLogging) DebugLog.W("RM/SIZING", "Underfunded ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ forcing qty=1");
                         }
                         else
                         {
-                            if (EnableLogging) DebugLog.W("RM/SIZING", "Underfunded Ã¢â€ â€™ qty=0, abort attach");
+                            if (EnableLogging) DebugLog.W("RM/SIZING", "Underfunded ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ qty=0, abort attach");
                             _pendingAttach = false; return;
                         }
                     }
@@ -2477,7 +2420,7 @@ namespace MyAtas.Strategies
                 var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Cover side for brackets: coverSide={coverSide} (dir={dir})");
 
-                // OCO 1:1 por TP Ã¢â‚¬â€ cada TP lleva su propio trozo de SL
+                // OCO 1:1 por TP ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â cada TP lleva su propio trozo de SL
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Starting bracket loop: TakeProfits.Count={plan.TakeProfits.Count}");
 
                 // Reparto de cantidades por splits (sin ceros) - usar targetForEnforce
@@ -2490,7 +2433,7 @@ namespace MyAtas.Strategies
                     if (q <= 0) { if (EnableLogging) DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: skip (qty=0)"); continue; }
                     var tp = plan.TakeProfits[idx];
 
-                    // === VALIDACIÓN: NO enviar TP con precio ≤ 0 ===
+                    // === VALIDACIÃ“N: NO enviar TP con precio â‰¤ 0 ===
                     if (tp.Price <= 0m)
                     {
                         if (EnableLogging) DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: SKIP TP (price=0)");
@@ -2508,16 +2451,22 @@ namespace MyAtas.Strategies
                 // Armar el BE (vigilancia del TP trigger para mover SL a breakeven)
                 if (BreakEvenMode != RmBeMode.Off)
                 {
-                    // Calcular precio de TP basándonos en el R múltiple configurado (no en el array filtrado)
-                    var tpTrigger = Math.Clamp(BeTriggerTp, 1, 3);
-                    decimal tpRMultiple = tpTrigger == 1 ? TP1R : (tpTrigger == 2 ? TP2R : TP3R);
+                    // NUEVO: Leer R múltiple desde Targets UI (no legacy TP1R/TP2R/TP3R)
+                    // Funciona incluso si TP tiene % cobro = 0 (TP virtual para trigger BE)
+                    decimal tpRMultiple = GetBeRMultipleFromTargets();
+
+                    // LOG DE DIAGNÓSTICO: Verificar qué TP row se está usando
+                    var tgt = Targets;
+                    var row = BeTriggerTp == 1 ? tgt?.TP1 : BeTriggerTp == 2 ? tgt?.TP2 : tgt?.TP3;
+                    if (EnableLogging)
+                        DebugLog.W("RM/BE/CHECK", $"triggerTP={BeTriggerTp} uses R={row?.R:F2} pct={row?.Percent}% active={row?.Active} (virtual={(row?.Percent ?? 0) == 0})");
 
                     // Calcular distancia R desde el stop
                     var slPx = plan.StopLoss?.Price ?? 0m;
                     var r = dir > 0 ? (entryPx - slPx) : (slPx - entryPx);
                     if (r <= 0) r = tickSize; // fallback
 
-                    // Precio de TP = entry ± (R × múltiple)
+                    // Precio de TP = entry Â± (R Ã— mÃºltiple)
                     var tpPxRaw = entryPx + (dir > 0 ? (tpRMultiple * r) : -(tpRMultiple * r));
                     _beTargetPx = ShrinkPrice(tpPxRaw);  // tick-safe
                     _beDirHint  = dir;
@@ -2529,7 +2478,7 @@ namespace MyAtas.Strategies
                     {
                         var currentCandle = GetCandle(Math.Max(0, CurrentBar - 1));
                         _beArmedAtPrice = currentCandle?.Close ?? entryPx;
-                        _beMaxReached = 0m;  // Se inicializará en primer tick de GetLastPriceTriplet
+                        _beMaxReached = 0m;  // Se inicializarÃ¡ en primer tick de GetLastPriceTriplet
                         _beMinReached = 0m;
                     }
                     catch
@@ -2540,7 +2489,7 @@ namespace MyAtas.Strategies
                     }
 
                     if (EnableLogging)
-                        DebugLog.W("RM/BE", $"ARMED → mode={BreakEvenMode} triggerTP={tpTrigger} R={tpRMultiple} tpPx={_beTargetPx:F2} baseline={_beArmedAtPrice:F2} dir={(_beDirHint>0?"LONG":"SHORT")}");
+                        DebugLog.W("RM/BE", $"ARMED → mode={BreakEvenMode} triggerTP={BeTriggerTp} R={tpRMultiple:F1} tpPx={_beTargetPx:F2} baseline={_beArmedAtPrice:F2} dir={(_beDirHint>0?"LONG":"SHORT")}");
                 }
                 else
                 {
@@ -2568,7 +2517,7 @@ namespace MyAtas.Strategies
             try
             {
                 var shrunkPx = ShrinkPrice(triggerPx);
-                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop: ShrinkPrice({triggerPx:F2}) Ã¢â€ â€™ {shrunkPx:F2}");
+                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop: ShrinkPrice({triggerPx:F2}) ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ {shrunkPx:F2}");
 
                 var order = new Order
                 {
@@ -2576,15 +2525,15 @@ namespace MyAtas.Strategies
                     Security = Security,
                     Direction = side,
                     Type = OrderTypes.Stop,
-                    TriggerPrice = shrunkPx, // Ã¢â€ Â tick-safe
+                    TriggerPrice = shrunkPx, // ÃƒÂ¢Ã¢â‚¬ Ã‚Â tick-safe
                     QuantityToFill = qty,
                     OCOGroup = oco,
                     IsAttached = true,
                     Comment = comment
                 };
-                order.AutoCancel = true;             // Ã¢â€ Â cancelar al cerrar
-                TrySetReduceOnly(order);             // Ã¢â€ Â no abrir nuevas
-                TrySetCloseOnTrigger(order);         // Ã¢â€ Â cerrar al disparar
+                order.AutoCancel = true;             // ÃƒÂ¢Ã¢â‚¬ Ã‚Â cancelar al cerrar
+                TrySetReduceOnly(order);             // ÃƒÂ¢Ã¢â‚¬ Ã‚Â no abrir nuevas
+                TrySetCloseOnTrigger(order);         // ÃƒÂ¢Ã¢â‚¬ Ã‚Â cerrar al disparar
 
                 if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmStop: Calling OpenOrder() for SL");
                 OpenOrder(order);
@@ -2605,7 +2554,7 @@ namespace MyAtas.Strategies
             try
             {
                 var shrunkPx = ShrinkPrice(price);
-                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit: ShrinkPrice({price:F2}) Ã¢â€ â€™ {shrunkPx:F2}");
+                if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit: ShrinkPrice({price:F2}) ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ {shrunkPx:F2}");
 
                 var order = new Order
                 {
@@ -2613,14 +2562,14 @@ namespace MyAtas.Strategies
                     Security = Security,
                     Direction = side,
                     Type = OrderTypes.Limit,
-                    Price = shrunkPx,       // Ã¢â€ Â tick-safe
+                    Price = shrunkPx,       // ÃƒÂ¢Ã¢â‚¬ Ã‚Â tick-safe
                     QuantityToFill = qty,
                     OCOGroup = oco,
                     IsAttached = true,
                     Comment = comment
                 };
-                order.AutoCancel = true;             // Ã¢â€ Â cancelar al cerrar
-                TrySetReduceOnly(order);             // Ã¢â€ Â no abrir nuevas
+                order.AutoCancel = true;             // ÃƒÂ¢Ã¢â‚¬ Ã‚Â cancelar al cerrar
+                TrySetReduceOnly(order);             // ÃƒÂ¢Ã¢â‚¬ Ã‚Â no abrir nuevas
 
                 if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmLimit: Calling OpenOrder() for TP");
                 OpenOrder(order);
@@ -2649,7 +2598,7 @@ namespace MyAtas.Strategies
                     QuantityToFill = qty,
                     Comment = comment
                 };
-                // IMPORTANTE: no marcar ReduceOnly aquÃƒÂ­ Ã¢â‚¬â€ queremos abrir delta
+                // IMPORTANTE: no marcar ReduceOnly aquÃƒÆ’Ã‚Â­ ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â queremos abrir delta
                 if (EnableLogging) DebugLog.W("RM/ORD", $"SubmitRmMarket: Calling OpenOrder() for {side} +{qty} (ReduceOnly=false)");
                 OpenOrder(order);
                 if (EnableLogging) DebugLog.W("RM/ORD", $"ENFORCE MARKET SENT: {side} +{qty} @{GetLastPriceSafe():F2} comment={comment}");
@@ -2678,12 +2627,12 @@ namespace MyAtas.Strategies
                 var c = GetCandle(barIdx);
                 if (c == null) return (0m, 0m, 0m);
 
-                // Si BE no armado → datos normales de barra
+                // Si BE no armado â†’ datos normales de barra
                 if (!_beArmed || _beArmedAtPrice == 0m)
                     return (c.Close, c.High, c.Low);
 
-                // BE armado → trackear extremos SOLO con el último precio (post-armado)
-                var last = GetLastPriceSafe();  // último trade/close del tick actual
+                // BE armado â†’ trackear extremos SOLO con el Ãºltimo precio (post-armado)
+                var last = GetLastPriceSafe();  // Ãºltimo trade/close del tick actual
                 if (_beMaxReached == 0m) _beMaxReached = _beArmedAtPrice;
                 if (_beMinReached == 0m) _beMinReached = _beArmedAtPrice;
 
@@ -2710,7 +2659,7 @@ namespace MyAtas.Strategies
                     var st = o.Status();
                     // Consider LIVE only when actively working according to ATAS enum:
                     // Placed (working) or PartlyFilled (still has remainder). Ignore None/Filled/Canceled.
-                    // Considera temporalmente "None" como working si así lo pedimos (latencia de registro)
+                    // Considera temporalmente "None" como working si asÃ­ lo pedimos (latencia de registro)
                     if (!o.Canceled && (st == OrderStatus.Placed || st == OrderStatus.PartlyFilled || (includeNone && st == OrderStatus.None)))
                         return true;
                 }
@@ -2773,7 +2722,7 @@ namespace MyAtas.Strategies
         {
             try
             {
-                // UniÃƒÂ³n: ÃƒÂ³rdenes de la estrategia + externas detectadas (ChartTrader)
+                // UniÃƒÆ’Ã‚Â³n: ÃƒÆ’Ã‚Â³rdenes de la estrategia + externas detectadas (ChartTrader)
                 var union = new System.Collections.Generic.List<Order>();
                 if (this.Orders != null) union.AddRange(this.Orders);
                 lock (_liveOrdersLock) union.AddRange(_liveOrders);
@@ -2783,7 +2732,7 @@ namespace MyAtas.Strategies
                 foreach (var o in union)
                 {
                     if (o == null) continue;
-                    // Mismo instrumento/portfolio (comparaciÃƒÂ³n laxa por ToString para evitar tipos internos)
+                    // Mismo instrumento/portfolio (comparaciÃƒÆ’Ã‚Â³n laxa por ToString para evitar tipos internos)
                     if (o.Security?.ToString() != Security?.ToString()) continue;
                     if (o.Portfolio?.ToString() != Portfolio?.ToString()) continue;
                     var oid = o.Id ?? $"{o.GetHashCode()}";
@@ -2820,7 +2769,7 @@ namespace MyAtas.Strategies
                 // 1) Strategy-owned way (works for this strategy orders)
                 try { CancelOrder(o); return true; } catch { /* might not belong to strategy */ }
 
-                // 2) TradingManager (platform-level) Ã¢â‚¬â€ sync variant
+                // 2) TradingManager (platform-level) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â sync variant
                 var tm = this.TradingManager;
                 if (tm != null)
                 {
@@ -2857,13 +2806,13 @@ namespace MyAtas.Strategies
                     .CreateExtendedOptions(order.Type);
                 if (flags is ATAS.DataFeedsCore.IOrderOptionReduceOnly ro)
                 {
-                    ro.ReduceOnly = true;   // evita abrir posiciÃƒÂ³n nueva
+                    ro.ReduceOnly = true;   // evita abrir posiciÃƒÆ’Ã‚Â³n nueva
                     order.ExtendedOptions = flags;
                 }
             } catch { }
         }
 
-        // Flatten por TradingManager (cascada de firmas). Devuelve true si se invocÃƒÂ³ alguna variante.
+        // Flatten por TradingManager (cascada de firmas). Devuelve true si se invocÃƒÆ’Ã‚Â³ alguna variante.
         private bool TryClosePositionViaTradingManager()
         {
             try
@@ -2871,7 +2820,7 @@ namespace MyAtas.Strategies
                 var tm = this.TradingManager;
                 if (tm == null)
                 {
-                    if (EnableLogging) DebugLog.W("RM/STOP", "TradingManager null Ã¢â€ â€™ fallback MARKET");
+                    if (EnableLogging) DebugLog.W("RM/STOP", "TradingManager null ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ fallback MARKET");
                     return false;
                 }
 
@@ -2932,12 +2881,12 @@ namespace MyAtas.Strategies
                     return true;
                 }
 
-                if (EnableLogging) DebugLog.W("RM/STOP", "ClosePosition* not found Ã¢â€ â€™ fallback MARKET");
+                if (EnableLogging) DebugLog.W("RM/STOP", "ClosePosition* not found ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ fallback MARKET");
                 return false;
             }
             catch (Exception ex)
             {
-                if (EnableLogging) DebugLog.W("RM/STOP", $"TryClosePositionViaTradingManager EX: {ex.Message} Ã¢â€ â€™ fallback MARKET");
+                if (EnableLogging) DebugLog.W("RM/STOP", $"TryClosePositionViaTradingManager EX: {ex.Message} ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ fallback MARKET");
                 return false;
             }
         }
@@ -2967,7 +2916,7 @@ namespace MyAtas.Strategies
                 {
                     var c = o?.Comment ?? "";
                     if (!c.StartsWith(prefix)) return false;
-                    // consideramos viva si NO estÃƒÂ¡ cancelada y NO estÃƒÂ¡ llena
+                    // consideramos viva si NO estÃƒÆ’Ã‚Â¡ cancelada y NO estÃƒÆ’Ã‚Â¡ llena
                     var st = o.Status();
                     return !o.Canceled
                            && st != OrderStatus.Filled
@@ -2977,7 +2926,7 @@ namespace MyAtas.Strategies
             catch { return false; }
         }
 
-        // Log de cancelaciÃƒÂ³n fallida (para ver por quÃƒÂ© queda algo "working")
+        // Log de cancelaciÃƒÆ’Ã‚Â³n fallida (para ver por quÃƒÆ’Ã‚Â© queda algo "working")
         protected override void OnOrderCancelFailed(Order order, string message)
         {
             if (!EnableLogging) return;
@@ -2988,7 +2937,7 @@ namespace MyAtas.Strategies
         }
 
         // ========= Helpers de neta y flatten =========
-        // Siempre usa el snapshot de CUENTA (TM.Position/Portfolio). No uses CurrentPosition aquÃƒÂ­.
+        // Siempre usa el snapshot de CUENTA (TM.Position/Portfolio). No uses CurrentPosition aquÃƒÆ’Ã‚Â­.
         private int ReadNetPositionSafe()
         {
             try { return ReadNetPosition(); } catch { return 0; }
@@ -3012,7 +2961,7 @@ namespace MyAtas.Strategies
             return false;
         }
 
-        // EnvÃƒÂ­a (si hace falta) la orden MARKET reduce-only para quedar flat.
+        // EnvÃƒÆ’Ã‚Â­a (si hace falta) la orden MARKET reduce-only para quedar flat.
         // Evita duplicarla si ya hay una STPFLAT "working".
         private void EnsureFlattenOutstanding(string reason)
         {
@@ -3041,7 +2990,7 @@ namespace MyAtas.Strategies
                     QuantityToFill = qty,
                     Comment        = comment
                 };
-                TrySetReduceOnly(o); // evita abrir si hay desincronizaciÃƒÂ³n
+                TrySetReduceOnly(o); // evita abrir si hay desincronizaciÃƒÆ’Ã‚Â³n
                 OpenOrder(o);
                 if (EnableLogging) DebugLog.W("RM/STOP", $"Flatten MARKET sent: {side} {qty} ({reason}) comment={comment}");
             }
@@ -3058,11 +3007,11 @@ namespace MyAtas.Strategies
             try
             {
                 // Usar nuestras variables de tracking internas en lugar de ReadPositionSnapshot()
-                // porque ReadPositionSnapshot() puede devolver 0 en replay/simulación
+                // porque ReadPositionSnapshot() puede devolver 0 en replay/simulaciÃ³n
                 var currentQty = _currentPositionQty;
                 var avgPrice = _currentPositionEntryPrice;
 
-                // Calcular P&L no realizado de posición abierta
+                // Calcular P&L no realizado de posiciÃ³n abierta
                 decimal unrealizedPnL = 0m;
                 if (currentQty != 0 && avgPrice > 0m)
                 {
@@ -3070,14 +3019,14 @@ namespace MyAtas.Strategies
                     var tickValue = ResolveTickValueUSD();
                     var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
 
-                    // P&L = (LastPrice - AvgPrice) × Qty × (TickValue / TickSize)
-                    // Para SHORT: P&L = (AvgPrice - LastPrice) × Qty × (TickValue / TickSize)
+                    // P&L = (LastPrice - AvgPrice) Ã— Qty Ã— (TickValue / TickSize)
+                    // Para SHORT: P&L = (AvgPrice - LastPrice) Ã— Qty Ã— (TickValue / TickSize)
                     var priceDiff = currentQty > 0 ? (lastPrice - avgPrice) : (avgPrice - lastPrice);
                     var ticks = priceDiff / tickSize;
                     unrealizedPnL = ticks * tickValue * Math.Abs(currentQty);
 
                     if (EnableLogging && Math.Abs(unrealizedPnL) > 0.01m)
-                        DebugLog.W("RM/PNL", $"Unrealized calc: currentQty={currentQty} entry={avgPrice:F2} last={lastPrice:F2} priceDiff={priceDiff:F2} ticks={ticks:F2} tickVal={tickValue:F2} → unrealized={unrealizedPnL:F2}");
+                        DebugLog.W("RM/PNL", $"Unrealized calc: currentQty={currentQty} entry={avgPrice:F2} last={lastPrice:F2} priceDiff={priceDiff:F2} ticks={ticks:F2} tickVal={tickValue:F2} â†’ unrealized={unrealizedPnL:F2}");
                 }
 
                 // Session P&L = Realized + Unrealized
@@ -3097,51 +3046,38 @@ namespace MyAtas.Strategies
             try
             {
                 if (_currentPositionQty == 0 || _currentPositionEntryPrice == 0m)
-                { if (EnableLogging) DebugLog.W("RM/PNL", "TrackPositionClose: No position tracked to close"); return; }
+                {
+                    if (EnableLogging) DebugLog.W("RM/PNL", "TrackPositionClose: No position tracked to close");
+                    return;
+                }
 
                 var tickValue = ResolveTickValueUSD();
-                var tickSize  = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+                var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
 
-                // P&L del fill
-                var priceDiff = direction > 0 ? (exitPrice - _currentPositionEntryPrice)
-                                              : (_currentPositionEntryPrice - exitPrice);
-                var ticks     = priceDiff / tickSize;
-                var tradePnL  = ticks * tickValue * Math.Abs(qty);
+                // Calcular P&L de la posiciÃ³n cerrada
+                // Para LONG: P&L = (ExitPrice - EntryPrice) Ã— Qty Ã— (TickValue / TickSize)
+                // Para SHORT: P&L = (EntryPrice - ExitPrice) Ã— Qty Ã— (TickValue / TickSize)
+                var priceDiff = direction > 0 ? (exitPrice - _currentPositionEntryPrice) : (_currentPositionEntryPrice - exitPrice);
+                var ticks = priceDiff / tickSize;
+                var tradePnL = ticks * tickValue * Math.Abs(qty);
 
-                // Realized de la sesión
                 _sessionRealizedPnL += tradePnL;
 
-                // ===== MÉTRICAS =====
-                _sessionRealizedUsd += tradePnL;
-                _sumTradeUsd        += tradePnL;
-                if (tradePnL > _bestTrade)  _bestTrade  = tradePnL;
-                if (tradePnL < _worstTrade) _worstTrade = tradePnL;
-
-                if (tradePnL > 0m) { _wins++; _sumWinsUsd += tradePnL; if (direction > 0) _winsLong++; else if (direction < 0) _winsShort++; }
-                else if (tradePnL < 0m) { _losses++; _sumLossUsd += tradePnL; }
-                else { _breakevens++; }
-
-                if (direction > 0) LongPnL  += tradePnL; else if (direction < 0) ShortPnL += tradePnL;
-                if (_lastEntryRiskUsd > 0m) _totalR += tradePnL / _lastEntryRiskUsd;
-                if (_lastEntryTimeUtc != DateTime.MinValue) _sumHold += (DateTime.UtcNow - _lastEntryTimeUtc);
-                _lastEntryTimeUtc = DateTime.MinValue;
-                _lastEntryRiskUsd = 0m;
-
-                _realizedCurvePeak = Math.Max(_realizedCurvePeak, _sessionRealizedUsd);
-                var dd = _realizedCurvePeak - _sessionRealizedUsd;
-                if (dd > MaxDrawdownUsd) MaxDrawdownUsd = dd;
-
                 if (EnableLogging)
-                    DebugLog.W("RM/STATS", $"CLOSED dir={(direction>0?"LONG":"SHORT")} pnl={tradePnL:F2} " +
-                                            $"wins={_wins} losses={_losses} WR={WinRatePct:F2}% maxDD={MaxDrawdownUsd:F2} ∑R={_totalR:F3}");
+                    DebugLog.W("RM/PNL", $"Position close: Entry={_currentPositionEntryPrice:F2} Exit={exitPrice:F2} Qty={qty} Dir={direction} â†’ P&L={tradePnL:F2} (Total Realized={_sessionRealizedPnL:F2})");
 
-                // Reducir qty trackeada
+                // Actualizar posiciÃ³n actual
                 _currentPositionQty = Math.Abs(_currentPositionQty) - Math.Abs(qty);
                 if (_currentPositionQty == 0)
-                { _currentPositionEntryPrice = 0m; if (EnableLogging) DebugLog.W("RM/PNL", "Position fully closed"); }
+                {
+                    _currentPositionEntryPrice = 0m;
+                    if (EnableLogging) DebugLog.W("RM/PNL", "Position fully closed");
+                }
             }
             catch (Exception ex)
-            { if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionClose EX: {ex.Message}"); }
+            {
+                if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionClose EX: {ex.Message}");
+            }
         }
 
         private void TrackPositionEntry(decimal entryPrice, int qty, int direction)
@@ -3150,30 +3086,26 @@ namespace MyAtas.Strategies
             {
                 if (_currentPositionQty == 0)
                 {
+                    // Nueva posiciÃ³n
                     _currentPositionEntryPrice = entryPrice;
-                    _currentPositionQty = qty * direction;
-                    if (EnableLogging) DebugLog.W("RM/PNL", $"Position entry: Price={entryPrice:F2} Qty={qty} Dir={direction} → Tracking started");
+                    _currentPositionQty = qty * direction;  // signed: +LONG / -SHORT
+                    if (EnableLogging)
+                        DebugLog.W("RM/PNL", $"Position entry: Price={entryPrice:F2} Qty={qty} Dir={direction} â†’ Tracking started");
                 }
                 else
                 {
+                    // Incremento de posiciÃ³n existente (promedio ponderado)
                     var totalQty = Math.Abs(_currentPositionQty) + Math.Abs(qty);
                     _currentPositionEntryPrice = (_currentPositionEntryPrice * Math.Abs(_currentPositionQty) + entryPrice * Math.Abs(qty)) / totalQty;
                     _currentPositionQty = totalQty * direction;
-                    if (EnableLogging) DebugLog.W("RM/PNL", $"Position add: NewEntry={entryPrice:F2} Qty={qty} → AvgEntry={_currentPositionEntryPrice:F2} TotalQty={totalQty}");
+                    if (EnableLogging)
+                        DebugLog.W("RM/PNL", $"Position add: NewEntry={entryPrice:F2} Qty={qty} â†’ AvgEntry={_currentPositionEntryPrice:F2} TotalQty={totalQty}");
                 }
-                // Riesgo inicial (USD) y timestamp
-                try
-                {
-                    var tickSize  = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
-                    var tickValue = ResolveTickValueUsd(Security?.ToString() ?? "", TickValueOverrides, FallbackTickValueUsd);
-                    var riskPerContractUsd = Math.Abs(entryPrice - _lastPlannedStopPrice) / Math.Max(0.0000001m, tickSize) * tickValue;
-                    _lastEntryRiskUsd = Math.Max(0m, riskPerContractUsd * Math.Max(1, qty));
-                    _lastEntryTimeUtc = DateTime.UtcNow;
-                }
-                catch { _lastEntryRiskUsd = 0m; _lastEntryTimeUtc = DateTime.UtcNow; }
             }
             catch (Exception ex)
-            { if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionEntry EX: {ex.Message}"); }
+            {
+                if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionEntry EX: {ex.Message}");
+            }
         }
 
     }
