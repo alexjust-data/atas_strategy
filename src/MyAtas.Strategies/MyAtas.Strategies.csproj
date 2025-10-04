@@ -2,6 +2,7 @@
   <PropertyGroup>
     <TargetFramework>net8.0-windows</TargetFramework>
     <UseWPF>true</UseWPF>
+    <UseWindowsForms>true</UseWindowsForms>
     <OutputType>Library</OutputType>
     <AssemblyName>MyAtas.Strategies</AssemblyName>
     <PlatformTarget>x64</PlatformTarget>
@@ -11,6 +12,8 @@
   <ItemGroup>
     <ProjectReference Include="..\MyAtas.Shared\MyAtas.Shared.csproj" />
     <ProjectReference Include="..\MyAtas.Indicators\MyAtas.Indicators.csproj" />
+    <ProjectReference Include="..\MyAtas.Risk\MyAtas.Risk.csproj" />
+    <ProjectReference Include="..\MyAtas.Bridges\MyAtas.Bridges.csproj" />
   </ItemGroup>
 
   <ItemGroup>
@@ -34,4 +37,10 @@
     <!-- WPF core -->
     <Reference Include="PresentationCore" />
   </ItemGroup>
+
+  <!-- Copiar MyAtas.Bridges.dll al directorio de salida -->
+  <Target Name="CopyBridgesDll" AfterTargets="Build">
+    <Copy SourceFiles="..\MyAtas.Bridges\bin\$(Configuration)\net8.0\MyAtas.Bridges.dll"
+          DestinationFolder="$(OutDir)" />
+  </Target>
 </Project>

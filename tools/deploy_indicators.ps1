@@ -11,7 +11,7 @@ if ($LASTEXITCODE -ne 0) {
 }
 
 # Set destination path directly
-$dst = 'C:\Users\AlexJ\AppData\Roaming\ATAS\Indicators'
+$dst = "C:\Users\AlexJ\AppData\Roaming\ATAS\Indicators"
 Write-Host "📦 Deploying to $dst..." -ForegroundColor Green
 
 # Create directory if not exists

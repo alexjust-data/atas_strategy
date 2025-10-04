@@ -46,7 +46,7 @@ namespace MyAtas.Shared
     public static class DebugLog
     {
         private static readonly object _lockObj = new object();
-        private static readonly string _projectRoot = @"C:\Users\AlexJ\Desktop\projects\01_atas\06_ATAS_strategy - v2";
+        private static readonly string _projectRoot = @"C:\Users\AlexJ\Desktop\projects\01_atas\07_ATAS_Risk_468 - v2";
 
         // Rutas de archivos del sistema dual
         private static readonly string _emergencyPath = Path.Combine(_projectRoot, "logs", "emergency", "EMERGENCY_ATAS_LOG.txt");

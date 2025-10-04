@@ -17,322 +17,91 @@ namespace MyAtas.Strategies
 
     // ====================== RISK MANAGEMENT ENUMS ======================
     public enum PositionSizingMode { Manual, FixedRiskUSD, PercentOfAccount }
-    public enum BreakevenMode { Disabled, Manual, OnTPFill }
+    public enum BreakevenMode { Disabled, Manual, OnTPFill, OnTPVirtualTouch }
 
     [DisplayName("468 – Simple Strategy (GL close + 2 confluences) - FIXED")]
-    public class FourSixEightSimpleStrategy : ChartStrategy
+    public partial class FourSixEightSimpleStrategy : ChartStrategy
     {
-        #region ===== RISK CORE (clean) =====
-        // Flags Capa 0 (deben existir ya)
-        // public bool EnableRiskManagement { get; set; } = false;
-        // public bool RiskDryRun { get; set; } = true;
-        private bool RMEnabled => EnableRiskManagement;
-        private bool RMDryRunEffective => !EnableRiskManagement || RiskDryRun;
-
-        // Gating de logs (respetan Capa 0)
-        private void RiskLog(string tag, string message)
+        // --- Helper: net por suma de fills (BUY=+1, SELL=-1) ---
+        private int NetByFills()
         {
-            if (tag == "468/RISK" && !RMEnabled) return;
-            MyAtas.Shared.DebugLog.W(tag, message);
-        }
-        private void CalcLog(string tag, string message)
-        {
-            if (tag == "468/CALC" && !RMEnabled) return;
-            MyAtas.Shared.DebugLog.W(tag, message);
+            try { return _orderFills?.Values.Sum() ?? 0; }
+            catch { return 0; }
         }
 
-        // Cache símbolo + fuente
-        private string _cachedSecurityCode;
-        private string _cachedSymbolSource;
-
-        /// <summary>
-        /// Símbolo efectivo (cacheado).
-        /// Prioridad: InstrumentInfo.Instrument → Security.Instrument → Security.Code → Instrument → "UNKNOWN"
-        /// </summary>
-        private string GetEffectiveSecurityCode()
+        // *** PHANTOM FIX: Registro robusto de signo por orden hija ***
+        private void RegisterChildSign(string orderId, int dir, bool isEntry)
         {
-            try
+            // Convención de signos:
+            //  - ENTRY aporta dir * qty al netByFills (abre posición)
+            //  - TP/SL aportan -dir * qty (cierran/reducen)
+            int sign = isEntry ? dir : -dir;
+            if (!string.IsNullOrEmpty(orderId))
             {
-                if (!string.IsNullOrWhiteSpace(_cachedSecurityCode))
-                    return _cachedSecurityCode;
-
-                // P1: InstrumentInfo.Instrument (reflexión para compatibilidad)
-                try
-                {
-                    var ii = GetType().GetProperty("InstrumentInfo",
-                        System.Reflection.BindingFlags.Instance |
-                        System.Reflection.BindingFlags.Public |
-                        System.Reflection.BindingFlags.NonPublic)?.GetValue(this);
-                    if (ii != null)
-                    {
-                        var p = ii.GetType().GetProperty("Instrument");
-                        var name = p?.GetValue(ii) as string;
-                        if (!string.IsNullOrWhiteSpace(name))
-                        {
-                            if (EnableDetailedRiskLogging)
-                                RiskLog("468/RISK", $"SYMBOL source=InstrumentInfo.Instrument value={name}");
-                            _cachedSecurityCode = name.Trim().ToUpperInvariant();
-                            _cachedSymbolSource = "InstrumentInfo.Instrument";
-                            return _cachedSecurityCode;
-                        }
-                    }
-                }
-                catch { /* best effort */ }
-
-                // P2: Security.Instrument
-                if (!string.IsNullOrWhiteSpace(Security?.Instrument))
-                {
-                    if (EnableDetailedRiskLogging)
-                        RiskLog("468/RISK", $"SYMBOL source=Security.Instrument value={Security.Instrument}");
-                    _cachedSecurityCode = Security.Instrument.Trim().ToUpperInvariant();
-                    _cachedSymbolSource = "Security.Instrument";
-                    return _cachedSecurityCode;
-                }
-
-                // P3: Security.Code
-                if (!string.IsNullOrWhiteSpace(Security?.Code))
-                {
-                    if (EnableDetailedRiskLogging)
-                        RiskLog("468/RISK", $"SYMBOL source=Security.Code value={Security.Code}");
-                    _cachedSecurityCode = Security.Code.Trim().ToUpperInvariant();
-                    _cachedSymbolSource = "Security.Code";
-                    return _cachedSecurityCode;
-                }
-
-                // P4: Instrument (base)
-                if (!string.IsNullOrWhiteSpace(Instrument))
-                {
-                    if (EnableDetailedRiskLogging)
-                        RiskLog("468/RISK", $"SYMBOL source=Instrument value={Instrument}");
-                    _cachedSecurityCode = Instrument.Trim().ToUpperInvariant();
-                    _cachedSymbolSource = "Instrument";
-                    return _cachedSecurityCode;
-                }
-
-                RiskLog("468/RISK", "SYMBOL source=fallback value=UNKNOWN (no detection)");
-                _cachedSecurityCode = "UNKNOWN";
-                _cachedSymbolSource = "fallback";
-                return _cachedSecurityCode;
-            }
-            catch (Exception ex)
-            {
-                RiskLog("468/RISK", $"SYMBOL error: {ex.Message} -> fallback=UNKNOWN");
-                _cachedSecurityCode = "UNKNOWN";
-                _cachedSymbolSource = "error";
-                return _cachedSecurityCode;
+                _childSign[orderId] = sign;
+                DebugLog.W("468/POS", $"RegisterChildSign: {orderId} = {sign} (dir={dir} isEntry={isEntry})");
             }
         }
 
-        /// <summary>
-        /// Fuente única para tick value con override-first logic
-        /// Prioridad: CSV override → Security.TickCost → fallback
-        /// </summary>
-        private decimal GetEffectiveTickValue()
+        // *** PHANTOM FIX: Limpieza atómica tras confirmación de flat ***
+        private void AtomicFlatCleanup(string reason)
         {
-            // 1) Override por símbolo
-            var sym = GetEffectiveSecurityCode(); // cacheado + log en INIT
-            var fromCsv = TryGetTickValueOverride(sym); // tu parsing actual
-            if (fromCsv.HasValue && fromCsv.Value > 0)
-            {
-                RiskLog("468/RISK", $"TICK-VALUE override hit sym={sym} value={fromCsv.Value:F2}");
-                return fromCsv.Value;
-            }
-
-            // 2) Autodetección segura (Security.TickCost si existe y >0)
-            var auto = (Security != null ? Security.TickCost : 0m);
-            if (auto > 0)
-            {
-                RiskLog("468/RISK", $"TICK-VALUE auto-detected value={auto:F2}");
-                return auto;
-            }
-
-            // 3) Fallback conocido (0.5m para MNQ/micro futures)
-            var fb = 0.5m;
-            RiskLog("468/RISK", $"TICK-VALUE fallback value={fb:F2}");
-            return fb;
+            _tradeActive = false;
+            _bracketsPlaced = false;
+            _bracketsAttachedAt = DateTime.MinValue;
+            _antiFlatUntilBar = -1;
+            _flatStreak = 0;
+            _lastFlatRead = DateTime.MinValue;
+            _orderFills.Clear();
+            _childSign.Clear();
+            _cachedNetPosition = 0;
+            _breakevenApplied = false;
+            _entryPrice = 0m;
+            _beLastTouchBar = -1;
+            _beLastTouchAt = DateTime.MinValue;
+            // Reset Virtual BE state
+            _virtualBeArmed = false;
+            _virtualBeDone = false;
+            _virtualBeTargetPx = 0m;
+            _virtualBeStopPx = 0m;
+            _virtualBeTouchBar = -1;
+            _virtualBeTouchAt = DateTime.MinValue;
+            DebugLog.W("468/POS", $"ATOMIC FLAT CLEANUP: {reason} → cleared fills/cache/childSign/virtualBE");
         }
 
-        /// <summary>
-        /// Equity efectivo sin CS1061. Patrón simplificado.
-        /// Manual override → Portfolio.BalanceAvailable → Portfolio.Balance → fallback
-        /// </summary>
-        private decimal GetEffectiveAccountEquity()
+        // --- Helper: ¿estado terminal? (no deben contarse como activos) ---
+        private static bool IsTerminal(OrderStatus s)
+            => s == OrderStatus.Filled
+            || s == OrderStatus.Canceled;
+
+        // --- Helper: ¿orden hija viva (TP/SL) con prefijo concreto? ---
+        private bool IsLiveChild(Order o, string prefix)
         {
-            // Manual override first
-            if (ManualAccountEquityOverride > 0) return ManualAccountEquityOverride;
-
-            try
-            {
-                var avail = Portfolio?.BalanceAvailable; // decimal?
-                if (avail.HasValue && avail.Value > 0) return avail.Value;
-
-                var bal = Portfolio?.Balance ?? 0m;     // decimal (no nullable)
-                if (bal > 0) return bal;
-            }
-            catch { /* swallow & fallback */ }
-
-            return 10000.0m; // fallback (o tu valor por defecto)
+            if (o == null) return false;
+            var comment = o.Comment ?? string.Empty;
+            if (!comment.StartsWith(prefix)) return false;
+            // Null-safe al leer Status() (algunos conectores pueden devolverlo nulo en microventanas)
+            var status = o.Status();
+            if (status != null && IsTerminal(status)) return false;
+            if (status == null) { /* conservador: no lo trates como terminal */ }
+            // Solo considerar activas las órdenes con State=Active (coherente con API ATAS)
+            return o.State == OrderStates.Active;
         }
 
-        /// <summary>
-        /// Diagnóstico consolidado: actualiza TickValue/Size/Equity con prioridad
-        /// Security.TickSize → InstrumentInfo.TickSize → fallback interno.
-        /// </summary>
-        private void UpdateDiagnostics()
+        // --- Helper: cuenta TPs activos ---
+        private int CountActiveTPs()
         {
-            try
-            {
-                // Efectivos (diagnóstico)
-                EffectiveTickValue = GetEffectiveTickValue();
-                EffectiveAccountEquity = GetEffectiveAccountEquity();
-
-                // TickSize
-                decimal ts = 0m;
-                if (Security != null && Security.TickSize > 0)
-                    ts = Security.TickSize;
-
-                if (ts <= 0m)
-                {
-                    try
-                    {
-                        var ii = GetType().GetProperty("InstrumentInfo",
-                            System.Reflection.BindingFlags.Instance |
-                            System.Reflection.BindingFlags.Public |
-                            System.Reflection.BindingFlags.NonPublic)?.GetValue(this);
-                        if (ii != null)
-                        {
-                            var pTs = ii.GetType().GetProperty("TickSize");
-                            var infoTs = (pTs?.GetValue(ii) as decimal?) ?? 0m;
-                            if (infoTs > 0) ts = infoTs;
-                        }
-                    }
-                    catch { /* best-effort */ }
-                }
-
-                if (ts <= 0m)
-                    ts = EffectiveTickSize > 0 ? EffectiveTickSize : 0.25m; // último recurso
-
-                EffectiveTickSize = ts;
-
-                // Throttling + de-dup para DIAG logs
-                if (EnableDetailedRiskLogging)
-                {
-                    var bar = CurrentBar;
-                    var code = GetEffectiveSecurityCode();
-                    var qc = Security?.QuoteCurrency ?? "USD";
-                    var hash = $"{EffectiveTickValue:F4}|{EffectiveTickSize:F4}|{EffectiveAccountEquity:F2}";
-
-                    if (hash != _lastDiagHash || _lastDiagRefreshBar < 0 || (bar - _lastDiagRefreshBar) >= 20)
-                    {
-                        RiskLog("468/RISK", $"DIAG [{code}] tickValue={EffectiveTickValue:F2}{qc}/t " +
-                                            $"tickSize={EffectiveTickSize:F4}pts/t " +
-                                            $"equity={EffectiveAccountEquity:F2}USD");
-                        _lastDiagHash = hash;
-                        _lastDiagRefreshBar = bar;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                RiskLog("468/RISK", $"UpdateDiagnostics error: {ex.Message}");
-            }
+            try { return _liveOrders?.Count(o => IsLiveChild(o, "468TP:")) ?? 0; }
+            catch { return 0; }
         }
 
-        /// <summary>
-        /// Parses tick value overrides from CSV string format
-        /// Format: "MNQ=0.5;NQ=5;MES=1.25;ES=12.5"
-        /// </summary>
-        private Dictionary<string, decimal> ParseTickValueOverrides()
+        // --- Helper: cuenta SLs activos ---
+        private int CountActiveSLs()
         {
-            var result = new Dictionary<string, decimal>();
-
-            try
-            {
-                if (string.IsNullOrWhiteSpace(TickValueOverrides))
-                    return result;
-
-                var pairs = TickValueOverrides.Split(';');
-                foreach (var pair in pairs)
-                {
-                    if (string.IsNullOrWhiteSpace(pair)) continue;
-
-                    var parts = pair.Split('=');
-                    if (parts.Length == 2)
-                    {
-                        var symbol = parts[0].Trim().ToUpper();
-                        if (decimal.TryParse(parts[1].Trim(), System.Globalization.NumberStyles.Number,
-                            System.Globalization.CultureInfo.InvariantCulture, out var value) && value > 0)
-                        {
-                            result[symbol] = value;
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                RiskLog("468/RISK", $"ParseTickValueOverrides error: {ex.Message}");
-            }
-
-            return result;
+            try { return _liveOrders?.Count(o => IsLiveChild(o, "468SL:")) ?? 0; }
+            catch { return 0; }
         }
 
-        /// <summary>
-        /// Try to get tick value override for specific symbol
-        /// </summary>
-        private decimal? TryGetTickValueOverride(string symbol)
-        {
-            if (string.IsNullOrWhiteSpace(symbol)) return null;
-
-            var overrides = ParseTickValueOverrides();
-            if (overrides.TryGetValue(symbol.ToUpperInvariant(), out var value) && value > 0)
-                return value;
-
-            return null;
-        }
-
-        /// <summary>
-        /// CAPA 7 — Calcula distancia real de SL (en ticks) desde entryPrice y stopPrice.
-        /// </summary>
-        private decimal ComputeActualSlTicks(decimal entryPrice, decimal stopPrice)
-        {
-            try
-            {
-                var ts = (EffectiveTickSize > 0 ? EffectiveTickSize : (Security != null && Security.TickSize > 0 ? Security.TickSize : 0.25m));
-                if (ts <= 0) ts = 0.25m;
-                var distPts = Math.Abs(entryPrice - stopPrice);
-                var ticks = distPts / ts;
-                // Saneamiento
-                if (ticks < 0) ticks = 0;
-                if (ticks > 10000) ticks = 10000;
-                return ticks;
-            }
-            catch { return 0m; }
-        }
-
-        /// <summary>
-        /// CAPA 7 — Placeholder para encontrar la orden de STOP asociada a una ENTRY.
-        /// TODO: Implementar con tu mecanismo real de brackets.
-        /// </summary>
-        private Order FindAttachedStopFor(Order entryOrder)
-        {
-            // Placeholder - retorna null por ahora
-            // En implementación real, buscarías en _liveOrders o brackets por relación con entryOrder
-            return null;
-        }
-
-        /// <summary>
-        /// Detecta cambios intrasesión de modo DRY-RUN/LIVE y los registra
-        /// </summary>
-        private void CheckAndLogModeSwitch()
-        {
-            var eff = RMDryRunEffective;
-            if (eff != _lastEffectiveDryRun)
-            {
-                RiskLog("468/RISK", $"MODE-SWITCH DryRun {(_lastEffectiveDryRun ? "ON" : "OFF")}->{(eff ? "ON" : "OFF")}");
-                _lastEffectiveDryRun = eff;
-            }
-        }
-        #endregion
         // ====================== USER PARAMETERS ======================
         [Category("General"), DisplayName("Quantity")]
         public int Quantity { get; set; } = 1;
@@ -398,10 +167,6 @@ namespace MyAtas.Strategies
         [Category("Execution"), DisplayName("Top-up missing qty to target")]
         public bool TopUpMissingQty { get; set; } = false;
 
-        [System.ComponentModel.DisplayName("Enable Bracket Watchdog")]
-        [Category("Execution")]
-        public bool EnableBracketWatchdog { get; set; } = true;
-
         // --- Anti-flat window (para evitar cancelaciones por net=0 fantasma justo tras colgar brackets)
         [Category("Execution"), DisplayName("Anti-flat lock (ms)")]
         public int AntiFlatMs { get; set; } = 600;
@@ -435,69 +200,37 @@ namespace MyAtas.Strategies
         [Category("Risk/Timing"), DisplayName("Enable flat watchdog failsafe")]
         public bool EnableFlatWatchdog { get; set; } = true;
 
-        // ====================== CAPA 0 — FLAGS RISK MANAGEMENT ======================
-        [System.ComponentModel.DisplayName("Enable Risk Management")]
-        [System.ComponentModel.Category("Risk Management")]
-        [System.ComponentModel.Description("Activa el subsistema de Risk Management. OFF por defecto.")]
-        public bool EnableRiskManagement { get; set; } = false;
-
-        [System.ComponentModel.DisplayName("Risk Dry-Run (no effect)")]
-        [System.ComponentModel.Category("Risk Management")]
-        [System.ComponentModel.Description("Cuando RM está activo, ejecuta cálculos y logs sin afectar órdenes. ON por defecto.")]
-        public bool RiskDryRun { get; set; } = true;
-
-        // CAPA 5 — Soft-engage: usar qty automática en vivo (OFF por defecto)
-        [Category("Risk Management/Position Sizing"), DisplayName("Use auto quantity for live orders")]
-        [Description("Cuando RM está activo y NO está en Dry-Run, usa LastAutoQty/CalculateQuantity para las órdenes en vivo.")]
-        public bool UseAutoQuantityForLiveOrders { get; set; } = false;
-
-        // CAPA 6/7 — Límites opcionales (diagnóstico, no imponen aún)
-        [Category("Risk Management/Limits"), DisplayName("Max contracts (diagnostic)")]
-        [Description("Límite superior sugerido para contratos por trade (diagnóstico; no impone todavía).")]
-        public int MaxContracts { get; set; } = 1000;
-
-        [Category("Risk Management/Limits"), DisplayName("Max risk per trade USD (diagnostic)")]
-        [Description("Tope de riesgo/trade en USD (diagnóstico; no impone todavía, solo log WARN si se excede). 0 = deshabilitado.")]
-        public decimal MaxRiskPerTradeUSD { get; set; } = 0m;
-
-        // CAPA 7 — Currency (documental, sin conversión aún)
-        [Category("Risk Management/Currency"), DisplayName("USD conversion factor (diagnostic)")]
-        [Description("Factor documental de conversión a USD para logs cuando el instrumento no cotiza en USD. No se aplica aún al cálculo.")]
-        public decimal CurrencyToUsdFactor { get; set; } = 1.0m;
-
-        // Throttling and diagnostics
-        [Category("Risk Management/Diagnostics"), DisplayName("Risk calc every N bars")]
-        [Description("Frecuencia de cálculo de risk management para logging (diagnóstico).")]
-        public int RiskCalcEveryNBars { get; set; } = 20;
-
-        [Category("Risk Management/Diagnostics"), DisplayName("AutoQty cap (0=off)")]
-        [Description("Límite duro opcional para auto quantity (0=sin límite). Solo diagnóstico por ahora.")]
-        public int AutoQtyCap { get; set; } = 0;
-
-        [Category("Risk Management/Diagnostics"), DisplayName("Market watchdog seconds")]
-        [Description("Segundos de espera antes de avisar retraso en market order (típico en demo). 0=off.")]
-        public int MarketWatchdogSec { get; set; } = 60;
-
-
         // ====================== RISK MANAGEMENT PARAMETERS ======================
 
         // --- Position Sizing ---
         [Category("Risk Management/Position Sizing"), DisplayName("Position Sizing Mode")]
+        [Description("Manual: usa Quantity fijo. FixedRiskUSD: calcula qty para arriesgar X USD. PercentAccount: calcula qty para arriesgar Y% de cuenta.")]
         public PositionSizingMode PositionSizingMode { get; set; } = PositionSizingMode.Manual;
 
         [Category("Risk Management/Position Sizing"), DisplayName("Risk per trade (USD)")]
+        [Description("USD que quieres arriesgar por trade cuando usas mode FixedRiskUSD")]
         public decimal RiskPerTradeUsd { get; set; } = 100.0m;
 
         [Category("Risk Management/Position Sizing"), DisplayName("Risk % of account")]
+        [Description("Porcentaje de la cuenta a arriesgar por trade cuando usas mode PercentAccount")]
         public decimal RiskPercentOfAccount { get; set; } = 0.5m;
 
-        [Category("Risk Management/Position Sizing"), DisplayName("Manual account equity override")]
+        // --- Account Equity (igual que RiskManager.Manual.cs líneas 134-141) ---
+        [Category("Risk Management/Position Sizing"), DisplayName("Account equity (USD)")]
+        [ReadOnly(true)]
+        [Description("Equity detectado automáticamente de Portfolio (actualizado cada 1s)")]
+        public decimal AccountEquitySnapshot { get; private set; } = 0m;
+
+        [Category("Risk Management/Position Sizing"), DisplayName("Account equity override (USD)")]
+        [Description("Si >0, usa este valor en lugar del detectado automáticamente. Si 0, usa detección automática.")]
         public decimal ManualAccountEquityOverride { get; set; } = 0.0m;
 
-        [Category("Risk Management/Position Sizing"), DisplayName("Tick value overrides (SYM=V)")]
-        public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5";
+        [Category("Risk Management/Position Sizing"), DisplayName("Tick value overrides (SYM=V;...)")]
+        [Description("Tick values manuales por símbolo: MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10")]
+        public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10";
 
         [Category("Risk Management/Position Sizing"), DisplayName("Enable detailed risk logging")]
+        [Description("Activa logs detallados de cálculos de position sizing y risk management")]
         public bool EnableDetailedRiskLogging { get; set; } = false;
 
         // --- Breakeven ---
@@ -519,6 +252,23 @@ namespace MyAtas.Strategies
         [Category("Risk Management/Breakeven"), DisplayName("Trigger on TP3 touch/fill")]
         public bool TriggerOnTP3TouchFill { get; set; } = false;
 
+        // --- Virtual Breakeven ---
+        [Category("Risk Management/Breakeven"), DisplayName("Virtual BE: TP index (1-3)")]
+        [Description("Qué TP virtual dispara BE (1=TP1, 2=TP2, 3=TP3). Solo funciona con modo OnTPVirtualTouch.")]
+        public int VirtualBeTriggerTpIndex { get; set; } = 1;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Virtual BE: TP1 R-multiple")]
+        [Description("Distancia en R del TP1 virtual (ej: 1.0 = 1R desde entry).")]
+        public decimal VirtualTp1R { get; set; } = 1.0m;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Virtual BE: TP2 R-multiple")]
+        [Description("Distancia en R del TP2 virtual (ej: 2.0 = 2R desde entry).")]
+        public decimal VirtualTp2R { get; set; } = 2.0m;
+
+        [Category("Risk Management/Breakeven"), DisplayName("Virtual BE: TP3 R-multiple")]
+        [Description("Distancia en R del TP3 virtual (ej: 3.0 = 3R desde entry).")]
+        public decimal VirtualTp3R { get; set; } = 3.0m;
+
         // --- Diagnostics (Read-only) ---
         [Category("Risk Management/Diagnostics"), DisplayName("Effective tick value (USD/tick)")]
         [ReadOnly(true)]
@@ -532,32 +282,54 @@ namespace MyAtas.Strategies
         [ReadOnly(true)]
         public decimal EffectiveAccountEquity { get; private set; } = 10000.0m;
 
-        [Category("Risk Management/Diagnostics"), DisplayName("Last auto qty")]
+        [Category("Risk Management/Diagnostics"), DisplayName("Session P&L (USD)")]
         [ReadOnly(true)]
-        public int LastAutoQty { get; private set; } = 0;
+        public decimal SessionPnL { get; private set; } = 0m;
 
-        [Category("Risk Management/Diagnostics"), DisplayName("Last risk per contract")]
+        [Category("Risk Management/Diagnostics"), DisplayName("Total Trades")]
         [ReadOnly(true)]
-        public decimal LastRiskPerContract { get; private set; } = 0.0m;
+        public int TotalTrades { get; private set; } = 0;
 
-        [Category("Risk Management/Diagnostics"), DisplayName("Last stop distance (ticks)")]
+        [Category("Risk Management/Diagnostics"), DisplayName("LONG Trades")]
         [ReadOnly(true)]
-        public decimal LastStopDistance { get; private set; } = 0.0m;
+        public int LongTrades { get; private set; } = 0;
 
-        [Category("Risk Management/Diagnostics"), DisplayName("Last risk input")]
+        [Category("Risk Management/Diagnostics"), DisplayName("SHORT Trades")]
         [ReadOnly(true)]
-        public decimal LastRiskInput { get; private set; } = 0.0m;
+        public int ShortTrades { get; private set; } = 0;
 
-        [Category("Risk Management/Diagnostics"), DisplayName("Underfunded abort last")]
+        [Category("Risk Management/Diagnostics"), DisplayName("LONG P&L (USD)")]
         [ReadOnly(true)]
-        public bool UnderfundedAbortLast { get; private set; } = false;
+        public decimal LongPnL { get; private set; } = 0m;
 
-        // --- Underfunded Protection ---
-        [Category("Risk Management/Position Sizing"), DisplayName("Skip trade if underfunded")]
-        public bool SkipIfUnderfunded { get; set; } = true;
+        [Category("Risk Management/Diagnostics"), DisplayName("SHORT P&L (USD)")]
+        [ReadOnly(true)]
+        public decimal ShortPnL { get; private set; } = 0m;
 
-        [Category("Risk Management/Position Sizing"), DisplayName("Min qty if underfunded")]
-        public int MinQtyIfUnderfunded { get; set; } = 1;
+        // --- ZOMBIE CANCEL GUARD ---
+        [Category("Risk Management/Diagnostics"), DisplayName("Zombie-cancel guard (ms)")]
+        [Description("Tiempo mínimo tras crear brackets durante el cual NO se permite cancelar por detección de zombie basado en net==0.")]
+        public int ZombieCancelGuardMs { get; set; } = 4000;
+
+        // --- DEFERRAL DE FILLS SOSPECHOSOS ---
+        [Category("Risk Management/Diagnostics"), DisplayName("Min stop-fill age (ms)")]
+        [Description("Edad mínima de una orden SL/TP antes de aceptar su fill como real. Fills más jóvenes se difieren para confirmación.")]
+        public int MinStopFillAgeMs { get; set; } = 60;
+
+        [Category("Risk Management/Diagnostics"), DisplayName("Fill confirm delay (ms)")]
+        [Description("Tiempo de espera para confirmar un fill sospechoso antes de procesarlo o descartarlo.")]
+        public int FillConfirmMs { get; set; } = 300;
+
+        // ====================== EXTERNAL RISK MANAGEMENT INTEGRATION ======================
+        [Category("Risk Management/Integration"), DisplayName("External risk controls SL/Trail")]
+        public bool ExternalRiskControlsStops { get; set; } = false;
+
+        // TODO: Future integration points when connecting external RM:
+        // 1. Position sizing calculations (delegate to external RM)
+        // 2. SL placement and trailing logic (ActivateBreakEven early return)
+        // 3. Risk-based quantity adjustments
+        // 4. Portfolio-level risk limits and exposure checks
+        // 5. Cross-strategy position coordination
 
         // ====================== INTERNAL STATE ======================
         private FourSixEightIndicator _ind;
@@ -570,14 +342,6 @@ namespace MyAtas.Strategies
         private readonly List<Order> _liveOrders = new(); // órdenes creadas por ESTA estrategia y aún activas
         private int _attachInProgress = 0;                // guard de concurrencia para attach/reconcile
         private int _lastReconcileBar = -1;               // throttle de reconciliación (1x por barra)
-
-        // === BREAKEVEN STATE ===
-        private List<decimal> _lastTpPrices = new List<decimal>(3);
-        private decimal _lastEntryPrice = 0m;
-        private DateTime _lastBreakevenMoveUtc = DateTime.MinValue;
-
-        // === BRACKET WATCHDOG STATE ===
-        private bool _scheduleAttachBrackets = false;
 
         // Post-fill bracket control
         private int _targetQty = 0;          // qty solicitada en la entrada
@@ -593,22 +357,38 @@ namespace MyAtas.Strategies
         private int _cachedNetPosition = 0;  // cached position for latency issues
         private DateTime _lastPositionUpdate = DateTime.MinValue;
         private readonly Dictionary<string, int> _orderFills = new(); // track our fills
+        private readonly Dictionary<string, int> _childSign = new(); // robust sign tracking for fills
+        private DateTime _postEntryFlatBlockUntil = DateTime.MinValue; // suprime confirmación de flat tras ENTRY
+
+        // Zombie cancel guards
+        private DateTime _lastBracketsAttachedAt = DateTime.MinValue; // cuándo terminamos de adjuntar brackets
+        private DateTime _flatSince = DateTime.MinValue;              // desde cuándo vemos net==0 de forma continua
 
         // Cooldown management
         private int _cooldownUntilBar = -1;   // bar index hasta el que no se permite re-entrada
         private int _lastFlatBar = -1;        // último bar en el que quedamos planos
 
-        // Risk Management session control and throttling
-        private bool _riskInitDone = false;
-        private int _lastDiagRefreshBar = -1;
-        private string _lastDiagHash = "";
-        private int _lastCalcBar = -1;
-        private string _lastInputsHash = "";
-        private bool _lastEffectiveDryRun = true; // para detectar cambios intrasesión
+        // ===== VIRTUAL BREAKEVEN =====
+        private bool _virtualBeArmed = false;           // true cuando se calcula TP virtual tras entrada
+        private bool _virtualBeDone = false;            // true cuando ya se disparó BE virtual
+        private decimal _virtualBeTargetPx = 0m;        // precio del TP virtual calculado (en R-multiples)
+        private decimal _virtualBeStopPx = 0m;          // precio del SL usado para calcular R
+        private int _virtualBeTouchBar = -1;            // bar donde se detectó touch (throttle 1x/bar)
+        private DateTime _virtualBeTouchAt = DateTime.MinValue; // timestamp throttle
 
-        // Market order watchdog for demo delays
-        private DateTime _lastMarketSentUtc = DateTime.MinValue;
-        private bool _marketOrderPending = false;
+        // ===== DEFERRAL DE FILLS SOSPECHOSOS =====
+        private readonly Dictionary<string, DateTime> _orderBirth = new(); // comment → timestamp cuando pasa a Placed
+        private readonly Dictionary<string, SuspectFill> _suspectFills = new(); // comment → datos del fill sospechoso
+        private readonly HashSet<string> _processedFills = new(); // evitar doble procesamiento
+
+        private sealed class SuspectFill
+        {
+            public string Comment;
+            public int Qty;
+            public int DirSign;
+            public decimal Price;
+            public DateTime DeferUntil;
+        }
 
         private struct Pending { public Guid Uid; public int BarId; public int Dir; }
 
@@ -669,25 +449,6 @@ namespace MyAtas.Strategies
                 {
                     DebugLog.W("468/STR", "WARNING: Could not attach indicator (method not found in hierarchy)");
                 }
-
-                // Initialize risk management diagnostics
-                UpdateDiagnostics();
-
-                // ---- RISK INIT (único por sesión) ----
-                if (!_riskInitDone)
-                {
-                    var sym = GetEffectiveSecurityCode();
-                    var qc = Security?.QuoteCurrency ?? "USD";
-                    var effTs = EffectiveTickSize;
-
-                    RiskLog("468/RISK", $"INIT flags EnableRiskManagement={EnableRiskManagement} RiskDryRun={RiskDryRun} effectiveDryRun={RMDryRunEffective}");
-                    RiskLog("468/RISK", $"INIT SYMBOL source=effective value={sym} qc={qc} tickSize={effTs:F4}");
-                    RiskLog("468/RISK", $"INIT OVERRIDES present={(string.IsNullOrWhiteSpace(TickValueOverrides) ? "NO" : "YES")}");
-
-                    _lastEffectiveDryRun = RMDryRunEffective;
-                    _riskInitDone = true;
-                }
-
             }
             catch (Exception ex)
             {
@@ -695,10 +456,54 @@ namespace MyAtas.Strategies
             }
         }
 
+        protected override void OnStopped()
+        {
+            try
+            {
+                DebugLog.Separator("STRATEGY STOPPED");
+                // Reset Session P&L tracking
+                ResetSessionPnL();
+            }
+            catch (Exception ex)
+            {
+                DebugLog.W("468/STR", $"OnStopped EX: {ex.Message}");
+            }
+            base.OnStopped();
+        }
 
         // ====================== CORE ======================
         protected override void OnCalculate(int bar, decimal value)
         {
+            // === DEFERRAL: Procesar fills sospechosos PRIMERO ===
+            try { ProcessSuspectFills(); } catch { }
+
+            // --- Position Sizing: Actualizar equity y diagnostics periódicamente (1x/s) ---
+            UpdateAccountEquityPeriodically();
+
+            // --- Session P&L: Inicializar equity la primera vez ---
+            if (_sessionStartingEquity == 0m)
+            {
+                // Priorizar ManualAccountEquityOverride si está configurado
+                if (ManualAccountEquityOverride > 0m)
+                {
+                    _sessionStartingEquity = ManualAccountEquityOverride;
+                    if (EnableDetailedRiskLogging) DebugLog.W("468/PNL", $"Session started with OVERRIDE equity: {_sessionStartingEquity:F2} USD");
+                }
+                else if (EffectiveAccountEquity > 0m)
+                {
+                    _sessionStartingEquity = EffectiveAccountEquity;
+                    if (EnableDetailedRiskLogging) DebugLog.W("468/PNL", $"Session started with effective equity: {_sessionStartingEquity:F2} USD");
+                }
+                else
+                {
+                    _sessionStartingEquity = 10000m;
+                    if (EnableDetailedRiskLogging) DebugLog.W("468/PNL", $"Session started with DEFAULT equity: {_sessionStartingEquity:F2} USD");
+                }
+            }
+
+            // --- Session P&L: Actualizar en tiempo real ---
+            UpdateSessionPnL();
+
             // --- Heartbeat ---
             try
             {
@@ -706,87 +511,6 @@ namespace MyAtas.Strategies
                     DebugLog.W("468/STR", $"HEARTBEAT bar={bar} t={GetCandle(bar).Time:HH:mm:ss}");
             }
             catch { }
-
-            // --- Risk Management Pulse Logging & Calculation Engine Exercise ---
-            try
-            {
-                // ===== Capa 2: Dry-run del motor de cálculo con throttle (no altera órdenes) =====
-                // Requisitos de ejecución:
-                //  - RM habilitado (OFF = baseline sin cambios)
-                //  - Primer tick de la vela
-                //  - Ha pasado el cooldown O han cambiado inputs clave O es cada N velas
-                if (RMEnabled)
-                {
-                    bool isFirstTick = IsFirstTickOf(bar);
-                    if (isFirstTick && bar > 0)
-                    {
-                        // Refrescar diagnósticos antes de calcular
-                        UpdateDiagnostics();
-
-                        string inputsHash = ComputeCalcInputsHash();
-                        bool inputsChanged = !string.Equals(inputsHash, _lastInputsHash, StringComparison.Ordinal);
-                        bool barInterval   = (bar % RiskCalcEveryNBars) == 0;
-                        bool cooldownOk    = (DateTime.UtcNow - _lastCalcUtc) >= _calcCooldown;
-
-                        if (cooldownOk || inputsChanged || barInterval)
-                        {
-                            try
-                            {
-                                // Detectar cambios intrasesión de modo DRY-RUN/LIVE
-                                CheckAndLogModeSwitch();
-
-                                var qty = CalculateQuantity(); // dry-run: no toca Quantity real
-
-                                var sym = GetEffectiveSecurityCode();
-                                var qc  = Security?.QuoteCurrency ?? "USD";
-                                var mode = PositionSizingMode;
-
-                                // Snapshot consolidado único con estado real
-                                var finalQty = AutoQtyCap > 0 ? Math.Min(qty, AutoQtyCap) : qty; // cap diagnóstico
-                                var dryTag = RMDryRunEffective ? "DRYRUN=ON" : "DRYRUN=OFF";
-                                CalcLog("468/CALC",
-                                    $"SNAPSHOT sym={sym} bars={bar} mode={mode} qty={finalQty} slTicks={LastStopDistance:F1} " +
-                                    $"rpc={LastRiskPerContract:F2}{qc} tickValue={EffectiveTickValue:F2}{qc}/t " +
-                                    $"equity={EffectiveAccountEquity:F2}USD {dryTag}");
-
-                                // Pulso mínimo cuando el log detallado está OFF (ritmo visible sin inundar)
-                                if (!EnableDetailedRiskLogging)
-                                {
-                                    CalcLog("468/CALC", $"PULSE sym={sym} bar={bar} mode={mode} qty={qty}");
-                                }
-
-                                _lastInputsHash = inputsHash;
-                                _lastCalcUtc = DateTime.UtcNow;
-                                _lastCalcBar = bar;
-                            }
-                            catch (Exception ex)
-                            {
-                                CalcLog("468/CALC", $"Engine dry-run error at bar={bar}: {ex.Message}");
-                            }
-                        }
-                    }
-                }
-                // ===============================================================================
-
-                // Periodic diagnostic refresh for non-RM mode (every 20 bars when RM is OFF)
-                if (!RMEnabled && IsFirstTickOf(bar))
-                {
-                    if (_lastDiagnosticRefreshBar == -1 || (bar - _lastDiagnosticRefreshBar) >= 20)
-                    {
-                        UpdateDiagnostics();
-                        var securityCode = GetEffectiveSecurityCode(); // FIX: resolver UNKNOWN
-                        var tickValue = GetEffectiveTickValue();
-                        var equity = GetEffectiveAccountEquity();
-                        // Capa 0: en RM OFF no emitir 468/RISK de rutina para no contaminar baseline
-                        RiskLog("468/RISK", $"REFRESH sym={securityCode} bar={bar} tickValue={tickValue:F2} equity={equity:F2}");
-                        _lastDiagnosticRefreshBar = bar;
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                RiskLog("468/RISK", $"Pulse logging error: {ex.Message}");
-            }
 
             // *** THROTTLED DEBUG: Only log first tick of each bar to prevent spam ***
             if (bar != _lastLoggedBar && IsFirstTickOf(bar))
@@ -806,194 +530,24 @@ namespace MyAtas.Strategies
             }
 
             // --- DEBUG: Check for signal availability and CAPTURE AT N ---
-            var sig = _ind?.LastSignal;
-            if (sig.HasValue)
+            // === SEÑALES: captura en N, ejecución en N+1 ===
+            ProcessSignalLogic(bar);
+
+            // --- BE TOUCH: comprobar si se ha tocado algún TP habilitado ---
+            try
             {
-                DebugLog.W("468/STR", $"SIGNAL_CHECK: bar={bar} sigBar={sig.Value.BarId} dir={(sig.Value.Dir > 0 ? "BUY" : "SELL")} uid={sig.Value.Uid.ToString().Substring(0, 8)} lastUid={(_lastUid != Guid.Empty ? _lastUid.ToString().Substring(0, 8) : "NONE")} condition_barMatch={sig.Value.BarId == bar} condition_uidNew={sig.Value.Uid != _lastUid}");
+                if (_tradeActive && _bracketsPlaced && (_entryDir != 0))
+                    CheckBreakEvenTouch_OnCalculate(bar);
             }
+            catch { /* best-effort */ }
 
-            // 1) CAPTURE AT N (only when the GL-cross signal is on THIS bar) + CLOSE CONFIRMATION
-            if (sig.HasValue && sig.Value.BarId == bar && sig.Value.Uid != _lastUid)
+            // --- VIRTUAL BE TOUCH: comprobar si se ha tocado el TP virtual (solo si modo OnTPVirtualTouch) ---
+            try
             {
-                bool closeConfirmed = true;
-
-                if (ValidateGenialCrossLocally && bar >= 1)
-                {
-                    var cN  = GetCandle(bar).Close;
-                    var gN  = GenialAt(bar);
-                    var cN1 = GetCandle(bar - 1).Close;
-                    var gN1 = GenialAt(bar - 1);
-                    var eps = Ticks(Math.Max(0, HysteresisTicks));
-
-                    // FIXED: Proper hysteresis implementation for both current and previous bar
-                    if (sig.Value.Dir > 0) // BUY
-                        closeConfirmed = (cN > gN + eps) && (cN1 <= gN1 + eps);
-                    else                   // SELL
-                        closeConfirmed = (cN < gN - eps) && (cN1 >= gN1 - eps);
-                }
-
-                if (closeConfirmed)
-                {
-                    _lastUid = sig.Value.Uid;
-                    _pending = new Pending { Uid = sig.Value.Uid, BarId = bar, Dir = sig.Value.Dir };
-                    DebugLog.Critical("468/STR", $"CAPTURE: N={bar} {(sig.Value.Dir>0?"BUY":"SELL")} uid={sig.Value.Uid} (confirmed close)");
-                }
-                else
-                {
-                    DebugLog.W("468/STR", $"IGNORE signal at N={bar} (close did not confirm; avoids intrabar flip-flop)");
-                }
+                if (_tradeActive && (_entryDir != 0))
+                    CheckVirtualBreakEvenTouch_OnCalculate(bar);
             }
-
-            // 2) EXECUTE EXACTLY AT N+1 — windowed (armed/execute/expire)
-            if (_pending.HasValue)
-            {
-                var execBar = _pending.Value.BarId + 1;
-                if (bar < execBar)
-                {
-                    // Aún no toca; mantenemos el pending "ARMED"
-                    if ((bar % 50) == 0)
-                        DebugLog.W("468/STR", $"PENDING ARMED: now={bar}, execBar={execBar}");
-                    return;
-                }
-                if (bar > execBar)
-                {
-                    // Nos saltamos N+1 → señal caducada (nada de pendientes eternos)
-                    DebugLog.W("468/STR", $"PENDING EXPIRED: now={bar}, execBar={execBar}");
-                    _pending = null;
-                    return;
-                }
-
-                // Aquí bar == execBar → toca ejecutar en N+1
-                DebugLog.W("468/STR", $"PROCESSING PENDING @N+1: bar={bar}, execBar={execBar}");
-                var s = _pending.Value;
-
-                // hard anti-dup by UID
-                if (s.Uid == _lastExecUid)
-                {
-                    _pending = null;
-                    DebugLog.W("468/STR", "SKIP: Already executed this UID");
-                    return;
-                }
-
-                int dir = s.Dir;
-
-                // ===== ENHANCED QTY DECISION with TRACING =====
-                // Asegúrate de tener diagnósticos frescos antes del cálculo
-                if (EnableRiskManagement)
-                {
-                    try
-                    {
-                        UpdateDiagnostics();
-                        CalculateQuantity(); // Updates LastAutoQty and UnderfundedAbortLast
-                        DebugLog.W("468/STR", $"TRACE: Post-calc LastAutoQty={LastAutoQty} UnderfundedAbort={UnderfundedAbortLast}");
-                    }
-                    catch (Exception ex)
-                    {
-                        DebugLog.W("468/STR", $"Risk calculation error: {ex.Message}");
-                    }
-                }
-
-                var finalQty = DecideEffectiveQtyForEntry(Math.Max(1, Quantity));
-                DebugLog.W("468/STR", $"TRACE: DecideEffectiveQty returned={finalQty} (manualQty={Quantity})");
-
-                // Check for abort due to underfunded
-                if (finalQty <= 0)
-                {
-                    DebugLog.W("468/STR", $"TRACE: ABORT ENTRY due to finalQty=0 (underfunded or size limits)");
-                    DebugLog.W("468/STR", $"ENTRY ABORTED: finalQty={finalQty} (see 468/RISK logs for details)");
-                    _pending = null;
-                    return;
-                }
-                // ===== END UNIFIED QTY DECISION =====
-
-                // 1) Apertura N+1: estricta (primer tick) con tolerancia por precio
-                if (StrictN1Open)
-                {
-                    if (!IsFirstTickOf(bar))
-                    {
-                        var openN1 = GetCandle(bar).Open;
-                        var lastPx = GetCandle(bar).Close; // precio actual del bar N+1
-                        var tol    = Ticks(Math.Max(0, OpenToleranceTicks));
-                        if (Math.Abs(lastPx - openN1) > tol)
-                        {
-                            DebugLog.W("468/STR", $"EXPIRE: missed first tick and |{lastPx-openN1}| > {tol}");
-                            _pending = null;
-                            return;
-                        }
-                        DebugLog.W("468/STR", $"First-tick missed but within tolerance ({lastPx}~{openN1}) -> proceed");
-                    }
-                }
-
-                // 2) Dirección de la vela que cruzó (en N) debe coincidir con la señal
-                var sigCandle = GetCandle(s.BarId);
-                bool candleDirOk = dir > 0 ? (sigCandle.Close > sigCandle.Open)
-                                           : (sigCandle.Close < sigCandle.Open);
-                if (!candleDirOk)
-                {
-                    _pending = null;
-                    DebugLog.W("468/STR", "ABORT ENTRY: Candle direction at N does not match signal");
-                    return;
-                }
-
-                // --- Confluence #1: Pendiente de GenialLine A FAVOR en N+1 (vela de ejecución)
-                if (RequireGenialSlope)
-                {
-                    // CheckGenialSlope ya imprime prev/curr y trend real con la misma serie que usa para decidir
-                    bool glOk = CheckGenialSlope(dir, bar);
-                    if (!glOk) { _pending = null; DebugLog.W("468/STR", "ABORT ENTRY: Conf#1 failed"); return; }
-                }
-
-                // --- Confluencia #2: EMA8 vs Wilder8 en N+1, con reglas granulares
-                if (RequireEmaVsWilder)
-                {
-                    bool emaOk = CheckEmaVsWilderAtExec(dir, bar);
-                    if (!emaOk) { _pending = null; DebugLog.W("468/STR", "ABORT ENTRY: Conf#2 failed"); return; }
-                }
-
-                // --- Validar solo una posición abierta (opcional) ---
-                if (OnlyOnePosition)
-                {
-                    int net = GetNetPosition();
-                    bool inCooldown = EnableCooldown && CooldownBars > 0 && _cooldownUntilBar >= 0 && bar <= _cooldownUntilBar;
-                    bool busy = _tradeActive || net != 0 || HasAnyActiveOrders() || inCooldown;
-                    DebugLog.W("468/STR", $"GUARD OnlyOnePosition: active={_tradeActive} net={net} activeOrders={CountActiveOrders()} cooldown={(inCooldown ? $"YES(until={_cooldownUntilBar})" : "NO")} -> {(busy ? "BLOCK" : "PASS")}");
-
-                    // Si net=0 pero hay órdenes activas "zombie", CANCELA en broker (no sólo limpiar lista)
-                    if (net == 0 && HasAnyActiveOrders())
-                    {
-                        DebugLog.W("468/STR", "ZOMBIE CANCEL: net=0 but active orders present -> cancelling...");
-                        CancelAllLiveActiveOrders();
-                        // CRITICAL FIX: NO re-entrar en el mismo ciclo. Esperar a que OnOrderChanged limpie.
-                        DebugLog.W("468/STR", "RETRY NEXT TICK: keeping pending for re-check after zombie cancel");
-                        // Conservar señal pendiente para reevaluación en próximo tick/bar
-                        return; // ← salir y dejar que el próximo OnCalculate reevalúe
-                    }
-
-                    if (busy)
-                    {
-                        _pending = null;
-                        DebugLog.W("468/STR", "ABORT ENTRY: OnlyOnePosition guard is active");
-                        return;
-                    }
-                }
-
-                // --- Todas las confluencias OK -> solo market; los brackets se adjuntan post-fill ---
-                try
-                {
-                    SubmitMarket(dir, finalQty, bar, s.BarId);
-                    _lastExecUid = s.Uid;
-
-                    DebugLog.Critical("468/STR", $"ENTRY sent at N+1 bar={bar} (signal N={s.BarId}) dir={(dir>0?"BUY":"SELL")} qty={finalQty} - brackets will attach post-fill");
-                }
-                catch (Exception ex)
-                {
-                    DebugLog.W("468/STR", "EXEC EX: " + ex);
-                }
-                finally
-                {
-                    _pending = null;
-                }
-            }
+            catch { /* best-effort */ }
 
             // --- Reconciliación controlada (1x por barra y fuera de anti-flat) ---
             if (EnableReconciliation && bar != _lastReconcileBar && IsFirstTickOf(bar))
@@ -1009,14 +563,6 @@ namespace MyAtas.Strategies
                 }
             }
 
-            // --- NOTA: PASO 3 calculation now handled by Capa 2 throttling system above ---
-
-            // --- BRACKET WATCHDOG: Re-attach missing brackets (replay stability) ---
-            if (IsFirstTickOf(bar))
-            {
-                try { BracketWatchdog(); } catch { /* best-effort */ }
-            }
-
             // --- FAILSAFE: Flat watchdog to prevent stuck _tradeActive ---
             if (EnableFlatWatchdog && IsFirstTickOf(bar))
             {
@@ -1027,7 +573,8 @@ namespace MyAtas.Strategies
                                   (DateTime.UtcNow - _bracketsAttachedAt).TotalMilliseconds >= Math.Max(0, AntiFlatMs);
                     bool barsOk = (_antiFlatUntilBar < 0) || (bar > _antiFlatUntilBar);
 
-                    if (_tradeActive && netWD == 0 && !HasAnyActiveOrders() && timeOk && barsOk)
+                    // GATE: Bloquear flat cleanup si hay fills sospechosos pendientes
+                    if (_tradeActive && netWD == 0 && !HasAnyActiveOrders() && timeOk && barsOk && _suspectFills.Count == 0)
                     {
                         _tradeActive = false;
                         _bracketsPlaced = false;
@@ -1035,6 +582,18 @@ namespace MyAtas.Strategies
                         _cachedNetPosition = 0;
                         _bracketsAttachedAt = DateTime.MinValue;
                         _antiFlatUntilBar = -1;
+                        // Reset BreakEven state
+                        _breakevenApplied = false;
+                        _entryPrice = 0m;
+                        _beLastTouchBar = -1;
+                        _beLastTouchAt = DateTime.MinValue;
+                        // Reset Virtual BE state
+                        _virtualBeArmed = false;
+                        _virtualBeDone = false;
+                        _virtualBeTargetPx = 0m;
+                        _virtualBeStopPx = 0m;
+                        _virtualBeTouchBar = -1;
+                        _virtualBeTouchAt = DateTime.MinValue;
                         _flatStreak = 0;
                         _lastFlatRead = DateTime.MinValue;
                         DebugLog.W("468/ORD", "Trade lock RELEASED by watchdog (flat & no active orders)");
@@ -1043,16 +602,30 @@ namespace MyAtas.Strategies
                 catch { /* best-effort */ }
             }
 
-            // <<< PATCH 1: HEARTBEAT RELEASE (final, sin depender de AntiFlatMs/bars) >>>
-            // Si por cualquier razón no ha actuado el watchdog o los eventos, libera aquí.
-            if (_tradeActive && !HasAnyActiveOrders() && GetNetPosition() == 0)
+            // <<< PATCH 1: HEARTBEAT RELEASE (final) >>>
+            // Libera sólo si TAMBIÉN NetByFills()==0 para evitar falsos planos tras parciales (TP1).
+            // GATE: Bloquear flat cleanup si hay fills sospechosos pendientes
+            if (_tradeActive && !HasAnyActiveOrders() && GetNetPosition() == 0 && NetByFills() == 0
+                && DateTime.UtcNow >= _postEntryFlatBlockUntil && _suspectFills.Count == 0)
             {
+                DebugLog.W("468/ORD",
+                    $"FLAT CONFIRMED (heartbeat): net=0 netByFills=0 tpActive={CountActiveTPs()} slActive={CountActiveSLs()}");
                 _tradeActive = false;
                 _bracketsPlaced = false;
                 _orderFills.Clear();
                 _cachedNetPosition = 0;
                 _bracketsAttachedAt = DateTime.MinValue;
                 _antiFlatUntilBar = -1;
+                // Reset BreakEven state
+                _breakevenApplied = false;
+                _entryPrice = 0m;
+                // Reset Virtual BE state
+                _virtualBeArmed = false;
+                _virtualBeDone = false;
+                _virtualBeTargetPx = 0m;
+                _virtualBeStopPx = 0m;
+                _virtualBeTouchBar = -1;
+                _virtualBeTouchAt = DateTime.MinValue;
                 _flatStreak = 0;
                 _lastFlatRead = DateTime.MinValue;
                 _lastFlatBar = CurrentBar;
@@ -1078,10 +651,163 @@ namespace MyAtas.Strategies
                 var before  = _liveOrders.Count;
                 DebugLog.W("468/ORD", $"OnOrderChanged: {comment} status={status} state={state} active={isActive} liveCount={before}");
 
+                // === DEFERRAL: Marcar nacimiento cuando orden pasa a Placed ===
+                if (status == OrderStatus.Placed && (comment.StartsWith("468SL:") || comment.StartsWith("468TP:") || comment.StartsWith("468ENTRY:")))
+                {
+                    _orderBirth[comment] = DateTime.UtcNow;
+                }
+
+                // === DEFERRAL: Limpiar al terminar ===
+                if ((status == OrderStatus.Canceled || status == OrderStatus.Filled) && _orderBirth.ContainsKey(comment))
+                {
+                    _orderBirth.Remove(comment);
+                }
+
                 // Track order fills for enhanced position detection
                 if (status == OrderStatus.Filled || status == OrderStatus.PartlyFilled)
                 {
                     TrackOrderFill(order, "Filled");
+                    // Capturar precio de entrada al primer fill de la ENTRY
+                    if ((comment.StartsWith("468ENTRY:")))
+                    {
+                        try { UpdateEntryPriceFromOrder(order); } catch { }
+                        _postEntryFlatBlockUntil = DateTime.UtcNow.AddMilliseconds(Math.Max(AntiFlatMs * 2, 800));
+                        DebugLog.W("468/ORD", $"POST-ENTRY FLAT BLOCK armed for {Math.Max(AntiFlatMs * 2, 800)}ms");
+
+                        // === Session P&L: Track position entry (TRIPLE FALLBACK como RiskManager) ===
+                        try
+                        {
+                            var filledQty = GetFilledQtyFromOrder(order);
+
+                            // Intentar obtener precio de entry de múltiples fuentes (igual que RiskManager.Manual.cs líneas 1103-1126)
+                            var entryPriceForTracking = _entryPrice; // Primero intentar desde _entryPrice (ya capturado)
+
+                            if (entryPriceForTracking <= 0m)
+                            {
+                                // Fallback 1: Intentar desde el order directamente
+                                entryPriceForTracking = ExtractAvgFillPriceFromOrder(order);
+                                if (EnableDetailedRiskLogging && entryPriceForTracking > 0m)
+                                    DebugLog.W("468/PNL", $"Entry price from _entryPrice=0, using order avgPrice={entryPriceForTracking:F2}");
+                            }
+
+                            if (entryPriceForTracking <= 0m)
+                            {
+                                // Fallback 2: leer desde posición actual (ReadPositionSnapshot)
+                                var snapForEntry = ReadPositionSnapshot();
+                                entryPriceForTracking = snapForEntry.AvgPrice;
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"Entry price from order=0, trying position avgPrice={entryPriceForTracking:F2}");
+                            }
+
+                            if (entryPriceForTracking <= 0m)
+                            {
+                                // Fallback 3: usar precio de la última barra (mejor aproximación)
+                                entryPriceForTracking = GetLastPriceSafe();
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"Entry price from position=0, using last bar price={entryPriceForTracking:F2}");
+                            }
+
+                            // Ahora SÍ llamar a TrackPositionEntry si tenemos precio y qty válidos
+                            if (entryPriceForTracking > 0m && filledQty > 0 && _entryDir != 0)
+                            {
+                                TrackPositionEntry(entryPriceForTracking, filledQty, _entryDir);
+                            }
+                            else
+                            {
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"SKIP TrackPositionEntry: entryPx={entryPriceForTracking:F2} fillQty={filledQty} _entryDir={_entryDir}");
+                            }
+                        }
+                        catch (Exception ex)
+                        {
+                            DebugLog.W("468/PNL", $"TrackPositionEntry failed: {ex.Message}");
+                        }
+                    }
+                    // Track TP/SL fills for P&L calculation
+                    else if (comment.StartsWith("468TP:") || comment.StartsWith("468SL:"))
+                    {
+                        // === DEFERRAL: Verificar edad del fill antes de procesar ===
+                        var now = DateTime.UtcNow;
+                        var bornAt = _orderBirth.TryGetValue(comment, out var t0) ? t0 : DateTime.MinValue;
+                        var ageMs = bornAt == DateTime.MinValue ? int.MaxValue : (int)(now - t0).TotalMilliseconds;
+
+                        // Evitar doble procesamiento
+                        if (_processedFills.Contains(comment))
+                        {
+                            if (EnableDetailedRiskLogging)
+                                DebugLog.W("468/ORD", $"SKIP duplicate fill processing: {comment}");
+                            return;
+                        }
+
+                        // SI el fill es demasiado joven → DEFERIR
+                        if (ageMs < MinStopFillAgeMs)
+                        {
+                            var filledQty = GetFilledQtyFromOrder(order);
+                            int sign;
+                            if (!_childSign.TryGetValue(comment, out sign))
+                                sign = comment.StartsWith("468ENTRY:") ? _entryDir : -_entryDir;
+
+                            _suspectFills[comment] = new SuspectFill
+                            {
+                                Comment = comment,
+                                Qty = Math.Abs(filledQty),
+                                DirSign = sign,
+                                Price = order.Price,
+                                DeferUntil = now.AddMilliseconds(Math.Max(100, FillConfirmMs))
+                            };
+
+                            // Congelar flat block hasta confirmación
+                            _postEntryFlatBlockUntil = DateTime.UtcNow.AddMilliseconds(
+                                Math.Max(FillConfirmMs, AntiFlatMs)
+                            );
+
+                            DebugLog.W("468/ORD", $"SUSPECT FILL deferred: {comment} age={ageMs}ms (<{MinStopFillAgeMs}ms) - will confirm in {FillConfirmMs}ms");
+                            return; // NO procesar TrackOrderFill ni P&L ni failsafe
+                        }
+
+                        // SI edad >= MinStopFillAgeMs → Procesar normalmente
+                        try
+                        {
+                            var exitPrice = ExtractAvgFillPriceFromOrder(order);
+                            var filledQty = GetFilledQtyFromOrder(order);
+
+                            if (EnableDetailedRiskLogging)
+                                DebugLog.W("468/PNL", $"TP/SL FILL detected: {comment} exitPrice={exitPrice:F2} filledQty={filledQty} _entryDir={_entryDir} age={ageMs}ms");
+
+                            // Fallback: si exitPrice es 0, usar order.Price
+                            if (exitPrice <= 0m)
+                            {
+                                exitPrice = order.Price;
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"Using order.Price as fallback: {exitPrice:F2}");
+                            }
+
+                            if (exitPrice > 0m && filledQty > 0 && _entryDir != 0)
+                            {
+                                TrackPositionClose(exitPrice, filledQty, _entryDir);
+                            }
+                            else
+                            {
+                                if (EnableDetailedRiskLogging)
+                                    DebugLog.W("468/PNL", $"SKIP TrackPositionClose: exitPx={exitPrice:F2} fillQty={filledQty} _entryDir={_entryDir}");
+                            }
+
+                            _processedFills.Add(comment);
+                        }
+                        catch (Exception ex)
+                        {
+                            DebugLog.W("468/PNL", $"TrackPositionClose failed: {ex.Message}");
+                        }
+                    }
+
+                    // Disparar BE por FILL de TP si está configurado
+                    try { CheckBreakEvenTrigger_OnOrderChanged(order, status); } catch { }
+
+                    // Failsafe: si un SL se llena, cancela todas las órdenes hijas del mismo trade (por stamp)
+                    if ((comment.StartsWith("468SL:")) && (status == OrderStatus.Filled))
+                    {
+                        CancelChildrenByStamp(comment);
+                    }
                 }
                 else if (status == OrderStatus.Canceled)
                 {
@@ -1092,44 +818,6 @@ namespace MyAtas.Strategies
                 if ((comment?.StartsWith("468ENTRY:") ?? false)
                     && (status == OrderStatus.Placed || status == OrderStatus.PartlyFilled || status == OrderStatus.Filled))
                 {
-                    // A) Resolver dirección real de ejecución vs intención inicial
-                    if (status == OrderStatus.PartlyFilled || status == OrderStatus.Filled)
-                    {
-                        var executedDir = order.Direction == OrderDirections.Buy ? 1 : -1;
-                        if (_entryDir != executedDir)
-                        {
-                            DebugLog.Critical("468/STR", $"ENTRY SIDE RESOLVE: prev={_entryDir} -> actual={(executedDir>0?"BUY":"SELL")}");
-                            _entryDir = executedDir;
-                        }
-                        var effectivePrice = GetEffectiveFillPrice(order);
-                        if (effectivePrice > 0)
-                        {
-                            _lastEntryPrice = effectivePrice;
-                            DebugLog.W("468/STR", $"ENTRY FILL side={(_entryDir>0?"BUY":"SELL")} price={_lastEntryPrice:F2}");
-                        }
-                        else
-                        {
-                            // último recurso: usa Close del bar si no hay fill price (mejor que 0, evita saltarse BE)
-                            var fallback = GetCandle(CurrentBar).Close;
-                            _lastEntryPrice = fallback;
-                            DebugLog.W("468/STR", $"ENTRY FILL price unresolved -> fallback close={_lastEntryPrice:F2}");
-                        }
-
-                        // C) Market order watchdog - detect demo delays
-                        if (_marketOrderPending && MarketWatchdogSec > 0)
-                        {
-                            var elapsed = (DateTime.UtcNow - _lastMarketSentUtc).TotalSeconds;
-                            if (elapsed > MarketWatchdogSec)
-                            {
-                                DebugLog.W("468/ORD", $"MARKET fill delayed {elapsed:F1}s (demo emulation?)");
-                            }
-                            _marketOrderPending = false;
-                        }
-
-                        // Schedule bracket attachment for watchdog
-                        _scheduleAttachBrackets = true;
-                    }
-
                     _tradeActive = true;
                     if (!_bracketsPlaced)
                     {
@@ -1167,8 +855,22 @@ namespace MyAtas.Strategies
                             _bracketsAttachedAt = DateTime.UtcNow;
                             _antiFlatUntilBar = CurrentBar + Math.Max(0, AntiFlatBars);
                             _flatStreak = 0;
+
+                            // --- STATE tras adjuntar brackets ---
+                            DebugLog.W("468/STR",
+                                $"STATE: tradeActive={_tradeActive} " +
+                                $"dir={_entryDir} net={GetNetPosition()} netByFills={NetByFills()} " +
+                                $"tpActive={CountActiveTPs()} slActive={CountActiveSLs()} " +
+                                $"liveOrders={(_liveOrders?.Count ?? 0)} " +
+                                $"signalBar={_lastSignalBar} antiFlatMs={AntiFlatMs} confirmFlatReads={ConfirmFlatReads}");
                             _lastFlatRead = DateTime.MinValue;
                             DebugLog.W("468/STR", $"BRACKETS ATTACHED (from net={net})");
+
+                            // *** VIRTUAL BE: Armar DESPUÉS de crear brackets (ahora SL y entry están disponibles) ***
+                            if (BreakevenMode == BreakevenMode.OnTPVirtualTouch && !_virtualBeArmed)
+                            {
+                                ArmVirtualBreakEven();
+                            }
                         }
                         else
                         {
@@ -1187,12 +889,32 @@ namespace MyAtas.Strategies
                     DebugLog.W("468/ORD", $"Removed {removed} from _liveOrders (now {_liveOrders.Count})");
                 }
 
+                // Failsafe tras cualquier cancelación manual de 468TP: o 468SL:
+                if (status == OrderStatus.Canceled && (comment.StartsWith("468TP:") || comment.StartsWith("468SL:")))
+                {
+                    if (_tradeActive)
+                    {
+                        var netAfterCancel = GetNetPosition();
+
+                        // Caso A: net=0 y solo quedan hijos -> cancelarlos y liberar
+                        if (netAfterCancel == 0 && HasAnyActiveOrders())
+                        {
+                            DebugLog.W("468/ORD", "Manual cancel detected -> zombie children cleanup");
+                            CancelAllLiveActiveOrders();
+                        }
+
+                        // Caso B: net=0 y ya no quedan órdenes -> libera candado
+                        if (netAfterCancel == 0 && !HasAnyActiveOrders())
+                            ReleaseTradeLock("manual cancel -> flat & no active orders");
+                    }
+                }
+
                 // IMPORTANTE: No reconciliar en OnOrderChanged para evitar ráfagas/reentradas.
                 // La reconciliación se hace en OnCalculate, 1x por barra, fuera de anti-flat.
 
                 // Plano: confirma con nueva lógica híbrida
                 int netNow = GetNetPosition();
-                if (FlatConfirmedNow(netNow))
+                if (DateTime.UtcNow >= _postEntryFlatBlockUntil && FlatConfirmedNow(netNow))
                 {
                     if (HasAnyActiveOrders())
                     {
@@ -1201,22 +923,14 @@ namespace MyAtas.Strategies
                     }
                     if (!HasAnyActiveOrders())
                     {
-                        _tradeActive = false;
-                        _bracketsPlaced = false;
-                        _bracketsAttachedAt = DateTime.MinValue;
-                        _antiFlatUntilBar = -1;
-                        _flatStreak = 0;
-                        _lastFlatRead = DateTime.MinValue;
+                        // *** PHANTOM FIX: Limpieza atómica completa ***
+                        AtomicFlatCleanup("flat confirmed & no active orders");
                         _lastFlatBar = CurrentBar;
                         if (EnableCooldown && CooldownBars > 0)
                         {
                             _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
                             DebugLog.W("468/STR", $"COOLDOWN armed until bar={_cooldownUntilBar} (now={CurrentBar})");
                         }
-                        // Clear fill tracking cache when truly flat
-                        _orderFills.Clear();
-                        _cachedNetPosition = 0;
-                        DebugLog.W("468/ORD", "Trade lock RELEASED (flat confirmed & no active orders)");
                     }
                 }
                 else if (netNow == 0)
@@ -1224,141 +938,22 @@ namespace MyAtas.Strategies
                     DebugLog.W("468/ORD", $"ANTI-FLAT: net=0 detected but not confirmed yet (streak={_flatStreak}, policy={AntiFlatPolicy})");
                 }
 
-                // <<< PATCH 2: RELEASE INCONDICIONAL AL FINAL DE OnOrderChanged >>>
-                // Cubre carreras donde FlatConfirmedNow() aún sea false pero ya no hay órdenes activas.
-                if (_tradeActive && netNow == 0 && !HasAnyActiveOrders())
+                // <<< DEFERRAL FIX: BLOQUE INCONDICIONAL DESACTIVADO >>>
+                // Este bloque causaba cleanup prematuro con fills fantasma, dejando órdenes huérfanas.
+                // La confirmación de flat ahora se hace SOLO vía watchdog/heartbeat con gates.
+                // GATE: Solo activar si NO hay fills sospechosos pendientes
+                if (_tradeActive && netNow == 0 && !HasAnyActiveOrders() && NetByFills() == 0 && _suspectFills.Count == 0)
                 {
-                    _tradeActive = false;
-                    _bracketsPlaced = false;
-                    _bracketsAttachedAt = DateTime.MinValue;
-                    _antiFlatUntilBar = -1;
-                    _flatStreak = 0;
-                    _lastFlatRead = DateTime.MinValue;
-                    _orderFills.Clear();
-                    _cachedNetPosition = 0;
+                    DebugLog.W("468/ORD",
+                        $"FLAT CONFIRMED (OnOrderChanged): net=0 netByFills=0 tpActive={CountActiveTPs()} slActive={CountActiveSLs()} suspectFills={_suspectFills.Count}");
+                    // *** PHANTOM FIX: Limpieza atómica completa ***
+                    AtomicFlatCleanup("OnOrderChanged final check");
                     _lastFlatBar = CurrentBar;
                     if (EnableCooldown && CooldownBars > 0)
                         _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
-                    DebugLog.W("468/ORD", "Trade lock RELEASED by OnOrderChanged (final)");
                 }
 
                 // Self-heal eliminado aquí. El re-attach sólo se gestiona en OnCalculate (1x/bar, fuera de anti-flat).
-                // CAPA 7 — Cuando una ENTRY se llena y ya conocemos el SL real, validar consistencia
-                if (RMEnabled && order != null && order.Status() == OrderStatus.Filled)
-                {
-                    // Detectar si es una entrada (usa tu propia condición si ya la tienes)
-                    bool isEntry = order.Comment != null && order.Comment.Contains("468ENTRY");
-                    if (isEntry)
-                    {
-                        var entryPrice = GetEffectiveFillPrice(order);
-
-                        // Intenta localizar la orden de STOP asociada al bracket
-                        // (Por ahora usamos un placeholder - sustituye por tu mecanismo real)
-                        var stopOrder = FindAttachedStopFor(order); // TODO: usa tu propio método/colección
-                        if (stopOrder != null && stopOrder.Price > 0)
-                        {
-                            var stopPrice = stopOrder.Price;
-                            var actualTicks = ComputeActualSlTicks(entryPrice, stopPrice);
-
-                            // Comparar con lo que usó el motor (diagnóstico)
-                            var plannedTicks = LastStopDistance; // lo que CalculatedQuantity usó
-                            var delta = actualTicks - plannedTicks;
-
-                            var qc = Security?.QuoteCurrency ?? "USD";
-                            var rpc = LastRiskPerContract; // ya en {qc}
-                            CalcLog("468/CALC",
-                                $"CONSISTENCY SL [entry={entryPrice:F2} stop={stopPrice:F2}] " +
-                                $"planned={plannedTicks:F2}t actual={actualTicks:F2}t delta={delta:F2}t " +
-                                $"rpc={rpc:F2}{qc}");
-
-                            // Si hay drift notable, dejar WARN
-                            if (Math.Abs(delta) >= 1m)
-                                RiskLog("468/RISK", $"SL DRIFT WARNING: planned={plannedTicks:F2}t vs actual={actualTicks:F2}t (Δ={delta:F2}t)");
-                        }
-                    }
-                }
-
-                // === BREAKEVEN TRIGGER: por TP fill ===
-                if (BreakevenMode == BreakevenMode.OnTPFill
-                    && order != null
-                    && (order.Comment?.StartsWith("468TP") ?? false)
-                    && order.Status() == OrderStatus.Filled)
-                {
-                    // Determinar qué TP se llenó usando Comment con fallback por precio
-                    int tpIndex = DetectTpIndexFromCommentOrPrice(order); // 0=TP1,1=TP2,2=TP3,-1=desconocido
-
-                    bool trigger = false;
-                    string reason = "unmapped";
-                    if (tpIndex == 0 && TriggerOnTP1TouchFill) { trigger = true; reason = "TP1"; }
-                    else if (tpIndex == 1 && TriggerOnTP2TouchFill) { trigger = true; reason = "TP2"; }
-                    else if (tpIndex == 2 && TriggerOnTP3TouchFill) { trigger = true; reason = "TP3"; }
-                    else if (tpIndex < 0)
-                    {
-                        // Si no pudimos mapear el índice, opcionalmente considerar TP1 por defecto si está enabled
-                        if (TriggerOnTP1TouchFill) { trigger = true; reason = "TP?→fallback TP1"; }
-                    }
-
-                    if (trigger)
-                    {
-                        // Check entry price availability BEFORE proceeding
-                        if (_lastEntryPrice <= 0m)
-                        {
-                            DebugLog.W("468/BRK", "SKIP BE: unknown entryPrice, attempting capture from current position");
-
-                            // Attempt to recover entry price from position if available
-                            try
-                            {
-                                var portfolio = Portfolio;
-                                var security = Security;
-                                if (portfolio != null && security != null)
-                                {
-                                    var getPos = portfolio.GetType().GetMethod("GetPosition", new[] { security.GetType() });
-                                    var pos = getPos?.Invoke(portfolio, new[] { security });
-                                    if (pos != null)
-                                    {
-                                        var pAvg = pos.GetType().GetProperty("AveragePrice") ?? pos.GetType().GetProperty("AvgPrice");
-                                        if (pAvg != null)
-                                        {
-                                            var avgPrice = Convert.ToDecimal(pAvg.GetValue(pos));
-                                            if (avgPrice > 0m)
-                                            {
-                                                _lastEntryPrice = avgPrice;
-                                                DebugLog.W("468/BRK", $"RECOVERED entry price from position: {_lastEntryPrice:F2}");
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                DebugLog.W("468/BRK", $"Failed to recover entry price: {ex.Message}");
-                            }
-
-                            // Final check after recovery attempt
-                            if (_lastEntryPrice <= 0m)
-                            {
-                                DebugLog.W("468/BRK", "ABORT BE: entryPrice still unknown after recovery attempt");
-                                return;
-                            }
-                        }
-
-                        // Pequeño throttle para evitar múltiples movimientos seguidos
-                        if ((DateTime.UtcNow - _lastBreakevenMoveUtc) < TimeSpan.FromSeconds(1))
-                        {
-                            DebugLog.W("468/BRK", "SKIP BE: throttled");
-                        }
-                        else
-                        {
-                            var trigPx = GetEffectiveFillPrice(order);
-                            DebugLog.W("468/BRK", $"TRIGGER by {reason} fill @ {(trigPx>0m?trigPx:order.Price):F2} entryPrice={_lastEntryPrice:F2}");
-                            MoveAllStopsToBreakevenAdvanced(_entryDir);
-                        }
-                    }
-                    else
-                    {
-                        DebugLog.W("468/BRK", $"NO-BE: TP index={tpIndex}, config TP1={TriggerOnTP1TouchFill}, TP2={TriggerOnTP2TouchFill}, TP3={TriggerOnTP3TouchFill}");
-                    }
-                }
             }
             catch (Exception ex)
             {
@@ -1391,12 +986,20 @@ namespace MyAtas.Strategies
                     _bracketsAttachedAt = DateTime.UtcNow;
                     _antiFlatUntilBar = CurrentBar + Math.Max(0, AntiFlatBars);
                     _flatStreak = 0;
+
+                    // --- STATE tras adjuntar brackets (OnPositionChanged) ---
+                    DebugLog.W("468/STR",
+                        $"STATE: tradeActive={_tradeActive} " +
+                        $"dir={_entryDir} net={GetNetPosition()} netByFills={NetByFills()} " +
+                        $"tpActive={CountActiveTPs()} slActive={CountActiveSLs()} " +
+                        $"liveOrders={(_liveOrders?.Count ?? 0)} " +
+                        $"signalBar={_lastSignalBar} antiFlatMs={AntiFlatMs} confirmFlatReads={ConfirmFlatReads}");
                     _lastFlatRead = DateTime.MinValue;
                     DebugLog.W("468/STR", $"BRACKETS ATTACHED (via OnPositionChanged, net={net})");
                 }
 
                 // Plano: usa nueva lógica híbrida
-                if (FlatConfirmedNow(net))
+                if (DateTime.UtcNow >= _postEntryFlatBlockUntil && FlatConfirmedNow(net))
                 {
                     if (HasAnyActiveOrders())
                     {
@@ -1414,6 +1017,11 @@ namespace MyAtas.Strategies
                         // Clear fill tracking cache when truly flat
                         _orderFills.Clear();
                         _cachedNetPosition = 0;
+                        // Reset BreakEven state
+                        _breakevenApplied = false;
+                        _entryPrice = 0m;
+                        _beLastTouchBar = -1;
+                        _beLastTouchAt = DateTime.MinValue;
                         DebugLog.W("468/ORD", "Trade lock RELEASED by OnPositionChanged (flat confirmed & no active orders)");
                     }
                 }
@@ -1427,447 +1035,41 @@ namespace MyAtas.Strategies
         }
 
         // ====================== BRACKETS (ROBUST) ======================
-        private void BuildAndSubmitBracket(int dir, int totalQty, int signalBar, int execBar)
-        {
-            if (totalQty <= 0) return;
+        // (moved to Execution.cs)
 
-            var (slPx, tpList) = BuildBracketPrices(dir, signalBar, execBar); // tpList respeta EnableTP1/2/3
-            // Cachear los targets de TP para identificar TP1/2/3 en OnOrderChanged
-            _lastTpPrices = (tpList != null) ? new List<decimal>(tpList) : new List<decimal>(0);
-            var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+        // (BuildBracketPrices moved to Execution.cs)
 
-            int enabled = tpList.Count;
-            if (enabled <= 0)
-            {
-                // Sin TPs activos → SL único por la qty completa
-                SubmitStop(null, coverSide, totalQty, slPx);
-                DebugLog.W("468/STR", $"BRACKETS: SL-only {totalQty} @ {slPx:F2} (no TPs enabled)");
+        // (SplitQtyForTPs moved to Execution.cs)
 
-                // Log consistency check after SL-only bracket
-                LogSlConsistencyIfPossible();
-                return;
-            }
-
-            // Reparto de cantidad entre TPs habilitados (p.ej., 3→[2,1] si enabled=2)
-            var qtySplit = SplitQtyForTPs(totalQty, enabled); // ya existe en tu código
-
-            for (int i = 0; i < enabled; i++)
-            {
-                int legQty = Math.Max(1, qtySplit[i]);
-                var oco = Guid.NewGuid().ToString("N");
-                SubmitStop(oco, coverSide, legQty, slPx);
-                SubmitLimit(oco, coverSide, legQty, tpList[i], i); // i = 0→TP1, 1→TP2, 2→TP3
-            }
-
-            DebugLog.W("468/STR", $"BRACKETS: SL={slPx:F2} | TPs={string.Join(",", tpList.Select(x=>x.ToString("F2")))} | Split=[{string.Join(",", qtySplit)}] | Total={totalQty}");
-
-            // Log consistency check after brackets are attached
-            LogSlConsistencyIfPossible();
-        }
-
-        private (decimal slPx, List<decimal> tpList) BuildBracketPrices(int dir, int signalBar, int execBar)
-        {
-            // FIXED: Use UseSignalCandleSL property
-            var refCandle = UseSignalCandleSL ? GetCandle(signalBar) : GetCandle(execBar);
-
-            decimal sl = dir > 0 ? refCandle.Low  - Ticks(Math.Max(0, StopOffsetTicks))
-                                 : refCandle.High + Ticks(Math.Max(0, StopOffsetTicks));
-            sl = RoundToTick(sl);
-
-            // Entrada de referencia: apertura de N+1 (o close de N como fallback)
-            decimal entryPx;
-            try
-            {
-                // Intentar la apertura de la vela de ejecución
-                if (execBar <= CurrentBar)
-                {
-                    entryPx = GetCandle(execBar).Open;
-                }
-                else
-                {
-                    // Fallback: cierre de N si exec aún no existe
-                    entryPx = GetCandle(signalBar).Close;
-                }
-            }
-            catch
-            {
-                // Ultimate fallback
-                entryPx = GetCandle(signalBar).Close;
-            }
-
-            if (entryPx <= 0) entryPx = GetCandle(signalBar).Close;
-
-            decimal risk = Math.Abs(entryPx - sl);
-            if (risk <= 0) risk = Ticks(2);
-
-            var tps = new List<decimal>();
-            if (EnableTP1) tps.Add(RoundToTick(dir > 0 ? entryPx + TP1_R * risk : entryPx - TP1_R * risk));
-            if (EnableTP2) tps.Add(RoundToTick(dir > 0 ? entryPx + TP2_R * risk : entryPx - TP2_R * risk));
-            if (EnableTP3) tps.Add(RoundToTick(dir > 0 ? entryPx + TP3_R * risk : entryPx - TP3_R * risk));
-
-            DebugLog.W("468/STR", $"BRACKET-PRICES: entry~{entryPx:F2} sl={sl:F2} risk={risk:F2}");
-            return (sl, tps);
-        }
-
-        private void BracketWatchdog()
-        {
-            if (!EnableBracketWatchdog) return;
-
-            var net = Math.Abs(GetNetPosition());
-            if (net <= 0) { _scheduleAttachBrackets = false; return; }
-
-            bool hasActiveSL = _liveOrders.Any(o => o?.Comment?.StartsWith("468SL:") == true && o.State == OrderStates.Active);
-            bool hasActiveTP = _liveOrders.Any(o => o?.Comment?.StartsWith("468TP") == true && o.State == OrderStates.Active);
-
-            if ((!hasActiveSL || !hasActiveTP) && _scheduleAttachBrackets)
-            {
-                // Recalcular precios desde _lastEntryPrice y _entryDir
-                var (slPx, tpList) = BuildBracketPrices(_entryDir, /*signalBar*/CurrentBar, /*execBar*/CurrentBar);
-                slPx = RoundToTick(slPx);
-                for (int i=0;i<tpList.Count;i++) tpList[i] = RoundToTick(tpList[i]);
-
-                var coverSide = _entryDir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
-                var oco = Guid.NewGuid().ToString("N");
-                var qtySplit = SplitQtyForTPs(net, tpList.Count);
-                SubmitStop(oco, coverSide, net, slPx);
-                for (int i=0;i<tpList.Count;i++)
-                    SubmitLimit(oco, coverSide, qtySplit[i], tpList[i], i);
-
-                DebugLog.Critical("468/BRK", $"WATCHDOG re-attached brackets net={net} sl={slPx:F2} tps=[{string.Join(",",tpList)}]");
-                _scheduleAttachBrackets = false;
-            }
-        }
-
-        private List<int> SplitQtyForTPs(int totalQty, int nTps)
-        {
-            var q = new List<int>();
-            if (nTps <= 0) { q.Add(totalQty); return q; }
-            int baseQ = Math.Max(1, totalQty / nTps);
-            int rem = totalQty - baseQ * nTps;
-            for (int i = 0; i < nTps; i++) q.Add(baseQ + (i < rem ? 1 : 0));
-            return q;
-        }
-
-        // FIXED: Implement missing ElementAtOrDefault method
-        private static T GetElementAtOrDefault<T>(List<T> list, int index, T defaultValue)
-        {
-            return (index >= 0 && index < list.Count) ? list[index] : defaultValue;
-        }
+        // (GetElementAtOrDefault moved to Execution.cs)
 
         // ====================== ORDER WRAPPERS ======================
-        private void SubmitMarket(int dir, int qty, int bar, int signalBar)
-        {
-            // *** CRITICAL DEBUG ***
-            DebugLog.Critical("468/STR", $"SubmitMarket CALLED: dir={dir} qty={qty} bar={bar} t={GetCandle(bar).Time:HH:mm:ss} - THIS IS OUR N+1 EXECUTION");
+        // (SubmitMarket moved to Execution.cs)
 
-            // C) Market order watchdog - track timing for demo delay detection
-            _lastMarketSentUtc = DateTime.UtcNow;
-            _marketOrderPending = true;
+        // (SubmitLimit moved to Execution.cs)
 
-            var order = new Order
-            {
-                Portfolio = Portfolio,
-                Security  = Security,
-                Direction = dir > 0 ? OrderDirections.Buy : OrderDirections.Sell,
-                Type      = OrderTypes.Market,
-                QuantityToFill = qty,
-                Comment = $"468ENTRY:{DateTime.UtcNow:HHmmss}"
-            };
-            OpenOrder(order);
-            _liveOrders.Add(order);
-
-            // Track signal context for post-fill brackets
-            _targetQty = qty;
-            _lastSignalBar = signalBar;
-            _entryDir = dir;
-            _bracketsPlaced = false;
-
-            DebugLog.Critical("468/STR", $"MARKET ORDER SENT: {(dir>0?"BUY":"SELL")} {qty} at N+1 (bar={bar}) - OpenOrder() called successfully");
-        }
-
-        private void SubmitLimit(string oco, OrderDirections side, int qty, decimal px, int tpIndex /* 0-based */)
-        {
-            var idx = Math.Max(0, Math.Min(tpIndex, 2)) + 1; // 1..3
-            var order = new Order
-            {
-                Portfolio = Portfolio,
-                Security  = Security,
-                Direction = side,
-                Type      = OrderTypes.Limit,
-                Price     = px,
-                QuantityToFill = qty,
-                OCOGroup  = oco,
-                AutoCancel = EnableAutoCancel,
-                IsAttached = true,
-                Comment   = $"468TP{idx}:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
-            };
-            OpenOrder(order);
-            _liveOrders.Add(order);
-            DebugLog.W("468/ORD", $"LIMIT submitted: {side} {qty} @{px:F2} OCO={(oco??"none")}");
-        }
-
-        private void SubmitStop(string oco, OrderDirections side, int qty, decimal triggerPx)
-        {
-            var order = new Order
-            {
-                Portfolio = Portfolio,
-                Security  = Security,
-                Direction = side,
-                Type      = OrderTypes.Stop,
-                TriggerPrice = triggerPx,
-                QuantityToFill = qty,
-                OCOGroup = oco,
-                AutoCancel = EnableAutoCancel,
-                IsAttached = true,
-                Comment = $"468SL:{DateTime.UtcNow:HHmmss}:{(oco!=null?oco.Substring(0,Math.Min(6,oco.Length)):"nooco")}"
-            };
-            OpenOrder(order);
-            _liveOrders.Add(order);
-            DebugLog.W("468/ORD", $"STOP submitted: {side} {qty} @{triggerPx:F2} OCO={(oco??"none")}");
-        }
-
-        /// <summary>
-        /// Cancela todos los SL activos y crea un único SL en breakeven (+offset) para la posición viva.
-        /// Totalmente idempotente: si net=0 o no hay entryPrice, no hace nada.
-        /// </summary>
-        /// <summary>
-        /// Legacy compatibility method that calls the enhanced version
-        /// </summary>
-        private void MoveAllStopsToBreakeven(int dir)
-        {
-            MoveAllStopsToBreakevenAdvanced(dir);
-        }
-
-        /// <summary>
-        /// Detecta el índice TP (0-based) por Comment con fallback por precio para retrocompatibilidad
-        /// </summary>
-        private int DetectTpIndexFromCommentOrPrice(Order order)
-        {
-            try
-            {
-                var c = order?.Comment ?? "";
-                if (c.StartsWith("468TP1:")) return 0;
-                if (c.StartsWith("468TP2:")) return 1;
-                if (c.StartsWith("468TP3:")) return 2;
-                if (c.StartsWith("468TP:"))
-                {
-                    // Retrocompatibilidad: mapear por precio con tolerancia 0.5 tick
-                    if (_lastTpPrices != null && _lastTpPrices.Count > 0)
-                    {
-                        var ts = (EffectiveTickSize > 0m) ? EffectiveTickSize : (Security?.TickSize ?? 0.25m);
-                        if (ts <= 0m) ts = 0.25m;
-                        var tol = ts * 0.5m;
-                        for (int i = 0; i < _lastTpPrices.Count; i++)
-                            if (Math.Abs(_lastTpPrices[i] - order.Price) <= tol)
-                                return i;
-                    }
-                }
-            }
-            catch { /* best-effort */ }
-            return -1; // desconocido
-        }
+        // (SubmitStop moved to Execution.cs)
 
         private int GetFilledQtyFromOrder(object order)
         {
-            try
+            // Igual que RiskManager.Manual.cs ExtractFilledQty (línea 802-818)
+            foreach (var name in new[] { "Filled", "FilledQuantity", "Quantity", "QuantityToFill", "Volume", "Lots" })
             {
-                foreach (var name in new[] { "Filled", "FilledQuantity", "Executed", "QtyFilled" })
+                try
                 {
                     var p = order.GetType().GetProperty(name);
                     if (p == null) continue;
-                    var v = Math.Abs(Convert.ToDecimal(p.GetValue(order)));
-                    if (v > 0) return (int)Math.Round(v);
+                    var v = p.GetValue(order);
+                    if (v == null) continue;
+                    var q = Convert.ToInt32(v);
+                    if (q > 0) return q;
                 }
+                catch { }
             }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/POS", $"GetFilledQtyFromOrder failed: {ex.Message}");
-            }
-            DebugLog.W("468/POS", "GetNetPosition: returning 0 (no position found)");
             return 0;
         }
 
-        /// <summary>
-        /// ENHANCED: Cancela todos los SL activos en TODOS los grupos OCO y crea un único SL en breakeven (+offset) para la posición viva.
-        /// Maneja múltiples órdenes SL asociadas a un mismo grupo para que todas se muevan juntas.
-        /// </summary>
-        private void MoveAllStopsToBreakevenAdvanced(int dir)
-        {
-            try
-            {
-                int net = Math.Abs(GetNetPosition());
-                if (net <= 0)
-                {
-                    DebugLog.W("468/BRK", "SKIP BE: net=0 (no position)");
-                    return;
-                }
-                if (_lastEntryPrice <= 0m)
-                {
-                    DebugLog.W("468/BRK", "SKIP BE: unknown entryPrice");
-                    return;
-                }
-
-                // Breakeven = entry ± offset*tick
-                var ts = (EffectiveTickSize > 0m) ? EffectiveTickSize : (Security?.TickSize ?? 0.25m);
-                if (ts <= 0m) ts = 0.25m;
-                var offsetTicks = Math.Max(0, BreakevenOffsetTicks);
-                var bePx = dir > 0
-                    ? _lastEntryPrice + offsetTicks * ts
-                    : _lastEntryPrice - offsetTicks * ts;
-
-                // Track OCO groups and their SL orders
-                var ocoGroups = new Dictionary<string, List<Order>>();
-
-                // Group SL orders by OCO ID
-                foreach (var o in _liveOrders.ToList())
-                {
-                    if (o?.Comment?.StartsWith("468SL:") ?? false)
-                    {
-                        try
-                        {
-                            // Extract OCO group from order (ATAS has specific OCO handling)
-                            var ocoId = ExtractOcoId(o);
-                            if (!string.IsNullOrEmpty(ocoId))
-                            {
-                                if (!ocoGroups.ContainsKey(ocoId))
-                                    ocoGroups[ocoId] = new List<Order>();
-                                ocoGroups[ocoId].Add(o);
-                            }
-                            else
-                            {
-                                // Individual SL not in OCO group
-                                if (!ocoGroups.ContainsKey("INDIVIDUAL"))
-                                    ocoGroups["INDIVIDUAL"] = new List<Order>();
-                                ocoGroups["INDIVIDUAL"].Add(o);
-                            }
-                        }
-                        catch
-                        {
-                            // Fallback: treat as individual
-                            if (!ocoGroups.ContainsKey("INDIVIDUAL"))
-                                ocoGroups["INDIVIDUAL"] = new List<Order>();
-                            ocoGroups["INDIVIDUAL"].Add(o);
-                        }
-                    }
-                }
-
-                int totalCanceledSL = 0;
-                // Cancel ALL SL orders in ALL OCO groups
-                foreach (var ocoGroup in ocoGroups)
-                {
-                    DebugLog.W("468/BRK", $"Canceling {ocoGroup.Value.Count} SL orders in group {ocoGroup.Key}");
-                    foreach (var o in ocoGroup.Value)
-                    {
-                        try { CancelOrder(o); } catch { /* swallow */ }
-                        totalCanceledSL++;
-                        DebugLog.W("468/BRK", $"Cancelled SL: {o.Comment} from OCO group {ocoGroup.Key}");
-                    }
-                }
-
-                // Crear nuevo SL unificado en breakeven
-                var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
-                var newOco = Guid.NewGuid().ToString("N");
-                SubmitStop(newOco, coverSide, net, bePx);
-                _lastBreakevenMoveUtc = DateTime.UtcNow;
-                DebugLog.Critical("468/BRK", $"BREAKEVEN MOVE COMPLETE → Canceled {totalCanceledSL} SL orders, Created unified SL {net} @ {bePx:F2} (entry={_lastEntryPrice:F2}, off={offsetTicks}t)");
-            }
-            catch (Exception ex)
-            {
-                DebugLog.W("468/BRK", $"MoveAllStopsToBreakevenAdvanced ERROR: {ex.Message}");
-            }
-        }
-
-        /// <summary>
-        /// Log de consistencia SL (diagnóstico)
-        /// </summary>
-        private void LogSlConsistencyIfPossible()
-        {
-            try
-            {
-                // Busca un stop activo (prefijo estándar de tus comentarios)
-                var sl = _liveOrders.FirstOrDefault(o =>
-                    o != null && (o.Comment?.StartsWith("468SL:") ?? false) && o.State == OrderStates.Active);
-
-                if (sl == null || _lastEntryPrice <= 0) return;
-
-                var actualTicks = Math.Abs(sl.Price - _lastEntryPrice) / Ticks(1);
-                DebugLog.W("468/CALC", $"CONSISTENCY SL [entry={_lastEntryPrice:F2} stop={sl.Price:F2}] " +
-                                       $"planned={LastStopDistance:F1}t actual={actualTicks:F1}t " +
-                                       $"delta={(actualTicks - LastStopDistance):F1}t rpc={LastRiskPerContract:F2}USD");
-            }
-            catch { /* best-effort */ }
-        }
-
-        /// <summary>
-        /// Helper to extract OCO group ID from an order
-        /// </summary>
-        private string ExtractOcoId(Order order)
-        {
-            try
-            {
-                // ATAS orders may have OCO properties - use reflection to find them
-                var ocoProps = new[] { "OcoId", "OCOId", "GroupId", "LinkedOrderId", "ParentId" };
-
-                foreach (var propName in ocoProps)
-                {
-                    var prop = order.GetType().GetProperty(propName, BindingFlags.Public | BindingFlags.Instance);
-                    if (prop != null)
-                    {
-                        var value = prop.GetValue(order);
-                        if (value != null && !string.IsNullOrEmpty(value.ToString()))
-                        {
-                            return value.ToString();
-                        }
-                    }
-                }
-
-                // Fallback: parse from comment if it contains OCO info
-                var comment = order.Comment ?? "";
-                if (comment.Contains("OCO:"))
-                {
-                    var ocoIndex = comment.IndexOf("OCO:");
-                    if (ocoIndex >= 0)
-                    {
-                        var ocoSegment = comment.Substring(ocoIndex + 4);
-                        var spaceIndex = ocoSegment.IndexOf(' ');
-                        if (spaceIndex > 0)
-                            return ocoSegment.Substring(0, spaceIndex);
-                        else
-                            return ocoSegment;
-                    }
-                }
-            }
-            catch
-            {
-                // Ignore errors in OCO extraction
-            }
-
-            return null; // No OCO group found
-        }
-
         // ====================== HELPERS - FIXED ======================
-
-        // ===== Helpers de fills/ejecución =====
-        private decimal GetEffectiveFillPrice(object order)
-        {
-            if (order == null) return 0m;
-            try
-            {
-                var t = order.GetType();
-                string[] names = { "AveragePrice", "AvgFillPrice", "ExecutionPrice", "LastFillPrice", "FillPrice", "Price" };
-                foreach (var n in names)
-                {
-                    var p = t.GetProperty(n);
-                    if (p == null) continue;
-                    var v = p.GetValue(order);
-                    if (v is decimal d && d > 0) return d;
-                    if (v is double dd && dd > 0) return (decimal)dd;
-                    if (v is float ff && ff > 0) return (decimal)ff;
-                }
-            }
-            catch { /* best-effort */ }
-            return 0m;
-        }
         // FIXED: Use override instead of new to properly override base property
         protected virtual decimal InternalTickSize
         {
@@ -1895,10 +1097,8 @@ namespace MyAtas.Strategies
         private decimal CloseAt(int i) => GetCandle(SafeBarIndex(i)).Close;
         private decimal RoundToTick(decimal price)
         {
-            var ts = (EffectiveTickSize > 0m) ? EffectiveTickSize : (Security?.TickSize ?? 0.25m);
-            if (ts <= 0m) ts = 0.25m;
-            var steps = Math.Round(price / ts, MidpointRounding.AwayFromZero);
-            return steps * ts;
+            var steps = Math.Round(price / InternalTickSize, MidpointRounding.AwayFromZero);
+            return steps * InternalTickSize;
         }
 
         // FIXED: Add safe bar index method
@@ -1925,23 +1125,35 @@ namespace MyAtas.Strategies
                 return positionsPos;
             }
 
-            // Strategy 3: Use our cached position with fill tracking
-            int cachedPos = GetCachedPositionWithFills();
-            if (cachedPos != 0)
+            // *** PHANTOM FIX: Si broker dice 0, solo usar fills si seguimos "en trade" ***
+            bool live = HasAnyActiveOrders() || _tradeActive;
+            if (live)
             {
-                DebugLog.W("468/POS", $"GetNetPosition via Cache+Fills: {cachedPos}");
-                return cachedPos;
+                // Strategy 3: Use cached position with fill tracking (solo si hay actividad)
+                int cachedPos = GetCachedPositionWithFills();
+                if (cachedPos != 0)
+                {
+                    DebugLog.W("468/POS", $"GetNetPosition via Cache+Fills (live={live}): {cachedPos}");
+                    return cachedPos;
+                }
+
+                // Strategy 4: Sticky cache ONLY while anti-flat protection is active
+                if (_cachedNetPosition != 0 && (DateTime.UtcNow < _postEntryFlatBlockUntil || !FlatConfirmedNow(0)))
+                {
+                    DebugLog.W("468/POS", $"GetNetPosition via StickyCache (anti-flat active): {_cachedNetPosition}");
+                    return _cachedNetPosition;
+                }
             }
 
-            // Strategy 4: Sticky cache ONLY while anti-flat protection is active
-            if (_cachedNetPosition != 0 && !FlatConfirmedNow(0))
+            // *** PHANTOM FIX: Si no hay actividad, sanear residuos ***
+            if (!live && (_orderFills.Count > 0 || _cachedNetPosition != 0))
             {
-                DebugLog.W("468/POS", $"GetNetPosition via StickyCache (anti-flat active): {_cachedNetPosition}");
-                return _cachedNetPosition;
+                DebugLog.W("468/POS", $"PHANTOM CLEANUP: broker=0, live=false, clearing fills({_orderFills.Count}) and cache({_cachedNetPosition})");
+                _orderFills.Clear();
+                _cachedNetPosition = 0;
             }
 
-            // All strategies failed
-            DebugLog.W("468/POS", "GetNetPosition: all strategies failed, returning 0");
+            DebugLog.W("468/POS", $"GetNetPosition: flat confirmed (portfolio=0 positions=0 live={live})");
             return 0;
         }
 
@@ -2066,35 +1278,35 @@ namespace MyAtas.Strategies
 
                 var qty = (int)Math.Abs(Math.Truncate(qFilled));
 
-                // Determine sign based on direction and order type
-                var direction = order.Direction;
-                int sign = 0;
-
-                // FIX: For ALL orders (ENTRY, TP, SL), use consistent sign logic
-                // Buy = +1, Sell = -1 (TP/SL do NOT reverse, they reduce position)
-                sign = (direction.ToString().Contains("Buy")) ? 1 : -1;
+                // *** PHANTOM FIX: Usar registro determinista del signo ***
+                int sign;
+                if (!_childSign.TryGetValue(orderId, out sign))
+                {
+                    // Fallback: usa _entryDir si existe; por defecto considera que
+                    // si no es entry, entonces cierra (-_entryDir).
+                    int dir = _entryDir; // -1 short, +1 long
+                    bool isEntry = c.StartsWith("468ENTRY:");
+                    sign = isEntry ? dir : -dir;
+                    DebugLog.W("468/POS", $"TrackOrderFill FALLBACK sign: {orderId} = {sign} (dir={dir} isEntry={isEntry})");
+                }
 
                 var netQty = qty * sign;
 
                 if (action == "Filled")
                 {
                     _orderFills[orderId] = netQty;
-
-                    // ENHANCED: Capture market fill prices for breakeven triggering
-                    if (c.StartsWith("468TP:"))
-                    {
-                        var tpFillPrice = GetEffectiveFillPrice(order);
-                        if (tpFillPrice > 0m)
-                        {
-                            DebugLog.W("468/BRK", $"TP FILL DETECTED: {orderId} @ {tpFillPrice:F2} qty={netQty}");
-                        }
-                    }
-
                     DebugLog.W("468/POS", $"Tracked fill: {orderId} = {netQty} (type: {c.Substring(0,8)})");
+                    DebugLog.W("468/POS", $"FILL SNAPSHOT: netByFills={NetByFills()} | liveOrders={(_liveOrders?.Count ?? 0)}");
+                    if (c.StartsWith("468ENTRY:"))
+                    {
+                        _postEntryFlatBlockUntil = DateTime.UtcNow.AddMilliseconds(Math.Max(AntiFlatMs * 2, 800));
+                        DebugLog.W("468/ORD", $"POST-ENTRY FLAT BLOCK armed (TrackFill) for {Math.Max(AntiFlatMs * 2, 800)}ms");
+                    }
                 }
                 else if (action == "Canceled")
                 {
                     _orderFills.Remove(orderId);
+                    _childSign.Remove(orderId); // también limpiar signo
                     DebugLog.W("468/POS", $"Removed fill tracking: {orderId}");
                 }
             }
@@ -2163,6 +1375,10 @@ namespace MyAtas.Strategies
 
         private bool FlatConfirmedNow(int netNow)
         {
+            // Nunca confirmes 'flat' si por fills queda posición
+            if (NetByFills() != 0)
+                return false;
+
             // 1) Actualiza racha de lecturas planas
             if (netNow == 0)
             {
@@ -2190,8 +1406,8 @@ namespace MyAtas.Strategies
                 _ => (timeOk && barsOk) // Hybrid
             };
 
-            // 3) Lecturas consistentes
-            bool readsOk = _flatStreak >= Math.Max(1, ConfirmFlatReads);
+            // Endurecer: mínimo 3 lecturas coherentes
+            bool readsOk = _flatStreak >= Math.Max(3, ConfirmFlatReads);
 
             return (netNow == 0) && policyOk && readsOk;
         }
@@ -2271,13 +1487,12 @@ namespace MyAtas.Strategies
                 return true;
             }
 
-            const decimal eps = 0.0001m;
-            bool trendUp   = (gN - gN1) >  eps;
-            bool trendDown = (gN1 - gN) >  eps;
-            bool ok = dir > 0 ? trendUp : trendDown; // BUY exige subiendo; SELL exige bajando (estricto)
+            bool up   = gN1 > gN;
+            bool down = gN1 < gN;
+            bool ok = dir > 0 ? up : down; // BUY exige subiendo; SELL exige bajando (estricto)
 
             DebugLog.W("468/STR", $"CONF#1 (GL slope @N+1) gN={gN:F5} gN1={gN1:F5} " +
-                                   $"trend={(trendUp? "UP": (trendDown? "DOWN":"FLAT"))} -> {(ok? "OK":"FAIL")}");
+                                   $"trend={(up? "UP": (down? "DOWN":"FLAT"))} -> {(ok? "OK":"FAIL")}");
             return ok;
         }
 
@@ -2381,26 +1596,123 @@ namespace MyAtas.Strategies
         private void ReconcileBracketsWithNet()
         {
             int net = Math.Abs(GetNetPosition());
-            if (net <= 0 && !FlatConfirmedNow(0))
+            int netByFills = Math.Abs(NetByFills());
+            DebugLog.W("468/STR", $"RECONCILE START: net={net} netByFills={netByFills}");
+
+            if (net <= 0 && (DateTime.UtcNow < _postEntryFlatBlockUntil || !FlatConfirmedNow(0)))
             {
                 DebugLog.W("468/STR", "RECONCILE SKIP: net=0 (not flat-confirmed) → protect children");
                 return;
             }
-            if (net < 0) net = 0;
+            if (net < 0)
+            {
+                DebugLog.W("468/STR", "RECONCILE: clamping net from negative to 0");
+                net = 0;
+            }
+
+            // === FREEZE MODE: mientras BE activo, mantener 1 solo TP (no recrear TP1/TP2/TP3) ===
+            if (_breakevenApplied)
+            {
+                var beActiveTps = _liveOrders
+                    .Where(o => o != null && (o.Comment?.StartsWith("468TP:") ?? false)
+                        && o.State == OrderStates.Active && o.Status() != OrderStatus.Filled && o.Status() != OrderStatus.Canceled)
+                    .ToList();
+                var beActiveSls = _liveOrders
+                    .Where(o => o != null && (o.Comment?.StartsWith("468SL:") ?? false)
+                        && o.State == OrderStates.Active && o.Status() != OrderStatus.Filled && o.Status() != OrderStatus.Canceled)
+                    .ToList();
+
+                // 1) Elegir el TP "bueno": el más lejano en la dirección (o el último memorizado por BE)
+                Order keepTp = null;
+                if (beActiveTps.Count > 0)
+                {
+                    keepTp = (_entryDir > 0)
+                        ? beActiveTps.OrderByDescending(o => SafeGetPrice(o)).First()
+                        : beActiveTps.OrderBy(o => SafeGetPrice(o)).First();
+                }
+
+                // 2) Cancelar TPs extra (si quedaron más de uno por carreras)
+                foreach (var tp in beActiveTps)
+                    if (!object.ReferenceEquals(tp, keepTp))
+                        try { CancelOrder(tp); } catch {}
+
+                // 3) Asegurar que existe EXACTAMENTE 1 TP y su qty==net
+                var coverSide = _entryDir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+                string oco = null;
+                if (beActiveSls.Count > 0) // intenta heredar el OCO del SL actual
+                    try { oco = (string)beActiveSls[0].GetType().GetProperty("OCOGroup")?.GetValue(beActiveSls[0]); } catch {}
+                if (string.IsNullOrEmpty(oco)) oco = Guid.NewGuid().ToString("N");
+
+                if (keepTp == null && net > 0)
+                {
+                    // Si no hay TP vivo (por timing), crea uno en el TP memorizado por BE
+                    var px = _beLastTpPrice;
+                    if (px <= 0m)
+                    {
+                        // fallback prudente: un poco más allá del BE
+                        px = _entryDir > 0 ? RoundToTick(GetCandle(CurrentBar).Close + Ticks(Math.Max(4, BreakevenOffsetTicks)))
+                                           : RoundToTick(GetCandle(CurrentBar).Close - Ticks(Math.Max(4, BreakevenOffsetTicks)));
+                    }
+                    SubmitLimit(oco, coverSide, net, px);
+                    DebugLog.W("468/STR", $"RECON(BE): recreated single TP qty={net} @ {px:F2}");
+                }
+                else if (keepTp != null)
+                {
+                    // Si hay TP, comprueba qty y ajusta si hace falta
+                    int tpQty = 0; try { tpQty = (int)Math.Abs(keepTp.QuantityToFill); } catch {}
+                    if (tpQty != net)
+                    {
+                        try { CancelOrder(keepTp); } catch {}
+                        var px = SafeGetPrice(keepTp); if (px <= 0m) px = _beLastTpPrice;
+                        SubmitLimit(oco, coverSide, net, px);
+                        DebugLog.W("468/STR", $"RECON(BE): resized single TP from {tpQty} -> {net}");
+                    }
+                }
+
+                // 4) Para el SL, conserva únicamente 1 SL = net (no tocar precio BE)
+                int beSlQty = 0; foreach (var s in beActiveSls) { try { beSlQty += (int)Math.Abs(s.QuantityToFill); } catch {} }
+                if (beSlQty != net)
+                {
+                    foreach (var s in beActiveSls) { try { CancelOrder(s); } catch {} }
+                    // Nota: NO recalculamos precio; lo debe fijar BE. Si no hay SL, créalo en BE.
+                    decimal bePx = CalculateBreakEvenPrice(_entryDir, _entryPrice, BreakevenOffsetTicks);
+                    SubmitStop(oco, coverSide, net, bePx);
+                    DebugLog.W("468/STR", $"RECON(BE): resized SL to qty={net} @ {bePx:F2}");
+                }
+
+                // Importante: durante BE no seguimos con la reconciliación "normal" (que replantea TP1/TP2/TP3)
+                return;
+            }
 
             // TPs activos de esta estrategia
             var tps = _liveOrders
                 .Where(o => o != null && (o.Comment?.StartsWith("468TP:") ?? false)
                        && o.State == OrderStates.Active && o.Status() != OrderStatus.Filled && o.Status() != OrderStatus.Canceled)
                 .ToList();
+            DebugLog.W("468/STR", $"RECONCILE TPs: found {tps.Count} active TPs for net={net}");
 
             // Si hay más TPs que net -> cancelar sobrantes
             if (tps.Count > net)
             {
-                // dejar los más cercanos primero (ordenar por Price asc. es suficiente para BUY)
-                var toCancel = tps.OrderBy(o => o.Price).Skip(net).ToList();
+                DebugLog.W("468/STR", $"RECONCILE TPs: need to cancel {tps.Count - net} excess TPs");
+                // dejar los más lejanos (más ambiciosos) para largos
+                var toCancel = tps.OrderByDescending(o => o.Price).Skip(net).ToList();
                 foreach (var o in toCancel)
-                    try { CancelOrder(o); } catch { }
+                {
+                    try
+                    {
+                        DebugLog.W("468/STR", $"RECONCILE CANCEL TP: price={o.Price:F2}");
+                        CancelOrder(o);
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugLog.W("468/STR", $"RECONCILE CANCEL TP EX: {ex.Message}");
+                    }
+                }
+            }
+            else if (tps.Count < net)
+            {
+                DebugLog.W("468/STR", $"RECONCILE TPs: have {tps.Count} TPs but net={net} (TP deficit, normal after partial fills)");
             }
 
             // Stops activos
@@ -2410,19 +1722,62 @@ namespace MyAtas.Strategies
                 .ToList();
             int slQty = 0;
             foreach (var s in sls) { try { slQty += (int)s.QuantityToFill; } catch { } }
+            DebugLog.W("468/STR", $"RECONCILE SLs: found {sls.Count} SL orders with total qty={slQty} (need={net})");
 
             // Si la suma de SL != net -> simplificar a un único SL = net
             if (slQty != net)
             {
-                foreach (var s in sls) { try { CancelOrder(s); } catch { } }
+                DebugLog.W("468/STR", $"RECONCILE SL QTY MISMATCH: have={slQty} need={net} -> rebuilding SL");
+                foreach (var s in sls)
+                {
+                    try
+                    {
+                        DebugLog.W("468/STR", $"RECONCILE CANCEL SL: price={s.TriggerPrice:F2} qty={(int)s.QuantityToFill}");
+                        CancelOrder(s);
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugLog.W("468/STR", $"RECONCILE CANCEL SL EX: {ex.Message}");
+                    }
+                }
                 if (Math.Abs(net) > 0 && _lastSignalBar >= 0 && _entryDir != 0)
                 {
                     var (slPx, _) = BuildBracketPrices(_entryDir, _lastSignalBar, CurrentBar);
                     var coverSide = _entryDir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
                     var oco = Guid.NewGuid().ToString();
+                    DebugLog.W("468/STR", $"RECONCILE REBUILD SL: {coverSide} qty={net} @{slPx:F2} oco={oco.Substring(0, 6)}");
                     SubmitStop(oco, coverSide, net, slPx);
                 }
+                else
+                {
+                    DebugLog.W("468/STR", $"RECONCILE SL SKIP: net={net} lastSignalBar={_lastSignalBar} entryDir={_entryDir}");
+                }
             }
+            else
+            {
+                DebugLog.W("468/STR", "RECONCILE SL QTY OK: no SL quantity adjustment needed");
+            }
+            DebugLog.W("468/STR", $"RECONCILED: net={net} netByFills={NetByFills()} tpActive={tps.Count} slActive={sls.Count}");
+        }
+
+        // === Helper: ReleaseTradeLock (botón de pánico) ===
+        private void ReleaseTradeLock(string reason)
+        {
+            _tradeActive = false;
+            _bracketsPlaced = false;
+            _bracketsAttachedAt = DateTime.MinValue;
+            _antiFlatUntilBar = -1;
+            _flatStreak = 0;
+            _lastFlatRead = DateTime.MinValue;
+            _orderFills.Clear();
+            _cachedNetPosition = 0;
+            _breakevenApplied = false;
+            _entryPrice = 0m;
+            _beLastTouchBar = -1;
+            _beLastTouchAt = DateTime.MinValue;
+            if (EnableCooldown && CooldownBars > 0)
+                _cooldownUntilBar = CurrentBar + Math.Max(1, CooldownBars);
+            DebugLog.W("468/ORD", $"Trade lock RELEASED ({reason})");
         }
 
         // === Cálculo local para evitar races de N+1 ===
@@ -2447,475 +1802,126 @@ namespace MyAtas.Strategies
             return rma;
         }
 
-        // ====================== PASO 3: CALCULATION ENGINE ======================
-
-        // Throttling state for calculation calls
-        private DateTime _lastCalcLogTime = DateTime.MinValue;
-
-        // Pulse logging for when EnableDetailedRiskLogging is false
-        private DateTime _lastPulseLogTime = DateTime.MinValue;
-        private int _lastDiagnosticRefreshBar = -1;
-
-        // Capa 2 — throttle del motor de cálculo
-        private DateTime _lastCalcUtc = DateTime.MinValue;
-        private static readonly TimeSpan _calcCooldown = TimeSpan.FromSeconds(30);
-        private const int _calcEveryNBars = 10; // dispara cada N velas (además de por cambio de inputs)
-
-
+        // ====================== DEFERRAL DE FILLS SOSPECHOSOS ======================
 
         /// <summary>
-        /// Decide la qty final que pasará a SubmitMarket, respetando soft-engage
+        /// Procesa fills sospechosos diferidos, confirmándolos o descartándolos según su estado actual
         /// </summary>
-        private int DecideEffectiveQtyForEntry(int manualQty)
+        private void ProcessSuspectFills()
         {
-            // Siempre registra snapshot de riesgo (si RM activo), pero no fuerza qty a menos que toque
-            var autoQty = LastAutoQty;
-            var rpc     = LastRiskPerContract;
+            if (_suspectFills.Count == 0) return;
 
-            // Condiciones para usar autoQty
-            bool canUseAuto =
-                EnableRiskManagement &&
-                !RiskDryRun &&
-                UseAutoQuantityForLiveOrders &&
-                autoQty > 0 &&
-                rpc > 0 &&
-                !UnderfundedAbortLast; // setéalo dentro de CalculateQuantity()
+            var now = DateTime.UtcNow;
+            var toRemove = new List<string>();
 
-            if (canUseAuto)
+            foreach (var kv in _suspectFills)
             {
-                DebugLog.W("468/RISK", $"AUTO-QTY APPLIED qty={autoQty} (rpc={rpc:F2})");
-                return autoQty;
+                var comm = kv.Key;
+                var suspect = kv.Value;
+
+                // Esperar hasta DeferUntil
+                if (now < suspect.DeferUntil) continue;
+
+                // Buscar orden actual en _liveOrders o this.Orders
+                var order = (_liveOrders?.FirstOrDefault(o => o?.Comment == comm))
+                            ?? this.Orders?.FirstOrDefault(o => o?.Comment == comm);
+
+                var st = order?.Status();
+
+                if (st == OrderStatus.Filled)
+                {
+                    // CONFIRMADO: El fill era real, procesar ahora
+                    try
+                    {
+                        // Procesar como fill real (P&L, netByFills, etc.)
+                        if (order != null)
+                        {
+                            TrackOrderFill(order, "Filled");
+
+                            var exitPrice = ExtractAvgFillPriceFromOrder(order);
+                            var filledQty = GetFilledQtyFromOrder(order);
+
+                            if (exitPrice <= 0m) exitPrice = order.Price;
+
+                            if (exitPrice > 0m && filledQty > 0 && _entryDir != 0)
+                            {
+                                TrackPositionClose(exitPrice, filledQty, _entryDir);
+                            }
+
+                            _processedFills.Add(comm);
+
+                            // Si es SL, ejecutar failsafe
+                            if (comm.StartsWith("468SL:"))
+                            {
+                                CancelChildrenByStamp(comm);
+                            }
+
+                            DebugLog.W("468/ORD", $"SUSPECT FILL confirmed: {comm} exitPrice={exitPrice:F2} qty={filledQty}");
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        DebugLog.W("468/ORD", $"SUSPECT FILL confirm failed: {comm} - {ex.Message}");
+                    }
+
+                    toRemove.Add(comm);
+                }
+                else
+                {
+                    // DESCARTADO: No quedó en Filled, era un fill fantasma
+                    DebugLog.W("468/ORD", $"SUSPECT FILL dropped (phantom): {comm} finalState={st}");
+                    toRemove.Add(comm);
+                }
             }
 
-            DebugLog.W("468/RISK", $"AUTO-QTY IGNORED reason=" +
-                $"{(EnableRiskManagement ? "" : "RM_OFF ")}" +
-                $"{(RiskDryRun ? "DRY_RUN " : "")}" +
-                $"{(UseAutoQuantityForLiveOrders ? "" : "FLAG_OFF ")}" +
-                $"{(autoQty > 0 ? "" : "autoQty<=0 ")}" +
-                $"{(rpc > 0 ? "" : "rpc<=0 ")}" +
-                $"{(UnderfundedAbortLast ? "underfunded" : "")}".Trim());
-
-            return manualQty;
+            // Limpiar fills procesados/descartados
+            foreach (var k in toRemove)
+            {
+                _suspectFills.Remove(k);
+            }
         }
 
         /// <summary>
-        /// PASO 3: CALCULATION ENGINE - Calculates position quantity based on selected mode
-        /// NOTE: This function is pure calculation - does NOT affect actual trading until PASO 4
-        /// Returns calculated quantity but actual trades still use original Quantity property
-        /// Includes lot step quantization and instrument-based limits
+        /// Extrae el timestamp del comment de una orden (ej: "468SL:145124:532dc5" → "145124")
         /// </summary>
-        private int CalculateQuantity()
+        private static string ExtractStamp(string comment)
         {
+            if (string.IsNullOrEmpty(comment)) return "";
+            var parts = comment.Split(':');
+            return parts.Length >= 2 ? parts[1] : "";
+        }
+
+        /// <summary>
+        /// Cancela todas las órdenes hijas (TP/SL) del mismo trade (mismo stamp) que el SL que se ejecutó
+        /// </summary>
+        private void CancelChildrenByStamp(string slComment)
+        {
+            var stamp = ExtractStamp(slComment);
+            if (string.IsNullOrEmpty(stamp)) return;
+
+            int cancelled = 0;
             try
             {
-                // Reset underfunded flag at start of calculation
-                UnderfundedAbortLast = false;
-
-                var mode = PositionSizingMode;
-                var tickValue = GetEffectiveTickValue();
-                var tickSize = EffectiveTickSize;
-                var accountEquity = GetEffectiveAccountEquity();
-
-                // Use real SL alignment if we have trading context, otherwise fallback
-                bool useRealSL = (_entryDir != 0 && _lastSignalBar >= 0);
-                var slDistanceInTicks = useRealSL
-                    ? ComputeRiskTicksFromRealSL(_entryDir, _lastSignalBar, CurrentBar)
-                    : GetStopLossDistanceInTicks();
-
-                // Throttle logging - only log when inputs change significantly
-                string currentInputsHash = $"{mode}|{tickValue:F2}|{slDistanceInTicks:F1}|{RiskPerTradeUsd:F0}|{RiskPercentOfAccount:F1}|{accountEquity:F0}";
-                bool shouldLog = EnableDetailedRiskLogging &&
-                               (currentInputsHash != _lastInputsHash ||
-                                (DateTime.UtcNow - _lastCalcLogTime).TotalSeconds > 30);
-
-                if (shouldLog)
+                foreach (var o in _liveOrders.ToList())
                 {
-                    var quoteCurrency = Security?.QuoteCurrency ?? "USD";
-                    var accountCurrency = "USD"; // Portfolio balance is typically in account base currency
-                    CalcLog("468/CALC", $"Starting calculation: mode={mode} " +
-                                          $"tickValue={tickValue:F2}{quoteCurrency}/t tickSize={tickSize:F4}pts/t " +
-                                          $"SLticks={slDistanceInTicks:F1} (src={(useRealSL ? "realSL" : "fallback")}) " +
-                                          $"equity={accountEquity:F2}{accountCurrency}");
-                    _lastInputsHash = currentInputsHash;
-                    _lastCalcLogTime = DateTime.UtcNow;
-                }
+                    if (o == null) continue;
 
-                decimal rawQuantity = 0;
+                    var c2 = o.Comment ?? "";
+                    var st2 = o.Status();
+                    bool sameStamp = ExtractStamp(c2) == stamp;
+                    bool isChild = c2.StartsWith("468TP:") || c2.StartsWith("468SL:");
+                    bool nonTerminal = st2 != OrderStatus.Filled && st2 != OrderStatus.Canceled;
 
-                switch (mode)
-                {
-                    case PositionSizingMode.Manual:
-                        rawQuantity = CalculateQuantityManual(shouldLog);
-                        break;
-
-                    case PositionSizingMode.FixedRiskUSD:
-                        rawQuantity = CalculateQuantityForFixedRisk(slDistanceInTicks, tickValue, shouldLog);
-                        break;
-
-                    case PositionSizingMode.PercentOfAccount:
-                        rawQuantity = CalculateQuantityForPercentRisk(slDistanceInTicks, tickValue, accountEquity, shouldLog);
-                        break;
-
-                    default:
-                        CalcLog("468/CALC", $"Unknown PositionSizingMode: {mode}, defaulting to Manual");
-                        rawQuantity = Quantity;
-                        break;
-                }
-
-                // Apply lot step quantization and instrument limits
-                int finalQuantity = QuantizeToLotStep(rawQuantity, shouldLog);
-
-                // Update diagnostic properties with calculation results
-                LastAutoQty = finalQuantity;
-                LastRiskPerContract = slDistanceInTicks * tickValue;
-                LastStopDistance = slDistanceInTicks;
-                LastRiskInput = mode == PositionSizingMode.FixedRiskUSD ? RiskPerTradeUsd :
-                               mode == PositionSizingMode.PercentOfAccount ? accountEquity * (RiskPercentOfAccount / 100m) : 0;
-
-                // CAPA 7 — Validación de límites (solo logs; no impone)
-                try
-                {
-                    var qc = Security?.QuoteCurrency ?? "USD";
-                    var actualRisk = LastAutoQty * LastRiskPerContract;
-
-                    if (MaxContracts > 0 && LastAutoQty > MaxContracts)
-                        RiskLog("468/RISK", $"LIMIT WARN: qty={LastAutoQty} > MaxContracts={MaxContracts} (diagnostic only)");
-
-                    if (MaxRiskPerTradeUSD > 0 && actualRisk > MaxRiskPerTradeUSD)
-                        RiskLog("468/RISK", $"LIMIT WARN: actualRisk={actualRisk:F2}{qc} > MaxRiskPerTradeUSD={MaxRiskPerTradeUSD:F2}USD (diagnostic only)");
-                }
-                catch { /* no-op */ }
-
-                if (shouldLog)
-                {
-                    if (finalQuantity == 0)
+                    if (isChild && sameStamp && nonTerminal)
                     {
-                        CalcLog("468/CALC", $"ABORT_UNDERFUNDED: qty=0 -> entry would be skipped");
-                    }
-                    else
-                    {
-                        CalcLog("468/CALC", $"FINAL calculation result: qty={finalQuantity} " +
-                                              $"(NOTE: actual trades use Quantity={Quantity} until PASO 4)");
+                        try { CancelOrder(o); cancelled++; }
+                        catch { }
                     }
                 }
-
-                // SNAPSHOT compacto (siempre útil para auditoría)
-                try
-                {
-                    var sym = GetEffectiveSecurityCode();
-                    var qc = Security?.QuoteCurrency ?? "USD";
-                    var bars = CurrentBar; // Current bar as reference
-                    CalcLog("468/CALC",
-                        $"SNAPSHOT sym={sym} bars={bars} mode={mode} qty={finalQuantity} lastAutoQty={LastAutoQty} " +
-                        $"slTicks={LastStopDistance:F1} rpc={LastRiskPerContract:F2}{qc} " +
-                        $"equity={EffectiveAccountEquity:F2}USD tickValue={EffectiveTickValue:F2}{qc}/t " +
-                        $"tickSize={EffectiveTickSize:F2}pts/t DRYRUN=ON");
-                }
-                catch { /* no romper cálculo por logging */ }
-
-                return finalQuantity;
             }
-            catch (Exception ex)
-            {
-                CalcLog("468/CALC", $"CalculateQuantity error: {ex.Message}, falling back to manual Quantity={Quantity}");
-                return Quantity; // Safe fallback to manual quantity
-            }
+            catch { }
+
+            DebugLog.W("468/ORD", $"SL filled → CHILDREN CANCEL (stamp={stamp}): {cancelled}");
         }
-
-        /// <summary>
-        /// Calculate quantity for Manual mode - uses original Quantity with risk diagnostics
-        /// </summary>
-        private decimal CalculateQuantityManual(bool shouldLog)
-        {
-            decimal manualQty = Quantity;
-
-            if (shouldLog)
-            {
-                decimal slTicks = GetStopLossDistanceInTicks();
-                decimal tickValue = GetEffectiveTickValue();
-                decimal riskPerContract = slTicks * tickValue;
-                decimal totalRisk = manualQty * riskPerContract;
-                var quoteCurrency = Security?.QuoteCurrency ?? "USD";
-
-                CalcLog("468/CALC", $"MANUAL mode: qty={manualQty} (user-defined) " +
-                                      $"riskPerContract={riskPerContract:F2}{quoteCurrency} " +
-                                      $"totalRisk={totalRisk:F2}{quoteCurrency}");
-            }
-
-            return manualQty;
-        }
-
-        /// <summary>
-        /// Calculate quantity for Fixed Risk USD mode with underfunded protection
-        /// All math kept in ticks, converted to money only for risk calculation
-        /// </summary>
-        private decimal CalculateQuantityForFixedRisk(decimal slDistanceInTicks, decimal tickValue, bool shouldLog)
-        {
-            if (slDistanceInTicks <= 0 || tickValue <= 0 || RiskPerTradeUsd <= 0)
-            {
-                if (shouldLog)
-                    CalcLog("468/CALC", $"Invalid inputs for FixedRisk: SL={slDistanceInTicks}t tickVal={tickValue} risk={RiskPerTradeUsd}");
-                return Quantity; // Fallback to manual
-            }
-
-            // All risk calculation in quote currency (TickCost units)
-            decimal riskPerContract = slDistanceInTicks * tickValue; // In quote currency
-            decimal targetRisk = RiskPerTradeUsd; // Assumes USD = quote currency for now
-            var quoteCurrency = Security?.QuoteCurrency ?? "USD";
-
-            if (riskPerContract > targetRisk)
-            {
-                // UNDERFUNDED scenario: risk per contract exceeds target risk
-                if (SkipIfUnderfunded)
-                {
-                    if (shouldLog)
-                        CalcLog("468/CALC", $"ABORT_UNDERFUNDED: riskPerContract={riskPerContract:F2}{quoteCurrency} > " +
-                                              $"targetRisk={targetRisk:F2}{quoteCurrency} -> qty=0 (entry will be skipped)");
-                    UnderfundedAbortLast = true; // Set flag for DecideEffectiveQtyForEntry
-                    return 0; // Return 0 to signal ABORT
-                }
-                else
-                {
-                    decimal minQty = MinQtyIfUnderfunded;
-                    decimal actualRisk = riskPerContract * minQty;
-                    if (shouldLog)
-                        CalcLog("468/CALC", $"WARNING_UNDERFUNDED: forcing minQty={minQty} " +
-                                              $"(actualRisk={actualRisk:F2}{quoteCurrency} > targetRisk={targetRisk:F2}{quoteCurrency})");
-                    return minQty;
-                }
-            }
-
-            decimal calculatedQty = Math.Floor(targetRisk / riskPerContract);
-
-            if (shouldLog)
-            {
-                decimal actualRisk = calculatedQty * riskPerContract;
-                CalcLog("468/CALC", $"FixedRiskUSD: targetRisk={targetRisk:F2}{quoteCurrency} " +
-                                      $"riskPerContract={riskPerContract:F2}{quoteCurrency} " +
-                                      $"-> rawQty={calculatedQty} actualRisk={actualRisk:F2}{quoteCurrency}");
-            }
-
-            return calculatedQty;
-        }
-
-        /// <summary>
-        /// Calculate quantity for Percent of Account mode with underfunded protection
-        /// Account equity is in account currency, risk calculation in quote currency
-        /// </summary>
-        private decimal CalculateQuantityForPercentRisk(decimal slDistanceInTicks, decimal tickValue, decimal accountEquity, bool shouldLog)
-        {
-            if (slDistanceInTicks <= 0 || tickValue <= 0 || accountEquity <= 0 || RiskPercentOfAccount <= 0)
-            {
-                if (shouldLog)
-                    CalcLog("468/CALC", $"Invalid inputs for PercentRisk: SL={slDistanceInTicks}t tickVal={tickValue} " +
-                                          $"equity={accountEquity} risk%={RiskPercentOfAccount}");
-                return Quantity; // Fallback to manual
-            }
-
-            // Risk calculation: account currency -> quote currency (assuming 1:1 for now)
-            decimal riskPerContract = slDistanceInTicks * tickValue; // In quote currency
-            decimal targetRisk = accountEquity * (RiskPercentOfAccount / 100m); // In account currency
-            var quoteCurrency = Security?.QuoteCurrency ?? "USD";
-            var accountCurrency = "USD"; // Account balance typically in base currency
-
-            if (riskPerContract > targetRisk)
-            {
-                // UNDERFUNDED scenario: risk per contract exceeds target risk
-                if (SkipIfUnderfunded)
-                {
-                    if (shouldLog)
-                        CalcLog("468/CALC", $"ABORT_UNDERFUNDED: riskPerContract={riskPerContract:F2}{quoteCurrency} > " +
-                                              $"targetRisk={targetRisk:F2}{accountCurrency} ({RiskPercentOfAccount:F1}% of {accountEquity:F2}{accountCurrency}) " +
-                                              $"-> qty=0 (entry will be skipped)");
-                    UnderfundedAbortLast = true; // Set flag for DecideEffectiveQtyForEntry
-                    return 0; // Return 0 to signal ABORT
-                }
-                else
-                {
-                    decimal minQty = MinQtyIfUnderfunded;
-                    decimal actualRisk = riskPerContract * minQty;
-                    if (shouldLog)
-                        CalcLog("468/CALC", $"WARNING_UNDERFUNDED: forcing minQty={minQty} " +
-                                              $"(actualRisk={actualRisk:F2}{quoteCurrency} > targetRisk={targetRisk:F2}{accountCurrency})");
-                    return minQty;
-                }
-            }
-
-            decimal calculatedQty = Math.Floor(targetRisk / riskPerContract);
-
-            if (shouldLog)
-            {
-                decimal actualRisk = calculatedQty * riskPerContract;
-                CalcLog("468/CALC", $"PercentOfAccount: equity={accountEquity:F2}{accountCurrency} risk%={RiskPercentOfAccount:F1}% " +
-                                      $"targetRisk={targetRisk:F2}{accountCurrency} riskPerContract={riskPerContract:F2}{quoteCurrency} " +
-                                      $"-> rawQty={calculatedQty} actualRisk={actualRisk:F2}{quoteCurrency}");
-            }
-
-            return calculatedQty;
-        }
-
-        /// <summary>
-        /// Quantize raw quantity to instrument lot step and apply min/max limits
-        /// Uses Security.LotSize, LotMinSize, LotMaxSize when available
-        /// </summary>
-        private int QuantizeToLotStep(decimal rawQuantity, bool shouldLog)
-        {
-            try
-            {
-                // Get lot constraints from Security
-                decimal lotSize = 1; // Default lot step
-                decimal lotMinSize = 1; // Default minimum
-                decimal lotMaxSize = 1000; // Default maximum
-
-                // TODO: Add LotSize constraints detection once ATAS API nullable types are confirmed
-                // For now using safe defaults (1, 1, 1000) that work for most instruments
-                // Will implement proper Security.LotSize/LotMinSize/LotMaxSize detection in future refinement
-
-                // Quantize to lot step
-                decimal quantizedQty = Math.Floor(rawQuantity / lotSize) * lotSize;
-
-                // Apply min/max limits
-                quantizedQty = Math.Max(lotMinSize, quantizedQty);
-                quantizedQty = Math.Min(lotMaxSize, quantizedQty);
-
-                int finalQty = (int)quantizedQty;
-
-                if (shouldLog && (finalQty != rawQuantity || lotSize != 1))
-                {
-                    CalcLog("468/CALC", $"Lot quantization: raw={rawQuantity:F2} lotStep={lotSize} " +
-                                          $"min={lotMinSize} max={lotMaxSize} -> final={finalQty}");
-                }
-
-                return finalQty;
-            }
-            catch (Exception ex)
-            {
-                CalcLog("468/CALC", $"QuantizeToLotStep error: {ex.Message}, using raw quantity as int");
-                return Math.Max(1, Math.Min(1000, (int)rawQuantity)); // Fallback to simple clamp
-            }
-        }
-
-        /// <summary>
-        /// Calculate current stop loss distance in ticks based on strategy settings
-        /// Keeps all math in ticks end-to-end for precision
-        /// </summary>
-        private decimal GetStopLossDistanceInTicks()
-        {
-            try
-            {
-                // Base SL distance from StopOffsetTicks setting (already in ticks)
-                decimal slDistanceInTicks = StopOffsetTicks;
-
-                // If using SL from signal candle, add estimated additional distance
-                if (UseSignalCandleSL)
-                {
-                    // Conservative estimate for signal candle SL extension
-                    // In real implementation this would calculate actual distance from signal candle
-                    slDistanceInTicks += 5; // Conservative 5-tick buffer for signal candle SL
-                }
-
-                // Apply safety limits (all in ticks)
-                slDistanceInTicks = Math.Max(1, slDistanceInTicks); // Minimum 1 tick
-                slDistanceInTicks = Math.Min(500, slDistanceInTicks); // Maximum 500 ticks (safety)
-
-                return slDistanceInTicks;
-            }
-            catch (Exception ex)
-            {
-                CalcLog("468/CALC", $"GetStopLossDistanceInTicks error: {ex.Message}, using fallback 10 ticks");
-                return 10; // Conservative fallback
-            }
-        }
-
-        /// <summary>
-        /// Calcula distancia de riesgo usando el SL real que se enviará en brackets
-        /// Máxima coherencia: mismo SL que BuildBracketPrices usa
-        /// </summary>
-        /// <summary>
-        /// ENHANCED: Computes SL distance using actual bracket construction logic for context-aware risk sizing
-        /// This ensures calculated quantities align with the actual SL distances that will be used in brackets
-        /// </summary>
-        private decimal ComputeRiskTicksFromRealSL(int dir, int signalBar, int execBar)
-        {
-            try
-            {
-                // Use the same logic as BuildBracketPrices to ensure consistency
-                var (slPx, tp1Px) = BuildBracketPrices(dir, signalBar, execBar);
-
-                // Get realistic entry price estimation
-                decimal entryPx = 0m;
-
-                // Priority 1: Use captured entry price if available
-                if (_lastEntryPrice > 0m)
-                {
-                    entryPx = _lastEntryPrice;
-                }
-                // Priority 2: Use execution bar open (most realistic for market orders)
-                else if (execBar <= CurrentBar)
-                {
-                    entryPx = GetCandle(execBar).Open;
-                }
-                // Priority 3: Fallback to signal bar close
-                else
-                {
-                    entryPx = GetCandle(signalBar).Close;
-                }
-
-                // Final fallback
-                if (entryPx <= 0m)
-                {
-                    entryPx = GetCandle(Math.Min(signalBar, CurrentBar)).Close;
-                }
-
-                var distPoints = Math.Abs(entryPx - slPx);
-                var tickSize = EffectiveTickSize > 0m ? EffectiveTickSize : (Security?.TickSize ?? 0.25m);
-                var ticks = distPoints / tickSize;
-
-                var clampedTicks = Math.Max(1m, Math.Min(500m, ticks)); // límites de seguridad
-
-                // Enhanced logging for risk calculation debugging
-                if (EnableDetailedRiskLogging)
-                {
-                    RiskLog("468/RISK", $"CONTEXT_SL dir={dir} entry={entryPx:F2} sl={slPx:F2} dist={distPoints:F2}pts ticks={ticks:F2} final={clampedTicks:F2}");
-                }
-
-                return clampedTicks;
-            }
-            catch (Exception ex)
-            {
-                RiskLog("468/RISK", $"ComputeRiskTicksFromRealSL error: {ex.Message}, using fallback");
-                return GetStopLossDistanceInTicks(); // Fallback to basic calculation
-            }
-        }
-
-        // ============== Capa 2: hash de inputs de cálculo (para throttle inteligente) ==============
-        private string ComputeCalcInputsHash()
-        {
-            try
-            {
-                // Entradas que afectan el qty calculado
-                var mode = PositionSizingMode;
-
-                // Usamos los efectivos/diagnóstico (no cambian comportamiento live)
-                decimal tickValue = EffectiveTickValue;
-                decimal slTicks   = GetStopLossDistanceInTicks();
-                decimal eq        = EffectiveAccountEquity;
-                decimal pct       = RiskPercentOfAccount;
-                decimal fixedUsd  = RiskPerTradeUsd;
-                decimal tsize     = EffectiveTickSize;
-
-                // Símbolo efectivo por si hay overrides dependientes de él
-                var sym = GetEffectiveSecurityCode();
-
-                // Compacto y determinista
-                return $"{mode}|{sym}|tv={tickValue:F4}|tsz={tsize:F4}|sl={slTicks:F2}|eq={eq:F2}|pct={pct:F4}|usd={fixedUsd:F2}";
-            }
-            catch
-            {
-                // Fallback: fuerza cálculo (hash distinto) si algo falla
-                return Guid.NewGuid().ToString("N");
-            }
-        }
-        // ===========================================================================================
     }
 }

@@ -1,8 +1,9 @@
 # Deploy Strategies to ATAS
 $ErrorActionPreference = "Stop"
 
-Write-Host "Building MyAtas.Strategies..." -ForegroundColor Yellow
+Write-Host "Cleaning + Building MyAtas.Strategies..." -ForegroundColor Yellow
 Set-Location "$PSScriptRoot\..\src\MyAtas.Strategies"
+dotnet clean
 dotnet build -c Debug
 
 if ($LASTEXITCODE -ne 0) {
@@ -30,9 +31,11 @@ Copy-Item "$binPath\MyAtas.Strategies.dll" $destinationPath -Force
 Copy-Item "$binPath\MyAtas.Strategies.pdb" $destinationPath -Force
 Copy-Item "$binPath\MyAtas.Indicators.dll" $destinationPath -Force
 Copy-Item "$binPath\MyAtas.Shared.dll" $destinationPath -Force
+Copy-Item "$binPath\MyAtas.Risk.dll" $destinationPath -Force
 
 Write-Host "Strategies deployed successfully to $destinationPath" -ForegroundColor Green
 Write-Host "   - MyAtas.Strategies.dll" -ForegroundColor Gray
 Write-Host "   - MyAtas.Strategies.pdb" -ForegroundColor Gray
 Write-Host "   - MyAtas.Indicators.dll" -ForegroundColor Gray
 Write-Host "   - MyAtas.Shared.dll" -ForegroundColor Gray
+Write-Host "   - MyAtas.Risk.dll" -ForegroundColor Gray
