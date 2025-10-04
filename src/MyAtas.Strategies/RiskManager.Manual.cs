@@ -24,6 +24,9 @@ namespace MyAtas.Strategies
     public enum RmStopPlacement { ByTicks, PrevBarOppositeExtreme }  // modo de colocaciÃƒÂ³n del SL
     public enum RmPrevBarOffsetSide { Outside, Inside }              // NEW: lado del offset (fuera/dentro)
 
+    // --- Volatility floor (solo cuando no hay N-1) ---
+    public enum RmVolMetric { ATR, AverageRange, MedianRange }
+
     // --- Helpers de normalizacion de TPs/splits ---
     internal static class _RmSplitHelper
     {
@@ -549,6 +552,75 @@ namespace MyAtas.Strategies
             return (PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit, "Legacy");
         }
 
+        private int ComputeVolatilityTicks(int window, RmVolMetric metric, decimal tickSize)
+        {
+            try
+            {
+                int w = Math.Clamp(window, 3, 200);
+                int last = Math.Max(0, CurrentBar - 1);
+                if (w <= 0 || tickSize <= 0) return 0;
+
+                var vals = new List<decimal>(w);
+                decimal prevClose = 0m;
+                for (int i = last; i >= 0 && vals.Count < w; i--)
+                {
+                    var c = GetCandle(i);
+                    if (c == null) break;
+                    decimal hi = c.High, lo = c.Low, cl = c.Close;
+                    decimal tr = metric == RmVolMetric.ATR && prevClose > 0m
+                        ? Math.Max(hi - lo, Math.Max(Math.Abs(hi - prevClose), Math.Abs(prevClose - lo)))
+                        : (hi - lo);
+                    vals.Add(Math.Max(0m, tr));
+                    prevClose = cl;
+                }
+                if (vals.Count == 0) return 0;
+
+                decimal baseRange;
+                switch (metric)
+                {
+                    case RmVolMetric.MedianRange:
+                        vals.Sort();
+                        baseRange = vals[vals.Count / 2];
+                        break;
+                    case RmVolMetric.AverageRange:
+                        baseRange = vals.Average();
+                        break;
+                    default: // ATR
+                        baseRange = vals.Average();
+                        break;
+                }
+                var ticks = (int)Math.Max(1, Math.Round((baseRange / tickSize) * (VolFloorFactor <= 0 ? 1.0m : VolFloorFactor)));
+                return ticks;
+            }
+            catch { return 0; }
+        }
+
+        private void EnforceVolatilityFloorIfNeeded(
+            int dir, decimal entryPx, ref decimal? overrideStopPx, ref int approxStopTicks, decimal tickSize)
+        {
+            if (!VolFloorEnabled || tickSize <= 0m || overrideStopPx == null) return;
+
+            // ¿Se usó N porque no había N-1 en el momento del fill?
+            bool usedN = (_pendingAnchorBarAtFill >= 0 && _pendingPrevBarIdxAtFill >= 0)
+                            ? _pendingAnchorBarAtFill != _pendingPrevBarIdxAtFill
+                            : true; // si no tenemos tracking claro, tratar como "usó N"
+            if (VolFloorOnlyIfNoPrev && !usedN) return;
+
+            int curTicks = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - overrideStopPx.Value) / tickSize));
+            int minTicks = ComputeVolatilityTicks(VolFloorWindow, VolFloorMetric, tickSize);
+            if (minTicks <= 0 || curTicks >= minTicks) return;
+
+            // Ensanchar desde la entrada hasta cumplir minTicks
+            decimal newSl = entryPx + (dir > 0 ? -(minTicks * tickSize) : +(minTicks * tickSize));
+            overrideStopPx = ShrinkPrice(newSl);
+            approxStopTicks = minTicks;
+
+            if (EnableLogging)
+                DebugLog.W("RM/VOLFLOOR",
+                    $"ENFORCED: usedN={usedN} window={VolFloorWindow} metric={VolFloorMetric} factor={VolFloorFactor} " +
+                    $"curTicks={curTicks} → minTicks={minTicks} newSL={overrideStopPx.Value:F2}");
+        }
+
         [Browsable(false)] public int PresetTPs { get; set; } = 2;
         [Browsable(false)] public decimal TP1R { get; set; } = 1.0m;
         [Browsable(false)] public decimal TP2R { get; set; } = 2.0m;
@@ -569,6 +641,73 @@ namespace MyAtas.Strategies
         [Category("Stops & TPs"), DisplayName("Prev-bar offset side")]
         [Description("Outside: fuera del extremo (mÃƒÂ¡s allÃƒÂ¡ del High/Low). Inside: dentro del rango de la vela.")]
         public RmPrevBarOffsetSide PrevBarOffsetSide { get; set; } = RmPrevBarOffsetSide.Outside;
+
+        [Browsable(false)]
+        public bool VolFloorEnabled { get; set; } = false;
+
+        [Browsable(false)]
+        public bool VolFloorOnlyIfNoPrev { get; set; } = true;
+
+        [Browsable(false)]
+        public int VolFloorWindow { get; set; } = 14;
+
+        [Browsable(false)]
+        public RmVolMetric VolFloorMetric { get; set; } = RmVolMetric.ATR;
+
+        [Browsable(false)]
+        public decimal VolFloorFactor { get; set; } = 1.0m;
+
+        // ----- UI group para Volatility Floor -----
+        [TypeConverter(typeof(ExpandableObjectConverter))]
+        public class VolFloorGroup
+        {
+            private readonly RiskManagerManualStrategy _o;
+            public VolFloorGroup(RiskManagerManualStrategy owner) => _o = owner;
+
+            [DisplayName("Activo")]
+            public bool Activo
+            {
+                get => _o.VolFloorEnabled;
+                set => _o.VolFloorEnabled = value;
+            }
+
+            [DisplayName("Solo si no hay N-1")]
+            public bool SoloSiNoHayN1
+            {
+                get => _o.VolFloorOnlyIfNoPrev;
+                set => _o.VolFloorOnlyIfNoPrev = value;
+            }
+
+            [DisplayName("Ventana (barras)")]
+            public int VentanaBarras
+            {
+                get => _o.VolFloorWindow;
+                set => _o.VolFloorWindow = value;
+            }
+
+            [DisplayName("Métrica")]
+            public RmVolMetric Metrica
+            {
+                get => _o.VolFloorMetric;
+                set => _o.VolFloorMetric = value;
+            }
+
+            [DisplayName("Factor ×")]
+            public decimal Factor
+            {
+                get => _o.VolFloorFactor;
+                set => _o.VolFloorFactor = value;
+            }
+
+            public override string ToString()
+                => Activo ? $"{Metrica} {VentanaBarras}×{Factor}" : "Desactivado";
+        }
+
+        // Campo + propiedad expuesta para el PropertyGrid
+        private VolFloorGroup _volFloorUI;
+        [Category("Stops & TPs"), DisplayName("Ticks mínimos del Stop Loss del SL por volatilidad")]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+        public VolFloorGroup VolatilityFloor => _volFloorUI ??= new VolFloorGroup(this);
 
         // =================== Breakeven ===================
         [Category("Breakeven"), DisplayName("Mode")]
@@ -624,6 +763,18 @@ namespace MyAtas.Strategies
         {
             var off = Math.Max(0, BeOffsetTicks) * tickSize;
             return dir > 0 ? ShrinkPrice(entryPx + off) : ShrinkPrice(entryPx - off);
+        }
+
+        // Clamp de seguridad para el BE: nunca por el otro lado del último precio
+        private decimal ClampBeTrigger(decimal proposed)
+        {
+            var last = GetLastPriceSafe();
+            var ts = Security?.TickSize ?? FallbackTickSize;
+            if (_currentPositionQty > 0)        // estamos largos → stop es Sell Stop
+                return Math.Min(proposed, last - ts); // jamás por encima de last
+            else if (_currentPositionQty < 0)   // estamos cortos → stop es Buy Stop
+                return Math.Max(proposed, last + ts); // jamás por debajo de last
+            return proposed;
         }
 
         // Mueve todos los SL a 'newStopPx' preservando TPs:
@@ -1407,8 +1558,11 @@ namespace MyAtas.Strategies
                         {
                             var refPx = snap.AvgPrice > 0m ? snap.AvgPrice : last;
                             var bePx = ComputeBePrice(dir, refPx, tickSize);
-                            if (EnableLogging) DebugLog.W("RM/BE", $"TOUCH trigger @ {_beTargetPx:F2} Ã¢â€ â€™ move SL to BE {bePx:F2}");
-                            MoveAllRmStopsTo(bePx, "BE touch");
+                            var newTrigger = ClampBeTrigger(bePx);
+                            if (newTrigger != bePx && EnableLogging)
+                                DebugLog.W("RM/BE/SAFE", $"clamp {bePx:F2} → {newTrigger:F2} (last={GetLastPriceSafe():F2})");
+                            if (EnableLogging) DebugLog.W("RM/BE", $"TOUCH trigger @ {_beTargetPx:F2} Ã¢â€ â€™ move SL to BE {newTrigger:F2}");
+                            MoveAllRmStopsTo(newTrigger, "BE touch");
                             _beDone = true;
                         }
                     }
@@ -1593,8 +1747,11 @@ namespace MyAtas.Strategies
                         {
                             var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
                             var bePx = ComputeBePrice(dir, snap.AvgPrice > 0m ? snap.AvgPrice : ExtractAvgFillPrice(order), tickSize);
-                            if (EnableLogging) DebugLog.W("RM/BE", $"FILL trigger by TP Ã¢â€ â€™ move SL to BE {bePx:F2}");
-                            MoveAllRmStopsTo(bePx, "BE fill");
+                            var newTrigger = ClampBeTrigger(bePx);
+                            if (newTrigger != bePx && EnableLogging)
+                                DebugLog.W("RM/BE/SAFE", $"clamp {bePx:F2} → {newTrigger:F2} (last={GetLastPriceSafe():F2})");
+                            if (EnableLogging) DebugLog.W("RM/BE", $"FILL trigger by TP Ã¢â€ â€™ move SL to BE {newTrigger:F2}");
+                            MoveAllRmStopsTo(newTrigger, "BE fill");
                             _beDone = true;
                         }
                     }
@@ -1941,11 +2098,23 @@ namespace MyAtas.Strategies
                         DebugLog.W("RM/STOPMODE", $"Active={StopPlacementMode} prevIdxAtFill={_pendingPrevBarIdxAtFill} offTicks={PrevBarOffsetTicks} side={PrevBarOffsetSide}");
                     if (StopPlacementMode == RmStopPlacement.PrevBarOppositeExtreme)
                     {
+                        // justo donde calculas el SL estructural, antes del STRUCT SL:
+                        if (EnableLogging)
+                        {
+                            var anchorBar = _pendingAnchorBarAtFill;
+                            var prevIdxAtFill = _pendingPrevBarIdxAtFill;
+                            DebugLog.W("RM/STOPMODE", $"ANCHOR CHOSEN: {(anchorBar == CurrentBar ? "N" : "N-1")} " +
+                                $"curBar={CurrentBar} anchorBar={anchorBar} prevIdxAtFill={prevIdxAtFill} offTicks={PrevBarOffsetTicks} side={PrevBarOffsetSide}");
+                        }
+
                         var (slPx, dbg) = ComputeStructureStopPx(dir, Convert.ToDecimal(tickSize));
                         overrideStopPx  = slPx;
                         approxStopTicks = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - slPx) / tickSize));
                         if (EnableLogging)
                             DebugLog.W("RM/STOPMODE", $"STRUCT SL: {dbg} | ticks≈{approxStopTicks}");
+
+                        // === Volatility floor: sólo si (opción ON) y se usó N (no había N-1) ===
+                        EnforceVolatilityFloorIfNeeded(dir, entryPx, ref overrideStopPx, ref approxStopTicks, tickSize);
                     }
                 } catch { /* fallback a DefaultStopTicks */ }
 
@@ -2381,20 +2550,19 @@ namespace MyAtas.Strategies
                 var c = GetCandle(barIdx);
                 if (c == null) return (0m, 0m, 0m);
 
-                // Si BE no está armado, usar datos normales de barra
+                // Si BE no armado → datos normales de barra
                 if (!_beArmed || _beArmedAtPrice == 0m)
                     return (c.Close, c.High, c.Low);
 
-                // BE armado: trackear extremos DESDE que se armó (no usar datos históricos)
-                // Actualizar máximo/mínimo alcanzado DESPUÉS de armar
-                if (_beMaxReached == 0m) _beMaxReached = _beArmedAtPrice;  // Inicializar si es primer tick
+                // BE armado → trackear extremos SOLO con el último precio (post-armado)
+                var last = GetLastPriceSafe();  // último trade/close del tick actual
+                if (_beMaxReached == 0m) _beMaxReached = _beArmedAtPrice;
                 if (_beMinReached == 0m) _beMinReached = _beArmedAtPrice;
 
-                // Trackear extremos desde baseline
-                _beMaxReached = Math.Max(_beMaxReached, c.High);
-                _beMinReached = Math.Min(_beMinReached, c.Low);
+                _beMaxReached = Math.Max(_beMaxReached, last);
+                _beMinReached = Math.Min(_beMinReached, last);
 
-                return (c.Close, _beMaxReached, _beMinReached);
+                return (last, _beMaxReached, _beMinReached);
             }
             catch { }
             return (0m, 0m, 0m);
