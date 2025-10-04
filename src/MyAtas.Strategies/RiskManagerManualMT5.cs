@@ -2,399 +2,19 @@ using System;
 using System.ComponentModel;
 using System.Globalization;
 using System.Linq;
-using System.Collections.Generic;
-using System.Drawing.Design;
-using System.Windows.Forms;
-using System.Windows.Forms.Design;
-using System.Text.RegularExpressions;
 using ATAS.Strategies.Chart;
 using ATAS.Types;
 using ATAS.DataFeedsCore;
 using MyAtas.Shared;
 using MyAtas.Risk.Engine;
 using MyAtas.Risk.Models;
+using MyAtas.Bridges;
 
 namespace MyAtas.Strategies
 {
-    // Enums externos para serializaciÃƒÂ³n correcta de ATAS
-    public enum RmSizingMode { Manual, FixedRiskUSD, PercentAccount }
-    // Mantiene compat. binaria pero aclara intención:
-    public enum RmBeMode { Off, OnTPTouch, OnTPFill }
-    public enum RmTrailMode { Off, BarByBar, TpToTp }
-    public enum RmStopPlacement { ByTicks, PrevBarOppositeExtreme }  // modo de colocaciÃƒÂ³n del SL
-    public enum RmPrevBarOffsetSide { Outside, Inside }              // NEW: lado del offset (fuera/dentro)
-
-    // --- Helpers de normalizacion de TPs/splits ---
-    internal static class _RmSplitHelper
-    {
-        // Devuelve arrays listos para el motor: solo TPs con split>0 y suma=100 (el ultimo absorbe la diferencia)
-        public static (decimal[] r, int[] s) BuildTpArrays(int preset, decimal tp1, decimal tp2, decimal tp3, int sp1, int sp2, int sp3)
-        {
-            var rList = new System.Collections.Generic.List<decimal>();
-            var sList = new System.Collections.Generic.List<int>();
-            var n = Math.Clamp(preset, 1, 3);
-            if (n >= 1 && sp1 > 0) { rList.Add(tp1); sList.Add(Math.Max(0, sp1)); }
-            if (n >= 2 && sp2 > 0) { rList.Add(tp2); sList.Add(Math.Max(0, sp2)); }
-            if (n >= 3 && sp3 > 0) { rList.Add(tp3); sList.Add(Math.Max(0, sp3)); }
-            if (rList.Count == 0)
-            {
-                // Fallback: un solo TP al 100% a 1R
-                rList.Add(Math.Max(1m, tp1));
-                sList.Add(100);
-                return (rList.ToArray(), sList.ToArray());
-            }
-            var sum = sList.Sum();
-            if (sum != 100)
-            {
-                // Re-normaliza a 100 y el ultimo absorbe la diferencia
-                for (int i = 0; i < sList.Count; i++)
-                    sList[i] = (int)Math.Max(0, Math.Round(100m * sList[i] / Math.Max(1, sum)));
-                var diff = 100 - sList.Sum();
-                sList[^1] = Math.Max(1, sList[^1] + diff);
-            }
-            return (rList.ToArray(), sList.ToArray());
-        }
-
-        // Reparte 'total' según 'splits' (% normalizados a 100). Último absorbe diferencia.
-        public static int[] SplitQty(int total, int[] splits)
-        {
-            if (total <= 0 || splits == null || splits.Length == 0) return Array.Empty<int>();
-            var q = new int[splits.Length];
-            var remain = total;
-            for (int i = 0; i < splits.Length; i++)
-            {
-                if (i == splits.Length - 1)
-                {
-                    q[i] = Math.Max(0, remain);
-                }
-                else
-                {
-                    var qi = (int)Math.Round(total * (splits[i] / 100m));
-                    q[i] = Math.Max(0, qi);
-                    remain -= q[i];
-                }
-            }
-            // Ajuste anti-todo-en-cero: si sumó 0 pero total>0, pon 1 al último
-            if (q.Sum() == 0 && total > 0) q[^1] = total;
-            // Ajuste si por redondeo sobrepasó:
-            var diff = q.Sum() - total;
-            if (diff > 0) q[^1] = Math.Max(0, q[^1] - diff);
-            return q;
-        }
-    }
-
-    // =================== SIMPLE TARGETS UI ===================
-    [Serializable]
-    public class TargetRow : INotifyPropertyChanged
-    {
-        public event PropertyChangedEventHandler PropertyChanged;
-        void OnChanged(string n) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(n));
-
-        private bool _active = false;
-        private decimal _r = 1m;
-        private int _percent = 0;
-
-        [Browsable(false)] public string Name { get; set; } = "";
-
-        [DisplayName("Activo")]
-        public bool Active
-        {
-            get => _active;
-            set { if (_active == value) return; _active = value; OnChanged(nameof(Active)); }
-        }
-
-        [DisplayName("R")]
-        public decimal R
-        {
-            get => _r;
-            set { if (_r == value) return; _r = value; OnChanged(nameof(R)); }
-        }
-
-        [DisplayName("Tanto % de cobro al cerrar")]
-        public int Percent
-        {
-            get => _percent;
-            set { if (_percent == value) return; _percent = value; OnChanged(nameof(Percent)); }
-        }
-    }
-
-    [Serializable]
-    [TypeConverter(typeof(TargetsModelConverter))]
-    public class TargetsModel
-    {
-        public event EventHandler Changed;
-        void RaiseChanged() => Changed?.Invoke(this, EventArgs.Empty);
-
-        private TargetRow _tp1 = new TargetRow { Name = "TP1" };
-        private TargetRow _tp2 = new TargetRow { Name = "TP2" };
-        private TargetRow _tp3 = new TargetRow { Name = "TP3" };
-
-        public TargetsModel()
-        {
-            WireRow(_tp1);
-            WireRow(_tp2);
-            WireRow(_tp3);
-        }
-
-        void WireRow(TargetRow r)
-        {
-            if (r != null) r.PropertyChanged += (_, __) => RaiseChanged();
-        }
-
-        [DisplayName("TP1")]
-        public TargetRow TP1
-        {
-            get => _tp1;
-            set
-            {
-                if (_tp1 != null) _tp1.PropertyChanged -= (_, __) => RaiseChanged();
-                _tp1 = value ?? new TargetRow { Name = "TP1" };
-                WireRow(_tp1);
-                RaiseChanged();
-            }
-        }
-
-        [DisplayName("TP2")]
-        public TargetRow TP2
-        {
-            get => _tp2;
-            set
-            {
-                if (_tp2 != null) _tp2.PropertyChanged -= (_, __) => RaiseChanged();
-                _tp2 = value ?? new TargetRow { Name = "TP2" };
-                WireRow(_tp2);
-                RaiseChanged();
-            }
-        }
-
-        [DisplayName("TP3")]
-        public TargetRow TP3
-        {
-            get => _tp3;
-            set
-            {
-                if (_tp3 != null) _tp3.PropertyChanged -= (_, __) => RaiseChanged();
-                _tp3 = value ?? new TargetRow { Name = "TP3" };
-                WireRow(_tp3);
-                RaiseChanged();
-            }
-        }
-
-        public static TargetsModel FromLegacy(int preset, decimal tp1, decimal tp2, decimal tp3, int sp1, int sp2, int sp3)
-        {
-            var m = new TargetsModel();
-            m.TP1.Active = preset >= 1 && sp1 > 0; m.TP1.R = tp1; m.TP1.Percent = Math.Max(0, sp1);
-            m.TP2.Active = preset >= 2 && sp2 > 0; m.TP2.R = tp2; m.TP2.Percent = Math.Max(0, sp2);
-            m.TP3.Active = preset >= 3 && sp3 > 0; m.TP3.R = tp3; m.TP3.Percent = Math.Max(0, sp3);
-            return m;
-        }
-        private IEnumerable<TargetRow> All() => new[] { TP1, TP2, TP3 };
-        public string ToSummary()
-        {
-            var act = All().Where(r => r.Active && r.Percent > 0).OrderBy(r => r.R).ToList();
-            if (act.Count == 0) return "— sin targets —";
-            return string.Join(" | ", act.Select(a => $"{a.Percent}% @ {a.R}R"));
-        }
-        public void NormalizePercents()
-        {
-            var act = All().Where(r => r.Active && r.Percent > 0).ToList();
-            if (act.Count == 0) return;
-            var sum = act.Sum(a => a.Percent);
-            if (sum == 100) return;
-            for (int i = 0; i < act.Count; i++)
-                act[i].Percent = (int)Math.Max(0, Math.Round(100m * act[i].Percent / Math.Max(1, sum)));
-            var diff = 100 - act.Sum(a => a.Percent);
-            act[^1].Percent = Math.Max(1, act[^1].Percent + diff);
-        }
-        public List<TargetRow> ActiveOrdered() =>
-            All().Where(r => r.Active && r.Percent > 0).OrderBy(r => r.R).ToList();
-    }
-
-    public class TargetsModelConverter : TypeConverter
-    {
-        public override bool GetPropertiesSupported(ITypeDescriptorContext context) => true;
-        public override PropertyDescriptorCollection GetProperties(ITypeDescriptorContext context, object value, Attribute[] attributes)
-            => TypeDescriptor.GetProperties(value, attributes, true);
-        public override bool GetStandardValuesSupported(ITypeDescriptorContext context) => false;
-
-        public override bool CanConvertTo(ITypeDescriptorContext context, Type destinationType) =>
-            destinationType == typeof(string) || base.CanConvertTo(context, destinationType);
-        public override object ConvertTo(ITypeDescriptorContext context, CultureInfo culture, object value, Type destinationType)
-        {
-            if (destinationType == typeof(string) && value is TargetsModel m) return m.ToSummary();
-            return base.ConvertTo(context, culture, value, destinationType);
-        }
-
-        // Permitir cargar desde string (lo que guarda ATAS)
-        public override bool CanConvertFrom(ITypeDescriptorContext context, Type sourceType) =>
-            sourceType == typeof(string) || base.CanConvertFrom(context, sourceType);
-        public override object ConvertFrom(ITypeDescriptorContext context, CultureInfo culture, object value)
-        {
-            if (value is string s)
-            {
-                // Ejemplos admitidos:
-                // "50% @ 1R | 50% @ 3R"
-                // "TP1: 40% @ 0,8R | TP3: 60% @ 2.5R"
-                var model = new TargetsModel();
-                try
-                {
-                    var list = new List<(decimal R, int Pct)>();
-                    var rx = new Regex(@"(?:TP\d\s*:)?\s*(\d{1,3})\s*%\s*@\s*([0-9]+(?:[.,][0-9]+)?)\s*R",
-                                       RegexOptions.IgnoreCase);
-                    foreach (Match m in rx.Matches(s))
-                    {
-                        if (!m.Success) continue;
-                        var pct = Math.Max(0, int.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture));
-                        var rStr = m.Groups[2].Value.Replace(',', '.');
-                        if (decimal.TryParse(rStr, NumberStyles.Any, CultureInfo.InvariantCulture, out var rVal))
-                            list.Add((rVal, pct));
-                    }
-                    // Fallback si no hay matches
-                    if (list.Count == 0)
-                    {
-                        model.TP1.Active = true; model.TP1.R = 1m; model.TP1.Percent = 100;
-                        model.TP2.Active = false; model.TP3.Active = false;
-                        return model;
-                    }
-                    // Ordenar por R y rellenar TP1..TP3
-                    var ordered = list.OrderBy(x => x.R).Take(3).ToList();
-                    for (int i = 0; i < ordered.Count; i++)
-                    {
-                        var (rVal, pctVal) = ordered[i];
-                        var row = new TargetRow { Active = pctVal > 0, R = rVal, Percent = pctVal, Name = $"TP{i+1}" };
-                        if (i == 0) model.TP1 = row;
-                        else if (i == 1) model.TP2 = row;
-                        else model.TP3 = row;
-                    }
-                    model.NormalizePercents();
-                    return model;
-                }
-                catch
-                {
-                    // Último recurso: 100% @ 1R
-                    model.TP1.Active = true; model.TP1.R = 1m; model.TP1.Percent = 100;
-                    return model;
-                }
-            }
-            return base.ConvertFrom(context, culture, value);
-        }
-    }
-
-    public class TargetsEditor : UITypeEditor
-    {
-        public override UITypeEditorEditStyle GetEditStyle(ITypeDescriptorContext context) => UITypeEditorEditStyle.Modal;
-        public override object EditValue(ITypeDescriptorContext context, IServiceProvider provider, object value)
-        {
-            var edSvc = provider?.GetService(typeof(IWindowsFormsEditorService)) as IWindowsFormsEditorService;
-            if (edSvc == null) return value;
-            var model = value as TargetsModel ?? new TargetsModel();
-            using (var form = new TargetsEditorForm(model))
-            {
-                if (edSvc.ShowDialog(form) == DialogResult.OK)
-                    return form.ResultModel;
-            }
-            return value;
-        }
-    }
-
-    public class TargetsEditorForm : Form
-    {
-        private DataGridView _grid;
-        private Button _ok, _cancel, _normalize;
-        private Button _preset_50_13, _preset_30_08_2, _preset_40_123, _preset_100_2;
-        public TargetsModel ResultModel { get; private set; }
-        public TargetsEditorForm(TargetsModel model)
-        {
-            Text = "Configurar Targets (R / %)";
-            StartPosition = FormStartPosition.CenterParent;
-            MinimizeBox = MaximizeBox = false;
-            FormBorderStyle = FormBorderStyle.FixedDialog;
-            Width = 640; Height = 360;
-
-            var rows = new BindingList<TargetRow>(new List<TargetRow> {
-                new TargetRow { Name="TP1", Active=model.TP1?.Active??false, R=model.TP1?.R??1m, Percent=model.TP1?.Percent??0 },
-                new TargetRow { Name="TP2", Active=model.TP2?.Active??false, R=model.TP2?.R??2m, Percent=model.TP2?.Percent??0 },
-                new TargetRow { Name="TP3", Active=model.TP3?.Active??false, R=model.TP3?.R??3m, Percent=model.TP3?.Percent??0 },
-            });
-            _grid = new DataGridView { Dock = DockStyle.Top, Height = 240, AutoGenerateColumns = false, AllowUserToAddRows = false };
-            _grid.Columns.Add(new DataGridViewCheckBoxColumn { DataPropertyName = "Active", HeaderText = "Activo", Width = 60 });
-            _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Name", HeaderText = "Nombre", Width = 80 });
-            _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "R", HeaderText = "R", Width = 80 });
-            _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName = "Percent", HeaderText = "% a cerrar", Width = 120 });
-            _grid.DataSource = new BindingSource { DataSource = rows };
-
-            _normalize    = new Button { Text = "Normalizar %",         Left = 12,  Top = 250, Width = 120 };
-            _preset_50_13 = new Button { Text = "50% @ 1R | 50% @ 3R",  Left = 142, Top = 250, Width = 180 };
-            _preset_30_08_2 = new Button { Text = "30% @ 0.8R | 70% @ 2R", Left = 328, Top = 250, Width = 200 };
-            _preset_40_123  = new Button { Text = "40% @1R | 30% @2R | 30% @3R", Left = 12, Top = 284, Width = 308 };
-            _preset_100_2   = new Button { Text = "100% @ 2R",           Left = 328, Top = 284, Width = 120 };
-            _ok = new Button { Text = "OK",        Left = 540, Top = 250, Width = 80, DialogResult = DialogResult.OK };
-            _cancel = new Button { Text = "Cancelar", Left = 540, Top = 284, Width = 80, DialogResult = DialogResult.Cancel };
-
-            _normalize.Click += (s, e) =>
-            {
-                var bs = (BindingSource)_grid.DataSource; var r = (BindingList<TargetRow>)bs.DataSource;
-                var m = new TargetsModel { TP1 = r[0], TP2 = r[1], TP3 = r[2] };
-                m.NormalizePercents();
-                _grid.Refresh();
-            };
-
-            // Helpers de presets
-            void ApplyPreset((decimal R, int P)[] tpl)
-            {
-                var bs = (BindingSource)_grid.DataSource;
-                var r  = (BindingList<TargetRow>)bs.DataSource;
-                // reset
-                for (int i=0;i<3;i++){ r[i].Active=false; r[i].Percent=0; }
-                for (int i=0;i<tpl.Length && i<3;i++)
-                {
-                    r[i].Active = tpl[i].P > 0;
-                    r[i].R      = tpl[i].R;
-                    r[i].Percent= tpl[i].P;
-                }
-                // normaliza a 100
-                var act = r.Where(x=>x.Active && x.Percent>0).ToList();
-                var sum = act.Sum(x=>x.Percent);
-                if (sum!=100 && act.Count>0)
-                {
-                    for (int i=0;i<act.Count;i++)
-                        act[i].Percent = (int)Math.Max(0, Math.Round(100m*act[i].Percent/Math.Max(1,sum)));
-                    var diff = 100 - act.Sum(x=>x.Percent);
-                    act[^1].Percent = Math.Max(1, act[^1].Percent + diff);
-                }
-                _grid.Refresh();
-            }
-            _preset_50_13.Click += (s, e)   => ApplyPreset(new[]{ (1.0m,50),(3.0m,50) });
-            _preset_30_08_2.Click += (s, e) => ApplyPreset(new[]{ (0.8m,30),(2.0m,70) });
-            _preset_40_123.Click += (s, e)  => ApplyPreset(new[]{ (1.0m,40),(2.0m,30),(3.0m,30) });
-            _preset_100_2.Click += (s, e)   => ApplyPreset(new[]{ (2.0m,100) });
-
-            Controls.AddRange(new Control[] { _grid, _normalize, _preset_50_13, _preset_30_08_2, _preset_40_123, _preset_100_2, _ok, _cancel });
-            AcceptButton = _ok; CancelButton = _cancel;
-            FormClosing += (s, e) =>
-            {
-                if (DialogResult == DialogResult.OK)
-                {
-                    var bs = (BindingSource)_grid.DataSource; var r = (BindingList<TargetRow>)bs.DataSource;
-                    var act = r.Where(x=>x.Active && x.Percent>0).ToList();
-                    if (act.Count == 0) { MessageBox.Show("Activa al menos un target (>0%).", "Validación", MessageBoxButtons.OK, MessageBoxIcon.Warning); e.Cancel = true; return; }
-                    var sum = act.Sum(x=>x.Percent);
-                    if (sum != 100) {
-                        for (int i=0;i<act.Count;i++) act[i].Percent = (int)Math.Round(100m*act[i].Percent/Math.Max(1,sum));
-                        var diff = 100 - act.Sum(x=>x.Percent); act[^1].Percent += diff;
-                    }
-                    ResultModel = new TargetsModel {
-                        TP1 = new TargetRow { Name="TP1", Active=r[0].Active, R=r[0].R, Percent=r[0].Percent },
-                        TP2 = new TargetRow { Name="TP2", Active=r[1].Active, R=r[1].R, Percent=r[1].Percent },
-                        TP3 = new TargetRow { Name="TP3", Active=r[2].Active, R=r[2].R, Percent=r[2].Percent },
-                    };
-                }
-            };
-        }
-    }
-
-    // Nota: esqueleto "safe". No envÃ¯Â¿Â½a ni cancela Ã¯Â¿Â½rdenes.
-    public class RiskManagerManualStrategy : ChartStrategy
+    // Risk Manager Manual con MT5 Bridge
+    // Para usar: Cargar estrategia en ATAS → Bridge MT5 activado por defecto
+    public class RiskManagerManualMT5Strategy : ChartStrategy
     {
         // =================== Activation ===================
         [Category("Activation"), DisplayName("Manage manual entries")]
@@ -465,102 +85,31 @@ namespace MyAtas.Strategies
         public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10";
 
         // =================== Stops & TPs ===================
-        // ===== Tabla de Targets (UI simple) - SSOT =====
-        private TargetsModel _targets;
-        private bool _useTargetsV2 = false; // SSOT: si true, los legacy se ignoran como entrada de usuario
+        [Category("Stops & TPs"), DisplayName("Preset TPs (1..3)")]
+        public int PresetTPs { get; set; } = 2; // 1..3
 
-        [Category("Stops & TPs"), DisplayName("Targets (clic para editar)")]
-        [Description("Configura T1..T3 como (R, %) y acciones asociadas. Abre un editor en tabla.")]
-        [Editor(typeof(TargetsEditor), typeof(UITypeEditor))]
-        public TargetsModel Targets
-        {
-            get
-            {
-                if (_targets == null)
-                {
-                    _targets = TargetsModel.FromLegacy(PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit);
-                    WireTargetsEvents(_targets);
-                }
-                return _targets;
-            }
-            set
-            {
-                _targets = value ?? TargetsModel.FromLegacy(PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit);
-                // engancha eventos y sincroniza legacy (por compatibilidad con guardados antiguos)
-                WireTargetsEvents(_targets);
-                ApplyTargetsToLegacyConfig();
-                _useTargetsV2 = true;
-                if (EnableLogging) DebugLog.W("RM/CFG", $"Targets set: {_targets.ToSummary()} (V2 active)");
-            }
-        }
+        [Category("Stops & TPs"), DisplayName("TP1 R multiple")]
+        public decimal TP1R { get; set; } = 1.0m;
 
-        private void WireTargetsEvents(TargetsModel m)
-        {
-            if (m == null) return;
-            m.Changed -= OnTargetsChanged;
-            m.Changed += OnTargetsChanged;
-        }
+        [Category("Stops & TPs"), DisplayName("TP2 R multiple")]
+        public decimal TP2R { get; set; } = 2.0m;
 
-        private void OnTargetsChanged(object s, EventArgs e)
-        {
-            try
-            {
-                ApplyTargetsToLegacyConfig();
-                _useTargetsV2 = true;
-                if (EnableLogging)
-                    DebugLog.W("RM/TARGETS", $"Synced from UI: {Targets.ToSummary()}");
-            }
-            catch { }
-        }
+        [Category("Stops & TPs"), DisplayName("TP3 R multiple")]
+        public decimal TP3R { get; set; } = 3.0m;
 
-        // === Helpers de Targets (V2-first) ===
-        private (int preset, decimal r1, decimal r2, decimal r3, int p1, int p2, int p3, string src) GetTargetsSnapshot()
-        {
-            if (_targets != null)
-            {
-                var act = _targets.ActiveOrdered();
-                var n = Math.Clamp(act.Count, 0, 3);
-                if (n > 0)
-                {
-                    decimal r1 = n >= 1 ? Math.Max(0.25m, act[0].R) : 0m;
-                    decimal r2 = n >= 2 ? Math.Max(0.25m, act[1].R) : 0m;
-                    decimal r3 = n >= 3 ? Math.Max(0.25m, act[2].R) : 0m;
-                    int p1 = n >= 1 ? Math.Max(0, act[0].Percent) : 0;
-                    int p2 = n >= 2 ? Math.Max(0, act[1].Percent) : 0;
-                    int p3 = n >= 3 ? Math.Max(0, act[2].Percent) : 0;
+        [Category("Stops & TPs"), DisplayName("TP1 split (%)")]
+        public int TP1pctunit { get; set; } = 50;
 
-                    // Normaliza a 100 (último absorbe)
-                    var list = new System.Collections.Generic.List<int> { p1, p2, p3 }.GetRange(0, n);
-                    var sum = list.Sum();
-                    if (sum != 100 && n > 0)
-                    {
-                        for (int i = 0; i < list.Count; i++)
-                            list[i] = (int)System.Math.Max(0, System.Math.Round(100m * list[i] / System.Math.Max(1, sum)));
-                        var diff = 100 - list.Sum();
-                        list[^1] = System.Math.Max(1, list[^1] + diff);
-                        p1 = list.Count > 0 ? list[0] : 0;
-                        p2 = list.Count > 1 ? list[1] : 0;
-                        p3 = list.Count > 2 ? list[2] : 0;
-                    }
-                    return (n, r1, r2, r3, p1, p2, p3, "TargetsV2");
-                }
-            }
-            // Fallback: legacy
-            return (PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit, "Legacy");
-        }
+        [Category("Stops & TPs"), DisplayName("TP2 split (%)")]
+        public int TP2pctunit { get; set; } = 50;
 
-        [Browsable(false)] public int PresetTPs { get; set; } = 2;
-        [Browsable(false)] public decimal TP1R { get; set; } = 1.0m;
-        [Browsable(false)] public decimal TP2R { get; set; } = 2.0m;
-        [Browsable(false)] public decimal TP3R { get; set; } = 3.0m;
-        [Browsable(false)] public int TP1pctunit { get; set; } = 50;
-        [Browsable(false)] public int TP2pctunit { get; set; } = 50;
-        [Browsable(false)] public int TP3pctunit { get; set; } = 0;
+        [Category("Stops & TPs"), DisplayName("TP3 split (%)")]
+        public int TP3pctunit { get; set; } = 0;
 
         // === Stop placement ===
         [Category("Stops & TPs"), DisplayName("Stop placement mode")]
         [Description("ByTicks: usa 'Default stop (ticks)'. PrevBarOppositeExtreme: coloca el SL en el extremo opuesto de la vela N-1 (+offset).")]
-        public RmStopPlacement StopPlacementMode { get; set; } = RmStopPlacement.PrevBarOppositeExtreme;
+        public RmStopPlacement StopPlacementMode { get; set; } = RmStopPlacement.ByTicks;
 
         [Category("Stops & TPs"), DisplayName("Prev-bar offset (ticks)")]
         [Description("Holgura aÃƒÂ±adida al extremo de la vela N-1 (1 = un tick mÃƒÂ¡s allÃƒÂ¡ del High/Low).")]
@@ -598,8 +147,25 @@ namespace MyAtas.Strategies
         [Category("Diagnostics"), DisplayName("Enable logging")]
         public bool EnableLogging { get; set; } = true;
 
+        // =================== MT5 Bridge ===================
+        [Category("MT5"), DisplayName("Bridge to MT5")]
+        public bool BridgeToMt5Enabled { get; set; } = true;
+
+        [Category("MT5"), DisplayName("MT5 Symbol (NQ)")]
+        public string Mt5SymbolNq { get; set; } = "NAS100.fs";
+
+        [Category("MT5"), DisplayName("MT5 Symbol (ES)")]
+        public string Mt5SymbolEs { get; set; } = "S&P.fs";
+
+        [Category("MT5"), DisplayName("Risk % (EA)")]
+        public double Mt5RiskPercent { get; set; } = 0.50; // 0.50% por trade
+
         // =================== Internal Helpers ===================
         private int _lastSeenBar = -1;
+
+        // ===== MT5 Bridge =====
+        private Mt5SocketClient _mt5;
+        private int _mt5Seq = 0;
 
         // === Breakeven: estado mínimo requerido por ResetAttachState / gates ===
         private bool   _beArmed     = false;
@@ -820,7 +386,7 @@ namespace MyAtas.Strategies
         // queremos: cancelar brackets propios y hacer FLATTEN de la posiciÃƒÂ³n.
         private bool _stopToFlat = false;
         private DateTime _rmStopGraceUntil = DateTime.MinValue;     // mientras now<=esto, estamos drenando cancel/fill
-        private const int _rmStopGraceMs = 900;                     // holgura post-cancel/flatten (antes 2200)
+        private const int _rmStopGraceMs = 2200;                    // holgura post-cancel/flatten
         private DateTime _nextStopSweepAt = DateTime.MinValue;
         private const int _stopSweepEveryMs = 250;                  // sweep periÃƒÂ³dico durante el stop
 
@@ -830,18 +396,18 @@ namespace MyAtas.Strategies
         // ==== Post-Close grace & timeouts ====
         private DateTime _postCloseUntil = DateTime.MinValue; // if now <= this Ã¢â€ â€™ inGrace
         private readonly int _postCloseGraceMs = 2200;        // un poco mÃƒÂ¡s de holgura tras Close
-        private readonly int _cleanupWaitMs = 150;            // wait before aggressive cleanup (ms) (antes 300)
+        private readonly int _cleanupWaitMs = 300;            // wait before aggressive cleanup (ms)
         private readonly int _maxRetryMs = 2000;              // absolute escape from WAIT (ms)
 
         // ==== State snapshots for external-close detection ====
         private bool _hadRmBracketsPrevTick = false;          // were there RM brackets last tick?
         private int  _prevNet = 0;                            // last net position snapshot
         private DateTime _lastExternalCloseAt = DateTime.MinValue;
-        private const int ExternalCloseDebounceMs = 600;      // antes 1500
+        private const int ExternalCloseDebounceMs = 1500;
 
         // ==== Attach protection ====
         private DateTime _lastAttachArmAt = DateTime.MinValue;
-        private const int AttachProtectMs = 400;              // proteger el attach mÃƒÂ¡s tiempo (antes 1200)
+        private const int AttachProtectMs = 1200;             // proteger el attach mÃƒÂ¡s tiempo
 
         // --- Estado de net para detectar 0Ã¢â€ â€™Ã¢â€° 0 (entrada) ---
         private bool _pendingAttach = false;
@@ -849,15 +415,12 @@ namespace MyAtas.Strategies
         private DateTime _pendingSince = DateTime.MinValue;
         private int _pendingDirHint = 0;                 // +1/-1 si logramos leerlo del Order
         private int _pendingFillQty = 0;                 // qty del fill manual (si la API lo expone)
-        private readonly int _attachThrottleMs = 80;     // consolidaciÃƒÂ³n mÃƒÂ­nima (antes 200)
-        private readonly int _attachDeadlineMs = 90;     // fallback rÃƒÂ¡pido si el net no llega (antes 120)
+        private readonly int _attachThrottleMs = 200; // consolidaciÃƒÂ³n mÃƒÂ­nima
+        private readonly int _attachDeadlineMs = 120; // fallback rÃƒÂ¡pido si el net no llega
         private readonly System.Collections.Generic.List<Order> _liveOrders = new();
         private readonly object _liveOrdersLock = new();
-        // Ancla estructural capturada en el fill
+        // Ancla de contexto para SL por estructura: ÃƒÂ­ndice de N-1 "en el momento del fill"
         private int _pendingPrevBarIdxAtFill = -1;
-        private decimal _pendingAnchorHigh = 0m;
-        private decimal _pendingAnchorLow  = 0m;
-        private int _pendingAnchorBarAtFill = -1;
 
         // Helper property for compatibility
         private bool IsActivated => ManageManualEntries;
@@ -867,8 +430,6 @@ namespace MyAtas.Strategies
             _pendingAttach = false;
             _pendingEntryPrice = 0m;
             _pendingPrevBarIdxAtFill = -1;
-            _pendingAnchorBarAtFill = -1;
-            _pendingAnchorHigh = _pendingAnchorLow = 0m;
             _pendingFillQty = 0;
             _beArmed = false; _beDone = false; _beTargetPx = 0m;
             _beArmedAtPrice = _beMaxReached = _beMinReached = 0m;  // Limpiar tracking BE
@@ -876,51 +437,17 @@ namespace MyAtas.Strategies
         }
 
         // Constructor explÃƒÂ­cito para evitar excepciones durante carga ATAS
-        public RiskManagerManualStrategy()
+        public RiskManagerManualMT5Strategy()
         {
             try
             {
                 // No inicializar aquÃƒÂ­ para evitar problemas de carga
                 _engine = null;
-                _targets = TargetsModel.FromLegacy(PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit);
             }
             catch
             {
                 // Constructor sin excepciones para ATAS
             }
-        }
-
-        private void ApplyTargetsToLegacyConfig()
-        {
-            var act = (_targets ?? new TargetsModel()).ActiveOrdered();
-            // Fallback si vacío: 100% @ 1R
-            if (act.Count == 0) { PresetTPs = 1; TP1R = 1m; TP1pctunit = 100; TP2pctunit = TP3pctunit = 0; _useTargetsV2 = true; return; }
-
-            PresetTPs = Math.Clamp(act.Count, 1, 3);
-            // R multipliers
-            TP1R = act.ElementAtOrDefault(0)?.R ?? 1m;
-            TP2R = act.ElementAtOrDefault(1)?.R ?? 0m;
-            TP3R = act.ElementAtOrDefault(2)?.R ?? 0m;
-            // Splits (%)
-            TP1pctunit = act.ElementAtOrDefault(0)?.Percent ?? 0;
-            TP2pctunit = act.ElementAtOrDefault(1)?.Percent ?? 0;
-            TP3pctunit = act.ElementAtOrDefault(2)?.Percent ?? 0;
-            // Normaliza a 100 por si acaso (último absorbe)
-            var sum = TP1pctunit + TP2pctunit + TP3pctunit;
-            if (sum != 100)
-            {
-                var list = new List<int> { TP1pctunit, TP2pctunit, TP3pctunit }.Take(PresetTPs).ToList();
-                for (int i = 0; i < list.Count; i++) list[i] = (int)Math.Max(0, Math.Round(100m * list[i] / Math.Max(1, sum)));
-                var diff = 100 - list.Sum(); list[^1] = Math.Max(1, list[^1] + diff);
-                TP1pctunit = list.ElementAtOrDefault(0);
-                TP2pctunit = PresetTPs >= 2 ? list.ElementAtOrDefault(1) : 0;
-                TP3pctunit = PresetTPs >= 3 ? list.ElementAtOrDefault(2) : 0;
-            }
-            // Legacy OFF si usamos Targets: evita solapes en constructores que aún lean legacy
-            _useTargetsV2 = true;
-
-            if (EnableLogging)
-                DebugLog.W("RM/CFG", $"Targets configured: {(_targets ?? new TargetsModel()).ToSummary()}");
         }
 
         private RiskEngine GetEngine()
@@ -1508,32 +1035,12 @@ namespace MyAtas.Strategies
                 // Anclar la "prev-bar" en el instante del fill (N-1 respecto a la barra visible ahora)
                 try
                 {
-                    // Capturar N-1; si no existe, N (intravela)
-                    var prevIdx = CurrentBar > 1 ? (CurrentBar - 2) : (CurrentBar - 1);
-                    _pendingPrevBarIdxAtFill = Math.Max(0, prevIdx);
-
-                    var anchor = GetCandle(_pendingPrevBarIdxAtFill);
-                    if (anchor == null)
-                    {
-                        _pendingAnchorBarAtFill = Math.Max(0, CurrentBar - 1); // fallback N
-                        anchor = GetCandle(_pendingAnchorBarAtFill);
-                    }
-                    else
-                    {
-                        _pendingAnchorBarAtFill = _pendingPrevBarIdxAtFill;
-                    }
-                    _pendingAnchorHigh = anchor?.High ?? 0m;
-                    _pendingAnchorLow  = anchor?.Low  ?? 0m;
-
+                    // En ATAS: ÃƒÂºltimo ÃƒÂ­ndice es CurrentBar-1 (vela actual). La "prev" cerrada es CurrentBar-2.
+                    _pendingPrevBarIdxAtFill = Math.Max(0, CurrentBar - 2);
                     if (EnableLogging)
-                        DebugLog.W("RM/STOPMODE", $"Anchor captured at fill: bar={_pendingAnchorBarAtFill} high={_pendingAnchorHigh:F2} low={_pendingAnchorLow:F2} (curBar={CurrentBar})");
+                        DebugLog.W("RM/STOPMODE", $"Anchor prevBarIdx set at fill (N-1): {_pendingPrevBarIdxAtFill} (curBarAtFill={CurrentBar})");
                 }
-                catch
-                {
-                    _pendingPrevBarIdxAtFill = -1;
-                    _pendingAnchorBarAtFill = -1;
-                    _pendingAnchorHigh = _pendingAnchorLow = 0m;
-                }
+                catch { _pendingPrevBarIdxAtFill = -1; }
 
                 // Armar attach con protecciÃƒÂ³n temporal
                 _pendingAttach = true;
@@ -1681,6 +1188,18 @@ namespace MyAtas.Strategies
                 _rmStopGraceUntil = DateTime.MinValue;
                 _nextStopSweepAt   = DateTime.MinValue;
                 if (EnableLogging) DebugLog.W("RM/STOP", "Started Ã¢â€ â€™ reset stop-to-flat flags");
+
+                // MT5 Bridge: inicializar socket
+                if (BridgeToMt5Enabled && _mt5 == null)
+                {
+                    _mt5 = new Mt5SocketClient();
+                    _mt5.OnAckLine += (line) =>
+                    {
+                        if (EnableLogging) DebugLog.W("MT5/ACK", line);
+                        // Si quieres, aquí parseas el JSON de ACK y correlacionas clientOrderId
+                    };
+                    if (EnableLogging) DebugLog.W("MT5", "Socket ATAS→Gateway conectado.");
+                }
             }
             catch { }
         }
@@ -1695,18 +1214,8 @@ namespace MyAtas.Strategies
                 if (EnableLogging) DebugLog.W("RM/STOP", $"OnStopping Ã¢â€ â€™ engage StopToFlat, grace until={_rmStopGraceUntil:HH:mm:ss.fff}");
 
                 // 1) Cancelar brackets + cualquier otra orden viva del instrumento
-                // Evitar limpiar si acabamos de armar attach (protección anti-cancel inmediato)
-                var freshAttach = _pendingAttach &&
-                                  (DateTime.UtcNow - _lastAttachArmAt).TotalMilliseconds < (AttachProtectMs + 250);
-                if (!freshAttach)
-                {
-                    CancelResidualBrackets("stop-to-flat");
-                    CancelNonBracketWorkingOrders("stop-to-flat");
-                }
-                else if (EnableLogging)
-                {
-                    DebugLog.W("RM/STOP", "Skip cleanup due to fresh attach (anti-cancel)");
-                }
+                CancelResidualBrackets("stop-to-flat");
+                CancelNonBracketWorkingOrders("stop-to-flat");
 
                 // 2) FLATTEN: intentar SIEMPRE el cierre nativo y dejar fallback armado
                 var snap = ReadPositionSnapshot();
@@ -1715,6 +1224,14 @@ namespace MyAtas.Strategies
                 if (EnableLogging) DebugLog.W("RM/STOP", $"ClosePosition attempt (TM) result={tmClosed}");
                 // 3) Fallback garantizado: EnsureFlattenOutstanding no duplica y no-op si net==0
                 EnsureFlattenOutstanding("OnStopping");
+
+                // MT5 Bridge: cerrar socket
+                if (_mt5 != null)
+                {
+                    _mt5.Dispose();
+                    _mt5 = null;
+                    if (EnableLogging) DebugLog.W("MT5", "Socket ATAS→Gateway cerrado.");
+                }
             }
             catch (Exception ex)
             {
@@ -1740,35 +1257,6 @@ namespace MyAtas.Strategies
                 SessionPnL = 0m;
             }
             catch { }
-        }
-
-        // Usa exclusivamente la ancla capturada (N-1; o N si no hay N-1).
-        private (decimal Price, string Debug) ComputeStructureStopPx(int dir, decimal tickSize)
-        {
-            var outside     = PrevBarOffsetSide == RmPrevBarOffsetSide.Outside;
-            var offsetTicks = Math.Max(0, PrevBarOffsetTicks);
-            var offset      = offsetTicks * tickSize;
-
-            // Si por algún motivo no hay ancla, reintenta: N-1 si existe, si no N
-            decimal hi = _pendingAnchorHigh, lo = _pendingAnchorLow;
-            if (hi <= 0m && lo <= 0m)
-            {
-                int idx = CurrentBar > 1 ? (CurrentBar - 2) : Math.Max(0, CurrentBar - 1);
-                var c = GetCandle(idx);
-                hi = c?.High ?? 0m;
-                lo = c?.Low  ?? 0m;
-                _pendingAnchorBarAtFill = idx;
-            }
-
-            decimal rawSL;
-            if (dir > 0) // LONG → detrás del LOW de la ancla
-                rawSL = outside ? (lo - offset) : (lo + offset);
-            else         // SHORT → detrás del HIGH de la ancla
-                rawSL = outside ? (hi + offset) : (hi - offset);
-
-            var px = ShrinkPrice(rawSL);
-            var dbg = $"anchorBar={_pendingAnchorBarAtFill} hi={hi:F2} lo={lo:F2} offTicks={offsetTicks} side={PrevBarOffsetSide} -> SL={px:F2}";
-            return (px, dbg);
         }
 
         private void TryAttachBracketsNow()
@@ -1937,15 +1425,39 @@ namespace MyAtas.Strategies
                 decimal? overrideStopPx = null;
                 try
                 {
-                    if (EnableLogging)
-                        DebugLog.W("RM/STOPMODE", $"Active={StopPlacementMode} prevIdxAtFill={_pendingPrevBarIdxAtFill} offTicks={PrevBarOffsetTicks} side={PrevBarOffsetSide}");
                     if (StopPlacementMode == RmStopPlacement.PrevBarOppositeExtreme)
                     {
-                        var (slPx, dbg) = ComputeStructureStopPx(dir, Convert.ToDecimal(tickSize));
-                        overrideStopPx  = slPx;
-                        approxStopTicks = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - slPx) / tickSize));
-                        if (EnableLogging)
-                            DebugLog.W("RM/STOPMODE", $"STRUCT SL: {dbg} | ticks≈{approxStopTicks}");
+                        var prevIdx = _pendingPrevBarIdxAtFill >= 0
+                            ? Math.Max(0, _pendingPrevBarIdxAtFill)
+                            : Math.Max(0, CurrentBar - 2);          // N-1 cerrada
+                        var prev = GetCandle(prevIdx);
+                        var cur  = GetCandle(Math.Max(0, CurrentBar - 1)); // N (intravela)
+                        if (prev != null && cur != null)
+                        {
+                            // Engulfing-safe base:
+                            // LONG → min(prev.Low, cur.Low) ; SHORT → max(prev.High, cur.High)
+                            var prevExtreme = (dir > 0) ? prev.Low  : prev.High;
+                            var curExtreme  = (dir > 0) ? cur.Low   : cur.High;
+                            var baseExtreme = (dir > 0)
+                                ? Math.Min(prevExtreme, curExtreme)
+                                : Math.Max(prevExtreme, curExtreme);
+
+                            var offsetTicks = Math.Max(0, PrevBarOffsetTicks);
+                            var offset      = offsetTicks * Convert.ToDecimal(tickSize);
+                            var outside     = PrevBarOffsetSide == RmPrevBarOffsetSide.Outside;
+
+                            decimal rawSL;
+                            if (dir > 0) // LONG
+                                rawSL = outside ? (baseExtreme - offset) : (baseExtreme + offset);
+                            else         // SHORT
+                                rawSL = outside ? (baseExtreme + offset) : (baseExtreme - offset);
+
+                            overrideStopPx   = ShrinkPrice(rawSL);  // tick-safe
+                            approxStopTicks  = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - overrideStopPx.Value) / tickSize));
+                            if (EnableLogging)
+                                DebugLog.W("RM/STOPMODE",
+                                    $"PrevBar+N SL({PrevBarOffsetSide}): prevIdx={prevIdx} prev={prevExtreme:F2} cur={curExtreme:F2} base={baseExtreme:F2} offTicks={offsetTicks} → SL={overrideStopPx.Value:F2} ticks≈{approxStopTicks}");
+                        }
                     }
                 } catch { /* fallback a DefaultStopTicks */ }
 
@@ -1965,21 +1477,17 @@ namespace MyAtas.Strategies
                     ManualQty: manualQtyToUse,
                     RiskUsd: RiskPerTradeUsd,
                     RiskPct: RiskPercentOfAccount,
-                    AccountEquityOverride: (AccountEquityOverride > 0m)
-                        ? AccountEquityOverride
-                        : (AccountEquitySnapshot > 0m ? AccountEquitySnapshot : _sessionStartingEquity),
+                    AccountEquityOverride: 0m,
                     TickValueOverrides: TickValueOverrides,
                     UnderfundedPolicy: Underfunded,
                     MinQty: Math.Max(1, MinQty),
                     MaxQty: Math.Max(1, MaxQty)
                 );
 
-                // TPs desde UI (V2 primero; si no hay, usa legacy)
-                var tg = GetTargetsSnapshot();
-                var (tpR, tpSplits) = _RmSplitHelper.BuildTpArrays(tg.preset, tg.r1, tg.r2, tg.r3, tg.p1, tg.p2, tg.p3);
-
+                // TPs desde UI (filtrando splits=0 y normalizando)
+                var (tpR, tpSplits) = _RmSplitHelper.BuildTpArrays(PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit);
                 if (EnableLogging)
-                    DebugLog.W("RM/SPLIT", $"SRC={tg.src} -> preset={tg.preset} tpR=[{string.Join(",", tpR)}] splits=[{string.Join(",", tpSplits)}]");
+                    DebugLog.W("RM/SPLIT", $"UI -> preset={PresetTPs} tpR=[{string.Join(",", tpR)}] splits=[{string.Join(",", tpSplits)}]");
 
                 var bracketCfg = new MyAtas.Risk.Models.BracketConfig(
                     StopTicks: approxStopTicks,                            // <-- idem
@@ -2001,62 +1509,62 @@ namespace MyAtas.Strategies
                 else
                 {
                     if (EnableLogging)
-                    {
                         DebugLog.W("RM/PLAN", $"Built plan: totalQty={plan.TotalQty} stop={plan.StopLoss?.Price:F2} tps={plan.TakeProfits?.Count} reason={plan.Reason}");
-
-                        // Log de configuración de targets
-                        var act = (_targets ?? new TargetsModel()).ActiveOrdered().ToList();
-                        DebugLog.W("RM/TP", $"PLAN v2={_useTargetsV2} preset={PresetTPs} | " +
-                            string.Join(" | ", act.Select((t, i) => $"TP{i + 1}: R={t.R} %={t.Percent} active={t.Active}")));
-                    }
                 }
 
-                // === FALLBACK DE TP: Si motor devuelve precio 0, calcular localmente ===
-                decimal slPxFromPlan = plan.StopLoss?.Price ?? 0m;
-                if (slPxFromPlan <= 0m && overrideStopPx.HasValue) slPxFromPlan = overrideStopPx.Value;
-                var slPxForR = slPxFromPlan > 0m ? slPxFromPlan
-                    : (dir > 0 ? entryPx - approxStopTicks * tickSize
-                               : entryPx + approxStopTicks * tickSize);
-                var rPrice = dir > 0 ? (entryPx - slPxForR) : (slPxForR - entryPx);
-                if (rPrice <= 0m) rPrice = Math.Max(1, approxStopTicks) * tickSize;
-
-                // Construir lista local de TPs seguros (precio>0) a partir de R-multiples UI
-                var tpRlocals = new System.Collections.Generic.List<decimal>();
-                if (PresetTPs >= 1 && TP1pctunit > 0) tpRlocals.Add(Math.Max(0.25m, TP1R));
-                if (PresetTPs >= 2 && TP2pctunit > 0) tpRlocals.Add(Math.Max(0.25m, TP2R));
-                if (PresetTPs >= 3 && TP3pctunit > 0) tpRlocals.Add(Math.Max(0.25m, TP3R));
-
-                // Validar y reconstruir TPs del plan
-                var safeTps = new System.Collections.Generic.List<MyAtas.Risk.Models.BracketLeg>();
-                for (int i = 0; i < plan.TakeProfits.Count; i++)
+                // ======= MT5 BRIDGE: enviar entrada a MT5 por % de equity =======
+                try
                 {
-                    var tp = plan.TakeProfits[i];
-                    var px = tp.Price;
-                    if (px <= 0m)
+                    if (BridgeToMt5Enabled && _mt5 != null)
                     {
-                        // Motor no puso precio válido → calcular localmente
-                        var rMult = (i < tpRlocals.Count) ? tpRlocals[i] : (tpRlocals.Count > 0 ? tpRlocals[tpRlocals.Count - 1] : 1m);
-                        var raw = dir > 0 ? (entryPx + rMult * rPrice) : (entryPx - rMult * rPrice);
-                        px = ShrinkPrice(raw);
-                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"TP[{i}] era 0 → calculado: {px:F2} (R={rMult:F2})");
-                    }
-                    if (px > 0m) safeTps.Add(new MyAtas.Risk.Models.BracketLeg(px, tp.Quantity));
-                }
+                        // 1) Determinar símbolo MT5 destino según el símbolo ATAS
+                        var src = Security?.ToString() ?? "";
+                        string dst = src.Contains("NQ", StringComparison.OrdinalIgnoreCase) ? Mt5SymbolNq : Mt5SymbolEs;
 
-                // Si no hay TPs válidos, crear uno en 1R con el 100% de qty
-                if (safeTps.Count == 0)
+                        // 2) SL que usará el EA para calcular lotes por % de cuenta
+                        double? slForEa = null;
+                        if (overrideStopPx.HasValue && overrideStopPx.Value > 0m)
+                            slForEa = (double)overrideStopPx.Value;
+                        else
+                        {
+                            // Fallback: usa un SL por defecto en ticks si no hubo override
+                            var fallbackTicks = Math.Max(1, DefaultStopTicks);
+                            var tickSizeDouble = Security?.TickSize != null ? (double)Security.TickSize : 0.25;
+                            var sign = dir > 0 ? -1 : +1;
+                            var raw = (double)entryPx + sign * fallbackTicks * tickSizeDouble;
+                            slForEa = raw;
+                        }
+
+                        // 3) Primer TP opcional (no es crítico para el EA)
+                        double? tpForEa = null;
+                        if (plan.TakeProfits != null && plan.TakeProfits.Count > 0)
+                            tpForEa = (double)plan.TakeProfits[0].Price;
+
+                        // 4) clientOrderId único
+                        string id = $"RM-{DateTime.UtcNow:yyyyMMdd-HHmmss-fff}-{_mt5Seq++:000}";
+
+                        // 5) Enviar; el EA ignorará qty_lots y calculará lotes con risk_mode="percentAccount"
+                        _mt5.SendNewMarketOrder(
+                            clientOrderId: id,
+                            symbolSrc: src,
+                            symbolDst: dst,
+                            dir: dir,
+                            slPrice: slForEa,
+                            tpPrice: tpForEa,
+                            riskMode: "percentAccount",
+                            riskValue: Mt5RiskPercent,
+                            comment: "ATAS468"
+                        );
+
+                        if (EnableLogging)
+                            DebugLog.W("MT5/SEND", $"NEW_ORDER {id} dir={(dir>0?"BUY":"SELL")} dst={dst} SL={slForEa:F2} TP={tpForEa?.ToString("F2") ?? "null"} risk%={Mt5RiskPercent}");
+                    }
+                }
+                catch (Exception ex)
                 {
-                    var px1 = ShrinkPrice(dir > 0 ? (entryPx + 1m * rPrice) : (entryPx - 1m * rPrice));
-                    if (px1 > 0m)
-                    {
-                        safeTps.Add(new MyAtas.Risk.Models.BracketLeg(px1, Math.Max(1, plan.TotalQty)));
-                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"No TPs válidos → creado 1 TP en 1R: {px1:F2}");
-                    }
+                    DebugLog.W("MT5/ERR", "SendNewMarketOrder EX: " + ex.Message);
                 }
-
-                // Sustituir TPs en plan
-                if (safeTps.Count > 0)
-                    plan = new MyAtas.Risk.Models.RiskPlan(plan.TotalQty, plan.StopLoss, safeTps, plan.OcoPolicy, plan.Reason + " [TP-safe]");
+                // ======= /MT5 BRIDGE =======
 
                 // ===== "LA UI MANDA": Si EnforceManualQty está activo, usar ManualQty =====
                 var manualTarget = Math.Max(MinQty, ManualQty);
@@ -2096,10 +1604,7 @@ namespace MyAtas.Strategies
                     );
 
                     if (EnableLogging)
-                    {
                         DebugLog.W("RM/PLAN", $"LA UI MANDA: Overriding plan qty {plan.TotalQty}→{q}, splits=[{q1},{q2},{q3}]");
-                        DebugLog.W("RM/SPLIT", $"QTY ENFORCE -> q=[{string.Join(",", newTps.Select(t => t.Quantity))}] (planCount={newTps.Count})");
-                    }
                 }
 
                 // ===== TARGET QTY por modo de dimensionado =====
@@ -2143,7 +1648,7 @@ namespace MyAtas.Strategies
                 // ===== ENFORCEMENT (imponer SIEMPRE el objetivo del modo activo) =====
                 targetForEnforce = (SizingMode == RmSizingMode.Manual)
                     ? Math.Clamp(ManualQty, Math.Max(1, MinQty), Math.Max(1, MaxQty))
-                    : Math.Clamp(targetQty, Math.Max(1, MinQty), Math.Max(1, MaxQty)); // usar el que acabamos de calcular
+                    : plan.TotalQty; // objetivo de riesgo
 
                 var currentNet = Math.Abs(ReadNetPosition());
                 var filledHint = Math.Max(0, _pendingFillQty);
@@ -2185,21 +1690,13 @@ namespace MyAtas.Strategies
 
                 // Reparto de cantidades por splits (sin ceros) - usar targetForEnforce
                 var splitQty = _RmSplitHelper.SplitQty(targetForEnforce, tpSplits);
-                if (EnableLogging) DebugLog.W("RM/SPLIT", $"total={targetForEnforce} -> [{string.Join(",", splitQty)}]");
+                if (EnableLogging) DebugLog.W("RM/SPLIT", $"targetForEnforce={targetForEnforce} Ã¢â€ â€™ splitQty=[{string.Join(",", splitQty)}]");
 
                 for (int idx = 0; idx < plan.TakeProfits.Count && idx < splitQty.Length; idx++)
                 {
                     var q = splitQty[idx];
                     if (q <= 0) { if (EnableLogging) DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: skip (qty=0)"); continue; }
                     var tp = plan.TakeProfits[idx];
-
-                    // === VALIDACIÓN: NO enviar TP con precio ≤ 0 ===
-                    if (tp.Price <= 0m)
-                    {
-                        if (EnableLogging) DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: SKIP TP (price=0)");
-                        continue;
-                    }
-
                     var ocoId = Guid.NewGuid().ToString("N");
                     var slPriceToUse = overrideStopPx ?? plan.StopLoss.Price;
                     SubmitRmStop(ocoId, coverSide, q, slPriceToUse);
