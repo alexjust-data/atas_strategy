@@ -42,10 +42,8 @@ namespace MyAtas.Strategies
             if (n >= 3 && sp3 > 0) { rList.Add(tp3); sList.Add(Math.Max(0, sp3)); }
             if (rList.Count == 0)
             {
-                // Fallback: un solo TP al 100% a 1R
-                rList.Add(Math.Max(1m, tp1));
-                sList.Add(100);
-                return (rList.ToArray(), sList.ToArray());
+                // Sin % válidos → cero TPs reales (permitido con VirtualBE/Trailing)
+                return (Array.Empty<decimal>(), Array.Empty<int>());
             }
             var sum = sList.Sum();
             if (sum != 100)
@@ -536,34 +534,17 @@ namespace MyAtas.Strategies
         {
             if (_targets != null)
             {
-                var act = _targets.ActiveOrdered();
-                var n = Math.Clamp(act.Count, 0, 3);
-                if (n > 0)
-                {
-                    decimal r1 = n >= 1 ? Math.Max(0.25m, act[0].R) : 0m;
-                    decimal r2 = n >= 2 ? Math.Max(0.25m, act[1].R) : 0m;
-                    decimal r3 = n >= 3 ? Math.Max(0.25m, act[2].R) : 0m;
-                    int p1 = n >= 1 ? Math.Max(0, act[0].Percent) : 0;
-                    int p2 = n >= 2 ? Math.Max(0, act[1].Percent) : 0;
-                    int p3 = n >= 3 ? Math.Max(0, act[2].Percent) : 0;
-
-                    // Normaliza a 100 (Ãºltimo absorbe)
-                    var list = new System.Collections.Generic.List<int> { p1, p2, p3 }.GetRange(0, n);
-                    var sum = list.Sum();
-                    if (sum != 100 && n > 0)
-                    {
-                        for (int i = 0; i < list.Count; i++)
-                            list[i] = (int)System.Math.Max(0, System.Math.Round(100m * list[i] / System.Math.Max(1, sum)));
-                        var diff = 100 - list.Sum();
-                        list[^1] = System.Math.Max(1, list[^1] + diff);
-                        p1 = list.Count > 0 ? list[0] : 0;
-                        p2 = list.Count > 1 ? list[1] : 0;
-                        p3 = list.Count > 2 ? list[2] : 0;
-                    }
-                    return (n, r1, r2, r3, p1, p2, p3, "TargetsV2");
-                }
+                // Leer SIEMPRE de TP1/TP2/TP3, incluso con % = 0 (no caer a legacy)
+                var r1 = _targets.TP1?.R ?? 1m;
+                var r2 = _targets.TP2?.R ?? 2m;
+                var r3 = _targets.TP3?.R ?? 3m;
+                var p1 = _targets.TP1?.Percent ?? 0;
+                var p2 = _targets.TP2?.Percent ?? 0;
+                var p3 = _targets.TP3?.Percent ?? 0;
+                var preset = (p1 > 0 ? 1 : 0) + (p2 > 0 ? 1 : 0) + (p3 > 0 ? 1 : 0);
+                return (preset, r1, r2, r3, p1, p2, p3, "TargetsV2");
             }
-            // Fallback: legacy
+            // Fallback: legacy (solo si _targets == null)
             return (PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit, "Legacy");
         }
 
@@ -855,7 +836,12 @@ namespace MyAtas.Strategies
                 _lastKnownStopPx = newStopPx;
                 TLog("APPLY", $"MoveAllRmStopsTo newStop={newStopPx:F2} reason={reason}");
                 var list = this.Orders;
-                if (list == null) return;
+                if (list == null)
+                {
+                    if (EnableLogging) DebugLog.W("RM/BE", "MoveAllRmStopsTo: Orders list is NULL");
+                    return;
+                }
+                if (EnableLogging) DebugLog.W("RM/BE", $"MoveAllRmStopsTo: Orders count={list.Count()}");
 
                 // Agrupar TPs y SLs por OCO
                 var tpsByOco = new System.Collections.Generic.Dictionary<string, Order>();
@@ -929,6 +915,56 @@ namespace MyAtas.Strategies
                         OpenOrder(tpNew);
                         recreated++;
                     }
+                }
+
+                // (NUEVO) Procesar SLs huérfanos: sin TP emparejado en el mismo OCO.
+                if (EnableLogging && slsByOco.Count > 0)
+                    DebugLog.W("RM/BE/ORPHAN", $"Checking orphan SLs: total slsByOco={slsByOco.Count} tpsByOco={tpsByOco.Count}");
+
+                foreach (var kv in slsByOco)
+                {
+                    var oco = kv.Key;                    // puede ser "" (sin OCO)
+                    if (tpsByOco.ContainsKey(oco))       // ya tratado arriba junto con su TP
+                    {
+                        if (EnableLogging)
+                            DebugLog.W("RM/BE/ORPHAN", $"Skip SL with oco={oco ?? "<empty>"} (has TP paired)");
+                        continue;
+                    }
+
+                    var slOld = kv.Value;
+                    var qty   = Math.Max(0, slOld.QuantityToFill);
+                    if (EnableLogging)
+                        DebugLog.W("RM/BE/ORPHAN", $"Found orphan SL: oco={oco ?? "<empty>"} qty={qty} status={slOld.Status()} comment={slOld.Comment}");
+
+                    if (qty <= 0)
+                    {
+                        if (EnableLogging)
+                            DebugLog.W("RM/BE/ORPHAN", $"Skip orphan SL (qty<=0)");
+                        continue;
+                    }
+
+                    // 1) Intentar modificación in-place
+                    if (TryModifyStopInPlace(slOld, newStopPx)) { modified++; continue; }
+
+                    // 2) Fallback: cancelar y recrear SOLO el SL (no hay TP asociado)
+                    try { CancelOrder(slOld); } catch {}
+                    var side = slOld.Direction; // Buy para cubrir short, Sell para cubrir long
+                    var slNew = new Order
+                    {
+                        Portfolio      = Portfolio,
+                        Security       = Security,
+                        Direction      = side,
+                        Type           = OrderTypes.Stop,
+                        TriggerPrice   = newStopPx,
+                        QuantityToFill = qty,
+                        OCOGroup       = oco,            // mantiene su (posible) OCO
+                        IsAttached     = true,
+                        Comment        = $"{OwnerPrefix}SL:{Guid.NewGuid():N}"
+                    };
+                    TrySetReduceOnly(slNew);
+                    TrySetCloseOnTrigger(slNew);
+                    OpenOrder(slNew);
+                    replaced++;
                 }
 
                 if (EnableLogging)
@@ -2318,6 +2354,19 @@ namespace MyAtas.Strategies
 
                 // TPs desde UI (V2 primero; si no hay, usa legacy)
                 var tg = GetTargetsSnapshot();
+
+                // Logs de diagnóstico: mostrar cada fila de Targets antes de build
+                if (EnableLogging)
+                {
+                    var t = Targets;
+                    if (t != null)
+                    {
+                        DebugLog.W("RM/SPLIT/ROW", $"TP1: active={t.TP1?.Active ?? false} R={t.TP1?.R ?? 0:F2} pct={t.TP1?.Percent ?? 0}% {(t.TP1?.Percent > 0 ? "OK" : "SKIP (pct=0)")}");
+                        DebugLog.W("RM/SPLIT/ROW", $"TP2: active={t.TP2?.Active ?? false} R={t.TP2?.R ?? 0:F2} pct={t.TP2?.Percent ?? 0}% {(t.TP2?.Percent > 0 ? "OK" : "SKIP (pct=0)")}");
+                        DebugLog.W("RM/SPLIT/ROW", $"TP3: active={t.TP3?.Active ?? false} R={t.TP3?.R ?? 0:F2} pct={t.TP3?.Percent ?? 0}% {(t.TP3?.Percent > 0 ? "OK" : "SKIP (pct=0)")}");
+                    }
+                }
+
                 var (tpR, tpSplits) = _RmSplitHelper.BuildTpArrays(tg.preset, tg.r1, tg.r2, tg.r3, tg.p1, tg.p2, tg.p3);
 
                 if (EnableLogging)
@@ -2388,11 +2437,20 @@ namespace MyAtas.Strategies
                 // Si no hay TPs vÃ¡lidos, crear uno en 1R con el 100% de qty
                 if (safeTps.Count == 0)
                 {
-                    var px1 = ShrinkPrice(dir > 0 ? (entryPx + 1m * rPrice) : (entryPx - 1m * rPrice));
-                    if (px1 > 0m)
+                    // Con BE virtual y/o trailing activos → PERMITIR 0 TPs reales
+                    if (VirtualBreakEven || TrailingMode != RmTrailMode.Off)
                     {
-                        safeTps.Add(new MyAtas.Risk.Models.BracketLeg(px1, Math.Max(1, plan.TotalQty)));
-                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"No TPs vÃ¡lidos â†’ creado 1 TP en 1R: {px1:F2}");
+                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", "0 TPs permitido (VirtualBE/Trailing). Sin fallback.");
+                    }
+                    else
+                    {
+                        // Solo si NO usamos BE virtual ni Trailing: forzar un TP de seguridad
+                        var px1 = ShrinkPrice(dir > 0 ? (entryPx + 1m * rPrice) : (entryPx - 1m * rPrice));
+                        if (px1 > 0m)
+                        {
+                            safeTps.Add(new MyAtas.Risk.Models.BracketLeg(px1, Math.Max(1, plan.TotalQty)));
+                            if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"Forzado 1 TP en 1R: {px1:F2}");
+                        }
                     }
                 }
 
@@ -2525,11 +2583,36 @@ namespace MyAtas.Strategies
                 // OCO 1:1 por TP ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â cada TP lleva su propio trozo de SL
                 if (EnableLogging) DebugLog.W("RM/ATTACH", $"Starting bracket loop: TakeProfits.Count={plan.TakeProfits.Count}");
 
-                // Reparto de cantidades por splits (sin ceros) - usar targetForEnforce
-                var splitQty = _RmSplitHelper.SplitQty(targetForEnforce, tpSplits);
-                if (EnableLogging) DebugLog.W("RM/SPLIT", $"total={targetForEnforce} -> [{string.Join(",", splitQty)}]");
+                // === CASO ESPECIAL: Solo SL (sin TPs) para VirtualBE/Trailing ===
+                if (plan.TakeProfits.Count == 0)
+                {
+                    // No hay TPs reales (virtual BE/Trailing). Aun así debemos proteger con SL.
+                    var slPriceToUse = overrideStopPx ?? plan.StopLoss.Price;
+                    if (EnableLogging)
+                        DebugLog.W("RM/ORD", $"SubmitRmStop SOLO-SL: side={coverSide} qty={targetForEnforce} triggerPx={slPriceToUse:F2} oco=<none>");
+                    SubmitRmStop(/*oco*/ null, coverSide, targetForEnforce, slPriceToUse);
 
-                for (int idx = 0; idx < plan.TakeProfits.Count && idx < splitQty.Length; idx++)
+                    // Sembrar el estado del trailing con el stop recién planificado (evita race condition)
+                    _lastKnownStopPx = slPriceToUse;
+                    _trailBaselinePx = (_pendingEntryPrice != 0m ? _pendingEntryPrice : GetLastPriceSafe());
+                    _trailMaxReached = _trailMinReached = _trailBaselinePx;
+
+                    // Continuar con armado de BE/Trailing (ya hay SL vivo que podremos mover)
+                    if (EnableLogging) DebugLog.W("RM/PLAN", "Attach DONE (SOLO SL)");
+                    _pendingAttach = false;
+                    _pendingPrevBarIdxAtFill = -1; // limpiar el ancla para la siguiente entrada
+
+                    // Armar BE/Trailing será manejado por los bloques subsiguientes
+                    // que ya están fuera del bucle de brackets
+                }
+                else
+                {
+                    // === CASO NORMAL: TPs con brackets OCO ===
+                    // Reparto de cantidades por splits (sin ceros) - usar targetForEnforce
+                    var splitQty = _RmSplitHelper.SplitQty(targetForEnforce, tpSplits);
+                    if (EnableLogging) DebugLog.W("RM/SPLIT", $"total={targetForEnforce} -> [{string.Join(",", splitQty)}]");
+
+                    for (int idx = 0; idx < plan.TakeProfits.Count && idx < splitQty.Length; idx++)
                 {
                     var q = splitQty[idx];
                     if (q <= 0) { if (EnableLogging) DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: skip (qty=0)"); continue; }
@@ -2548,7 +2631,12 @@ namespace MyAtas.Strategies
                     SubmitRmLimit(ocoId, coverSide, q, tp.Price);
                     if (EnableLogging)
                         DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: OCO SL {q}@{slPriceToUse:F2} + TP {q}@{tp.Price:F2} (dir={(dir>0?"LONG":"SHORT")})");
-                }
+                    }
+
+                    _pendingAttach = false;
+                    _pendingPrevBarIdxAtFill = -1; // limpiar el ancla para la siguiente entrada
+                    if (EnableLogging) DebugLog.W("RM/PLAN", "Attach DONE");
+                } // fin del else (caso normal con TPs)
 
                 // Armar el BE (vigilancia del TP trigger para mover SL a breakeven)
                 if (BreakEvenMode != RmBeMode.Off)
@@ -2629,10 +2717,6 @@ namespace MyAtas.Strategies
                     _trailBaselinePx = _trailMaxReached = _trailMinReached = 0m;
                     _lastTrailMoveBar = -1;
                 }
-
-                _pendingAttach = false;
-                _pendingPrevBarIdxAtFill = -1; // limpiar el ancla para la siguiente entrada
-                if (EnableLogging) DebugLog.W("RM/PLAN", "Attach DONE");
             }
             catch (Exception ex)
             {
@@ -3297,31 +3381,22 @@ namespace MyAtas.Strategies
             }
             else if (TrailingMode == RmTrailMode.BarByBar)
             {
-                if (TrailConfirmBars < 1) { TLog("GATE", "BarByBar confirm<1"); return; }
-                decimal anchor;
+                // BarByBar clásico: usa la vela N-1 (prev bar extreme ± offset)
+                var prevBar = SafeGetCandle(CurrentBar - 1);
+                if (prevBar == null) { TLog("GATE", "BarByBar prev-bar null"); return; }
+
                 if (dir > 0)
                 {
-                    anchor = decimal.MaxValue;
-                    for (int i = 1; i <= TrailConfirmBars; i++)
-                    {
-                        var c = SafeGetCandle(CurrentBar - i);
-                        if (c == null) break;
-                        anchor = Math.Min(anchor, c.Low);
-                    }
-                    newStop = AddTicks(anchor, TrailDistanceTicks, -1);
+                    // LONG: candidato = low de N-1 - distanceTicks (más alto = mejora)
+                    newStop = AddTicks(prevBar.Low, TrailDistanceTicks, -1);
+                    reason = $"BarByBar LONG prevLow={prevBar.Low:F2}";
                 }
                 else
                 {
-                    anchor = decimal.MinValue;
-                    for (int i = 1; i <= TrailConfirmBars; i++)
-                    {
-                        var c = SafeGetCandle(CurrentBar - i);
-                        if (c == null) break;
-                        anchor = Math.Max(anchor, c.High);
-                    }
-                    newStop = AddTicks(anchor, TrailDistanceTicks, +1);
+                    // SHORT: candidato = high de N-1 + distanceTicks (más bajo = mejora)
+                    newStop = AddTicks(prevBar.High, TrailDistanceTicks, +1);
+                    reason = $"BarByBar SHORT prevHigh={prevBar.High:F2}";
                 }
-                reason = $"BarByBar N={TrailConfirmBars} anchor={anchor:F2}";
                 TLog("CALC", $"{reason} dist={TrailDistanceTicks} newStop={newStop:F2}");
             }
 
