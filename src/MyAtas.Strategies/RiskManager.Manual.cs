@@ -10,6 +10,7 @@ using System.Text.RegularExpressions;
 using ATAS.Strategies.Chart;
 using ATAS.Types;
 using ATAS.DataFeedsCore;
+using ATAS.Indicators;
 using MyAtas.Shared;
 using MyAtas.Risk.Engine;
 using MyAtas.Risk.Models;
@@ -128,7 +129,7 @@ namespace MyAtas.Strategies
         public event EventHandler Changed;
         void RaiseChanged() => Changed?.Invoke(this, EventArgs.Empty);
 
-        private TargetRow _tp1 = new TargetRow { Name = "TP1", Active = true, R = 1m, Percent = 0 };
+        private TargetRow _tp1 = new TargetRow { Name = "TP1", Active = false, R = 1m, Percent = 0 };
         private TargetRow _tp2 = new TargetRow { Name = "TP2", Active = true, R = 2m, Percent = 50 };
         private TargetRow _tp3 = new TargetRow { Name = "TP3", Active = true, R = 3m, Percent = 50 };
 
@@ -798,6 +799,27 @@ namespace MyAtas.Strategies
         // Tracking de extremos desde el momento de armar BE (evita usar datos histÃ³ricos de barra)
         private decimal _beArmedAtPrice = 0m;  // Precio cuando se armÃ³ BE (baseline)
         private decimal _beMaxReached = 0m;    // MÃ¡ximo alcanzado DESPUÃ‰S de armar BE
+
+        // === TRAILING state ===
+        private bool   _trailArmed = false;
+        private int    _trailLastStepIdx = -1;       // -1 = ninguno
+        private decimal _trailBaselinePx = 0m;
+        private decimal _trailMaxReached = 0m;
+        private decimal _trailMinReached = 0m;
+        private int    _lastTrailMoveBar = -1;
+
+        // === TRAILING: tracking extra ===
+        // Último precio conocido del stop RM (lo actualizamos en OnOrderChanged y cuando lo movemos)
+        private decimal _lastKnownStopPx = 0m;
+        // Riesgo por contrato (|entry - stopInicial|). Se establece al colocarse el primer SL.
+        private decimal _trailRiskAbs = 0m;
+
+        // === TRAILING: logging helper
+        private void TLog(string sub, string msg)
+        {
+            if (EnableLogging) DebugLog.W("RM/TRAIL/" + sub, msg);
+        }
+
         private decimal _beMinReached = 0m;    // MÃ­nimo alcanzado DESPUÃ‰S de armar BE
 
         // === Session P&L tracking ===
@@ -830,6 +852,8 @@ namespace MyAtas.Strategies
         {
             try
             {
+                _lastKnownStopPx = newStopPx;
+                TLog("APPLY", $"MoveAllRmStopsTo newStop={newStopPx:F2} reason={reason}");
                 var list = this.Orders;
                 if (list == null) return;
 
@@ -909,6 +933,9 @@ namespace MyAtas.Strategies
 
                 if (EnableLogging)
                     DebugLog.W("RM/BE", $"Moved SLs to {newStopPx:F2} (modified={modified} replaced={replaced} tpRecreated={recreated}) reason={reason}");
+
+                // Rate-limit: evitar que BE y Trailing muevan el stop múltiples veces en la misma barra
+                _lastTrailMoveBar = CurrentBar;
             }
             catch (Exception ex)
             {
@@ -1070,6 +1097,12 @@ namespace MyAtas.Strategies
             _pendingFillQty = 0;
             _beArmed = false; _beDone = false; _beTargetPx = 0m;
             _beArmedAtPrice = _beMaxReached = _beMinReached = 0m;  // Limpiar tracking BE
+            _trailArmed = false;
+            _trailLastStepIdx = -1;
+            _trailBaselinePx = _trailMaxReached = _trailMinReached = 0m;
+            _lastTrailMoveBar = -1;
+            _lastKnownStopPx = 0m;
+            _trailRiskAbs = 0m;
             if (EnableLogging) DebugLog.W("RM/GATE", $"ResetAttachState: {reason}");
         }
 
@@ -1524,6 +1557,25 @@ namespace MyAtas.Strategies
                 UpdateSessionPnL();
             }
 
+            // === TRAILING: acumular extremos desde el armado ===
+            if (_trailArmed)
+            {
+                try
+                {
+                    var current = SafeGetCandle(bar);
+                    if (current != null)
+                    {
+                        if (_trailMaxReached == 0m) _trailMaxReached = current.Close;
+                        if (_trailMinReached == 0m) _trailMinReached  = current.Close;
+                        if (current.High > _trailMaxReached) _trailMaxReached = current.High;
+                        if (current.Low  < _trailMinReached) _trailMinReached  = current.Low;
+                        TLog("TRACE", $"hi={current.High:F2} lo={current.Low:F2} c={current.Close:F2} " +
+                                    $"max={_trailMaxReached:F2} min={_trailMinReached:F2}");
+                    }
+                }
+                catch { }
+            }
+
             // Heartbeat del estado de Stop-to-Flat (visible en logs)
             if (EnableLogging && IsFirstTickOf(bar))
             {
@@ -1645,6 +1697,18 @@ namespace MyAtas.Strategies
                 }
             }
             catch (Exception ex) { DebugLog.W("RM/BE", $"BE touch check EX: {ex.Message}"); }
+
+            // === TRAILING: Process trailing stop logic ===
+            if (_trailArmed && TrailingMode != RmTrailMode.Off)
+            {
+                try
+                {
+                    var current = SafeGetCandle(bar);
+                    if (current != null)
+                        ProcessTrailing(current);
+                }
+                catch (Exception ex) { if (EnableLogging) DebugLog.W("RM/TRAIL", $"ProcessTrailing invocation EX: {ex.Message}"); }
+            }
         }
 
         protected override void OnOrderChanged(Order order)
@@ -1704,6 +1768,30 @@ namespace MyAtas.Strategies
                 }
                 if (comment.StartsWith(OwnerPrefix))
                 {
+                    // Tracking del STOP RM para trailing: guardar precio y riesgo cuando el SL pasa a Placed/Active
+                    var isRmOrder = true;
+                    var isSl = comment.StartsWith(OwnerPrefix + "SL:");
+                    if (isRmOrder && isSl)
+                    {
+                        if (st == OrderStatus.Placed || st == OrderStatus.PartlyFilled)
+                        {
+                            // Capturar trigger price (órdenes Stop usan TriggerPrice, no Price)
+                            var trig = 0m;
+                            try { trig = Convert.ToDecimal(order.TriggerPrice); } catch { /* reflection-safe */ }
+                            _lastKnownStopPx = (trig > 0m ? trig : order.Price);
+                            // Si aún no capturamos el riesgo inicial, hazlo ahora
+                            if (_trailRiskAbs <= 0m)
+                            {
+                                var entry = _pendingEntryPrice != 0m ? _pendingEntryPrice : _currentPositionEntryPrice;
+                                if (entry > 0m && _lastKnownStopPx > 0m)
+                                {
+                                    _trailRiskAbs = Math.Abs(entry - _lastKnownStopPx);
+                                    TLog("INIT", $"riskAbs={_trailRiskAbs:F2} entry={entry:F2} stop0={_lastKnownStopPx:F2}");
+                                }
+                            }
+                        }
+                    }
+
                     if (EnableLogging) DebugLog.W("RM/ORD", $"OnOrderChanged SKIP: OwnerPrefix detected ({OwnerPrefix})");
                     return;
                 }
@@ -2511,6 +2599,37 @@ namespace MyAtas.Strategies
                     _beArmedAtPrice = _beMaxReached = _beMinReached = 0m;
                 }
 
+                // === TRAILING: armar baseline si está activo ===
+                if (TrailingMode != RmTrailMode.Off)
+                {
+                    try
+                    {
+                        var currentCandle = GetCandle(Math.Max(0, CurrentBar - 1));
+                        var px = currentCandle?.Close ?? entryPx;
+                        _trailArmed = true;
+                        _trailBaselinePx = px;
+                        _trailMaxReached = px;
+                        _trailMinReached = px;
+                        _trailLastStepIdx = -1;
+                        _lastTrailMoveBar = CurrentBar;
+                        TLog("ARMED", $"mode={TrailingMode} base={px:F2} distTicks={TrailDistanceTicks} " +
+                                    $"confirm={TrailConfirmBars} entry={_pendingEntryPrice:F2}/{_currentPositionEntryPrice:F2} " +
+                                    $"stopTracked={_lastKnownStopPx:F2} riskAbs={_trailRiskAbs:F2}");
+                    }
+                    catch
+                    {
+                        _trailArmed = false;
+                        if (EnableLogging) DebugLog.W("RM/TRAIL", "FAILED to arm (exception getting current candle)");
+                    }
+                }
+                else
+                {
+                    _trailArmed = false;
+                    _trailLastStepIdx = -1;
+                    _trailBaselinePx = _trailMaxReached = _trailMinReached = 0m;
+                    _lastTrailMoveBar = -1;
+                }
+
                 _pendingAttach = false;
                 _pendingPrevBarIdxAtFill = -1; // limpiar el ancla para la siguiente entrada
                 if (EnableLogging) DebugLog.W("RM/PLAN", "Attach DONE");
@@ -3055,6 +3174,167 @@ namespace MyAtas.Strategies
             {
                 if (EnableLogging) DebugLog.W("RM/PNL", $"UpdateSessionPnL EX: {ex.Message}");
             }
+        }
+
+        // ====================== TRAILING STOP Processing ======================
+
+        // === Helpers de vela/seguridad ===
+        private IndicatorCandle SafeGetCandle(int idx)
+        {
+            if (idx < 0) return null;
+            try { return GetCandle(idx); }
+            catch { return null; }
+        }
+
+        private bool TryGetCurrentStop(out decimal stopPx)
+        {
+            // En este archivo no existe GetAttachedStopPriceSafe(); mantenemos nuestro tracking.
+            stopPx = _lastKnownStopPx;
+            if (stopPx <= 0m) { TLog("GATE", "STOP-READ-FAIL lastKnown=0"); return false; }
+            TLog("READ", $"STOP={stopPx:F2}");
+            return true;
+        }
+
+        // Calcula precio objetivo por múltiplo de R usando el riesgo capturado al poner el primer SL.
+        private decimal CalcTargetPriceByR(decimal entry, int dir, decimal rMultiple)
+        {
+            if (_trailRiskAbs <= 0m || entry <= 0m || dir == 0) return 0m;
+            var delta = rMultiple * _trailRiskAbs;
+            return dir > 0 ? entry + delta : entry - delta;
+        }
+
+        private (decimal tp1, decimal tp2, decimal tp3) GetTpPricesForR()
+        {
+            var entry = _pendingEntryPrice != 0m ? _pendingEntryPrice : _currentPositionEntryPrice;
+            var dir   = Math.Sign(_currentPositionQty != 0 ? _currentPositionQty : _beDirHint);
+            if (entry == 0m || dir == 0) { TLog("GATE", $"TP-PRICES sin entry/dir (e={entry:F2}, dir={dir})"); return (0m,0m,0m); }
+
+            var t  = Targets;
+            var r1 = Math.Max(0.0000001m, t?.TP1?.R ?? 1m);
+            var r2 = Math.Max(0m,           t?.TP2?.R ?? 0m);
+            var r3 = Math.Max(0m,           t?.TP3?.R ?? 0m);
+
+            var p1 = CalcTargetPriceByR(entry, dir, r1);
+            var p2 = r2 > 0m ? CalcTargetPriceByR(entry, dir, r2) : 0m;
+            var p3 = r3 > 0m ? CalcTargetPriceByR(entry, dir, r3) : 0m;
+            TLog("TP", $"R: {r1:F2}/{r2:F2}/{r3:F2}  Px: {p1:F2}/{p2:F2}/{p3:F2}  risk={_trailRiskAbs:F2}");
+            return (p1,p2,p3);
+        }
+
+        private int GetHighestTouchedStepForDir(int dir)
+        {
+            var (tp1, tp2, tp3) = GetTpPricesForR();
+            int touched = -1;
+            if (tp1 == 0m) return -1;
+            if (dir > 0) {
+                if (_trailMaxReached >= tp1) touched = 1;
+                if (tp2 > 0m && _trailMaxReached >= tp2) touched = 2;
+                if (tp3 > 0m && _trailMaxReached >= tp3) touched = 3;
+            } else if (dir < 0) {
+                if (_trailMinReached <= tp1) touched = 1;
+                if (tp2 > 0m && _trailMinReached <= tp2) touched = 2;
+                if (tp3 > 0m && _trailMinReached <= tp3) touched = 3;
+            }
+            TLog("STEP", $"dir={(dir>0?"LONG":"SHORT")} touched={touched} last={_trailLastStepIdx} " +
+                         $"max={_trailMaxReached:F2} min={_trailMinReached:F2}");
+            return touched;
+        }
+
+        private decimal TickSizeDec => Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+        private decimal AddTicks(decimal price, int ticks, int sign) => price + (ticks * sign) * TickSizeDec;
+        private bool BetterForLong(decimal newStop, decimal currStop) => newStop > currStop + 0.0000001m;
+        private bool BetterForShort(decimal newStop, decimal currStop) => newStop < currStop - 0.0000001m;
+
+        private void ProcessTrailing(IndicatorCandle current)
+        {
+            if (TrailingMode == RmTrailMode.Off) { TLog("GATE", "MODE=Off"); return; }
+            if (!_trailArmed) { TLog("GATE", "NOT-ARMED"); return; }
+            // En este archivo no hay deferral de fills; gate omitido.
+            if (_currentPositionQty == 0) { TLog("GATE", "FLAT"); return; }
+            if (_lastTrailMoveBar == CurrentBar) { TLog("GATE", "RATE-LIMIT one-move-per-bar"); return; }
+
+            var dir = Math.Sign(_currentPositionQty);
+            if (dir == 0) { TLog("GATE", "DIR=0"); return; }
+
+            if (!TryGetCurrentStop(out var currStop)) return;
+
+            decimal newStop = 0m;
+            string  reason  = null;
+
+            if (TrailingMode == RmTrailMode.TpToTp)
+            {
+                var touched = GetHighestTouchedStepForDir(dir);
+                if (touched <= _trailLastStepIdx) { TLog("GATE", $"NO-NEW-STEP touched={touched} last={_trailLastStepIdx}"); return; }
+
+                var (tp1, tp2, tp3) = GetTpPricesForR();
+                var entryPx = _pendingEntryPrice != 0m ? _pendingEntryPrice : _currentPositionEntryPrice;
+                var ts = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+
+                if (touched == 1)
+                {
+                    // Primer salto: mover al BE con su offset
+                    newStop = ComputeBePrice(dir, entryPx, ts);
+                    reason  = $"TpToTp step=1 → BE (offset={BeOffsetTicks})";
+                }
+                else if (touched == 2)
+                {
+                    newStop = dir > 0 ? AddTicks(tp1, TrailDistanceTicks, -1)
+                                      : AddTicks(tp1, TrailDistanceTicks, +1);
+                    reason  = $"TpToTp step=2 ref={tp1:F2}";
+                }
+                else if (touched == 3)
+                {
+                    newStop = dir > 0 ? AddTicks(tp2, TrailDistanceTicks, -1)
+                                      : AddTicks(tp2, TrailDistanceTicks, +1);
+                    reason  = $"TpToTp step=3 ref={tp2:F2}";
+                }
+
+                if (newStop > 0m)
+                {
+                    TLog("CALC", $"TpToTp step={touched} newStop={newStop:F2} reason={reason}");
+                }
+                _trailLastStepIdx = touched;
+            }
+            else if (TrailingMode == RmTrailMode.BarByBar)
+            {
+                if (TrailConfirmBars < 1) { TLog("GATE", "BarByBar confirm<1"); return; }
+                decimal anchor;
+                if (dir > 0)
+                {
+                    anchor = decimal.MaxValue;
+                    for (int i = 1; i <= TrailConfirmBars; i++)
+                    {
+                        var c = SafeGetCandle(CurrentBar - i);
+                        if (c == null) break;
+                        anchor = Math.Min(anchor, c.Low);
+                    }
+                    newStop = AddTicks(anchor, TrailDistanceTicks, -1);
+                }
+                else
+                {
+                    anchor = decimal.MinValue;
+                    for (int i = 1; i <= TrailConfirmBars; i++)
+                    {
+                        var c = SafeGetCandle(CurrentBar - i);
+                        if (c == null) break;
+                        anchor = Math.Max(anchor, c.High);
+                    }
+                    newStop = AddTicks(anchor, TrailDistanceTicks, +1);
+                }
+                reason = $"BarByBar N={TrailConfirmBars} anchor={anchor:F2}";
+                TLog("CALC", $"{reason} dist={TrailDistanceTicks} newStop={newStop:F2}");
+            }
+
+            if (newStop <= 0m) { TLog("GATE", "newStop<=0"); return; }
+
+            bool isBetter = dir > 0 ? BetterForLong(newStop, currStop)
+                                    : BetterForShort(newStop, currStop);
+            if (!isBetter) { TLog("KEEP", $"no-better curr={currStop:F2} cand={newStop:F2}"); return; }
+
+            TLog("MOVE", $"from={currStop:F2} to={newStop:F2} dir={(dir>0?"LONG":"SHORT")} reason={reason}");
+            // En este archivo TryModifyStopInPlace(Order,px) no sirve; usa el wrapper existente:
+            MoveAllRmStopsTo(newStop, reason ?? "TRAIL");
+            _lastTrailMoveBar = CurrentBar;
         }
 
         private void TrackPositionClose(decimal exitPrice, int qty, int direction)
