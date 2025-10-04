@@ -429,12 +429,15 @@ namespace MyAtas.Strategies
         [Category("Position Sizing"), DisplayName("Risk % of account")]
         public decimal RiskPercentOfAccount { get; set; } = 0.5m;
 
+        [Browsable(false)]
         [Category("Position Sizing"), DisplayName("Default stop (ticks)")]
         public int DefaultStopTicks { get; set; } = 12;
 
+        [Browsable(false)]
         [Category("Position Sizing"), DisplayName("Fallback tick size")]
         public decimal FallbackTickSize { get; set; } = 0.25m;
 
+        [Browsable(false)]
         [Category("Position Sizing"), DisplayName("Fallback tick value (USD)")]
         public decimal FallbackTickValueUsd { get; set; } = 12.5m;
 
@@ -459,10 +462,67 @@ namespace MyAtas.Strategies
         public decimal AccountEquityOverride { get; set; } = 0m;
 
         // === Session P&L Tracking ===
-        [Category("Position Sizing"), DisplayName("Session P&L (USD)")]
+        [Category("Diagnostics/Session stats"), DisplayName("Session P&L (USD)")]
         [System.ComponentModel.ReadOnly(true)]
         [Description("Ganancia/pérdida acumulada desde que se activó la estrategia. Se resetea al desactivar.")]
         public decimal SessionPnL { get; private set; } = 0m;
+
+        // ===== Session Stats (UI) =====
+        [Category("Diagnostics/Session stats"), DisplayName("Win trades"), System.ComponentModel.ReadOnly(true)]
+        public int WinTrades => _wins;
+        [Category("Diagnostics/Session stats"), DisplayName("Loss trades"), System.ComponentModel.ReadOnly(true)]
+        public int LossTrades => _losses;
+        [Category("Diagnostics/Session stats"), DisplayName("Breakeven trades"), System.ComponentModel.ReadOnly(true)]
+        public int BreakevenTrades => _breakevens;
+
+        [Category("Diagnostics/Session stats"), DisplayName("Win rate (%)"), System.ComponentModel.ReadOnly(true)]
+        public decimal WinRatePct => (WinTrades + LossTrades) > 0
+            ? Math.Round(100m * WinTrades / (WinTrades + LossTrades), 2)
+            : 0m;
+
+        [Category("Diagnostics/Session stats"), DisplayName("Best trade (USD)"), System.ComponentModel.ReadOnly(true)]
+        public decimal BestTradeUsd => _bestTrade;
+        [Category("Diagnostics/Session stats"), DisplayName("Worst trade (USD)"), System.ComponentModel.ReadOnly(true)]
+        public decimal WorstTradeUsd => _worstTrade;
+
+        [Category("Diagnostics/Session stats"), DisplayName("Avg trade (USD)"), System.ComponentModel.ReadOnly(true)]
+        public decimal AvgTradeUsd => (WinTrades + LossTrades + BreakevenTrades) > 0
+            ? Math.Round(_sumTradeUsd / (WinTrades + LossTrades + BreakevenTrades), 2)
+            : 0m;
+
+        [Category("Diagnostics/Session stats"), DisplayName("Expectancy / trade (USD)"), System.ComponentModel.ReadOnly(true)]
+        public decimal ExpectancyUsd
+        {
+            get
+            {
+                var wins = WinTrades; var losses = LossTrades;
+                if (wins + losses == 0) return 0m;
+                var avgWin  = wins   > 0 ? (_sumWinsUsd  / wins)   : 0m;
+                var avgLoss = losses > 0 ? (_sumLossUsd / losses)  : 0m;
+                var p       = WinRatePct / 100m;
+                return Math.Round(p * avgWin - (1m - p) * Math.Abs(avgLoss), 2);
+            }
+        }
+
+        [Category("Diagnostics/Session stats"), DisplayName("Max drawdown (USD)"), System.ComponentModel.ReadOnly(true)]
+        public decimal MaxDrawdownUsd { get; private set; } = 0m;
+
+        [Category("Diagnostics/Session stats"), DisplayName("LONG P&L (USD)"), System.ComponentModel.ReadOnly(true)]
+        public decimal LongPnL { get => _longPnL; private set => _longPnL = value; }
+        [Category("Diagnostics/Session stats"), DisplayName("SHORT P&L (USD)"), System.ComponentModel.ReadOnly(true)]
+        public decimal ShortPnL { get => _shortPnL; private set => _shortPnL = value; }
+
+        [Category("Diagnostics/Session stats"), DisplayName("Total R (∑R)"), System.ComponentModel.ReadOnly(true)]
+        public decimal TotalR => Math.Round(_totalR, 2);
+        [Category("Diagnostics/Session stats"), DisplayName("Avg R / trade"), System.ComponentModel.ReadOnly(true)]
+        public decimal AvgR => (WinTrades + LossTrades + BreakevenTrades) > 0
+            ? Math.Round(_totalR / (WinTrades + LossTrades + BreakevenTrades), 3)
+            : 0m;
+
+        [Category("Diagnostics/Session stats"), DisplayName("Avg hold (s)"), System.ComponentModel.ReadOnly(true)]
+        public int AvgHoldSeconds => (WinTrades + LossTrades + BreakevenTrades) > 0
+            ? (int)Math.Round(_sumHold.TotalSeconds / (WinTrades + LossTrades + BreakevenTrades))
+            : 0;
 
         [Category("Position Sizing"), DisplayName("Tick value overrides (SYM=V;...)")]
         public string TickValueOverrides { get; set; } = "MNQ=0.5;NQ=5;MES=1.25;ES=12.5;MGC=1;GC=10";
@@ -608,6 +668,11 @@ namespace MyAtas.Strategies
 
             int curTicks = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - overrideStopPx.Value) / tickSize));
             int minTicks = ComputeVolatilityTicks(VolFloorWindow, VolFloorMetric, tickSize);
+
+            if (EnableLogging)
+                DebugLog.W("RM/VOLFLOOR", $"CHECK: usedN={usedN} curTicks={curTicks} minTicks={minTicks} " +
+                    $"window={VolFloorWindow} metric={VolFloorMetric} factor={VolFloorFactor}");
+
             if (minTicks <= 0 || curTicks >= minTicks) return;
 
             // Ensanchar desde la entrada hasta cumplir minTicks
@@ -617,8 +682,7 @@ namespace MyAtas.Strategies
 
             if (EnableLogging)
                 DebugLog.W("RM/VOLFLOOR",
-                    $"ENFORCED: usedN={usedN} window={VolFloorWindow} metric={VolFloorMetric} factor={VolFloorFactor} " +
-                    $"curTicks={curTicks} → minTicks={minTicks} newSL={overrideStopPx.Value:F2}");
+                    $"ENFORCED: curTicks={curTicks} → minTicks={minTicks} newSL={overrideStopPx.Value:F2}");
         }
 
         [Browsable(false)] public int PresetTPs { get; set; } = 2;
@@ -641,6 +705,35 @@ namespace MyAtas.Strategies
         [Category("Stops & TPs"), DisplayName("Prev-bar offset side")]
         [Description("Outside: fuera del extremo (mÃƒÂ¡s allÃƒÂ¡ del High/Low). Inside: dentro del rango de la vela.")]
         public RmPrevBarOffsetSide PrevBarOffsetSide { get; set; } = RmPrevBarOffsetSide.Outside;
+
+        [Category("Stops & TPs"), DisplayName("N-1 debe coincidir con la dirección de entrada")]
+        [Description("Si activo, N-1 solo se usa si su color coincide con la dirección (LONG→verde, SHORT→rojo). Evita usar barras contra-tendencia.")]
+        public bool PrevBarMustMatchEntryDir { get; set; } = true;
+
+        [Browsable(false)]
+        public int CounterTrendExtraOffsetTicks { get; set; } = 0;
+
+        // Grupo para offset extra en contra-tendencia (ancla N)
+        [TypeConverter(typeof(ExpandableObjectConverter))]
+        public class CounterTrendGroup
+        {
+            private readonly RiskManagerManualStrategy _o;
+            public CounterTrendGroup(RiskManagerManualStrategy o) => _o = o;
+
+            [DisplayName("Offset adicional (ticks)")]
+            [Description("Ticks extra añadidos al SL cuando se usa ancla N (entrada contra-tendencia).")]
+            public int OffsetTicks
+            {
+                get => _o.CounterTrendExtraOffsetTicks;
+                set => _o.CounterTrendExtraOffsetTicks = Math.Max(0, value);
+            }
+            public override string ToString() => OffsetTicks > 0 ? $"{OffsetTicks} ticks" : "sin extra";
+        }
+
+        private CounterTrendGroup _ctUI;
+        [Category("Stops & TPs"), DisplayName("Contratendencia (ancla N)")]
+        [DesignerSerializationVisibility(DesignerSerializationVisibility.Content)]
+        public CounterTrendGroup CounterTrend => _ctUI ??= new CounterTrendGroup(this);
 
         [Browsable(false)]
         public bool VolFloorEnabled { get; set; } = false;
@@ -758,6 +851,21 @@ namespace MyAtas.Strategies
         private decimal _currentPositionEntryPrice = 0m;  // Precio promedio de entrada actual
         private int _currentPositionQty = 0;  // Cantidad de posición actual (signed: +LONG / -SHORT)
         private decimal _sessionRealizedPnL = 0m;  // P&L realizado acumulado desde activación
+
+        // ===== Session Stats (privado) =====
+        private int    _wins = 0, _losses = 0, _breakevens = 0;
+        private int    _winsLong = 0, _winsShort = 0;
+        private decimal _bestTrade = 0m, _worstTrade = 0m;
+        private decimal _sumTradeUsd = 0m;
+        private decimal _realizedCurvePeak = 0m; // equity realizada desde el arranque de sesión
+        private decimal _sessionRealizedUsd = 0m; // acumulado realizado (para curva y drawdown)
+        private decimal _longPnL = 0m, _shortPnL = 0m;
+        private decimal _totalR = 0m, _lastEntryRiskUsd = 0m;
+        private DateTime _lastEntryTimeUtc = DateTime.MinValue;
+        private TimeSpan _sumHold = TimeSpan.Zero;
+        // Para calcular riesgo inicial, tomamos el SL del último plan armado
+        private decimal _lastPlannedStopPrice = 0m;
+        private decimal _sumWinsUsd = 0m, _sumLossUsd = 0m;
 
         private decimal ComputeBePrice(int dir, decimal entryPx, decimal tickSize)
         {
@@ -1662,25 +1770,39 @@ namespace MyAtas.Strategies
                 // Anclar la "prev-bar" en el instante del fill (N-1 respecto a la barra visible ahora)
                 try
                 {
-                    // Capturar N-1; si no existe, N (intravela)
-                    var prevIdx = CurrentBar > 1 ? (CurrentBar - 2) : (CurrentBar - 1);
-                    _pendingPrevBarIdxAtFill = Math.Max(0, prevIdx);
+                    var curBar  = CurrentBar;
+                    var prevBar = CurrentBar - 1;
+                    var cur  = prevBar >= 0 ? GetCandle(prevBar) : null;  // N (CurrentBar-1 es la barra de fill)
+                    var prev = CurrentBar > 1 ? GetCandle(CurrentBar - 2) : null;  // N-1
 
-                    var anchor = GetCandle(_pendingPrevBarIdxAtFill);
-                    if (anchor == null)
-                    {
-                        _pendingAnchorBarAtFill = Math.Max(0, CurrentBar - 1); // fallback N
-                        anchor = GetCandle(_pendingAnchorBarAtFill);
-                    }
-                    else
-                    {
-                        _pendingAnchorBarAtFill = _pendingPrevBarIdxAtFill;
-                    }
+                    bool prevExists   = prev != null;
+                    bool prevSameDir  = prevExists && (
+                        (_pendingDirHint > 0 && prev.Close > prev.Open) ||   // LONG → N-1 debe ser alcista
+                        (_pendingDirHint < 0 && prev.Close < prev.Open)      // SHORT → N-1 debe ser bajista
+                    );
+                    bool geometricOk  = prevExists && cur != null && (
+                        (_pendingDirHint > 0 && prev.Low  < cur.Low) ||
+                        (_pendingDirHint < 0 && prev.High > cur.High)
+                    );
+
+                    // Solo usamos N-1 si (existe) y (pasa la geometría) y
+                    // (o bien no exigimos coincidencia de color o coincide el color)
+                    bool canUsePrev = prevExists && geometricOk &&
+                                      (!PrevBarMustMatchEntryDir || prevSameDir);
+
+                    // Ancla definitiva
+                    int anchorBar = canUsePrev ? (CurrentBar - 2) : (CurrentBar - 1);
+                    _pendingPrevBarIdxAtFill = CurrentBar - 2;  // siempre guardamos dónde estaría N-1
+                    _pendingAnchorBarAtFill  = anchorBar;
+
+                    var anchor = GetCandle(anchorBar);
                     _pendingAnchorHigh = anchor?.High ?? 0m;
                     _pendingAnchorLow  = anchor?.Low  ?? 0m;
 
                     if (EnableLogging)
-                        DebugLog.W("RM/STOPMODE", $"Anchor captured at fill: bar={_pendingAnchorBarAtFill} high={_pendingAnchorHigh:F2} low={_pendingAnchorLow:F2} (curBar={CurrentBar})");
+                        DebugLog.W("RM/STOPMODE", $"Anchor captured at fill: {(canUsePrev ? "N-1" : "N")} bar={_pendingAnchorBarAtFill} " +
+                            $"high={_pendingAnchorHigh:F2} low={_pendingAnchorLow:F2} dir={(_pendingDirHint > 0 ? "LONG" : "SHORT")} " +
+                            $"prevSameDir={prevSameDir} geomOk={geometricOk} (curBar={CurrentBar})");
                 }
                 catch
                 {
@@ -1895,6 +2017,14 @@ namespace MyAtas.Strategies
                 _currentPositionQty = 0;
                 _sessionRealizedPnL = 0m;
                 SessionPnL = 0m;
+
+                // ===== Reset Session Stats =====
+                _wins = _losses = _breakevens = _winsLong = _winsShort = 0;
+                _bestTrade = 0m; _worstTrade = 0m; _sumTradeUsd = 0m;
+                _sessionRealizedUsd = 0m; _realizedCurvePeak = 0m; MaxDrawdownUsd = 0m;
+                _longPnL = 0m; _shortPnL = 0m; _totalR = 0m;
+                _sumWinsUsd = 0m; _sumLossUsd = 0m; _sumHold = TimeSpan.Zero;
+                _lastEntryRiskUsd = 0m; _lastPlannedStopPrice = 0m; _lastEntryTimeUtc = DateTime.MinValue;
             }
             catch { }
         }
@@ -1903,29 +2033,33 @@ namespace MyAtas.Strategies
         private (decimal Price, string Debug) ComputeStructureStopPx(int dir, decimal tickSize)
         {
             var outside     = PrevBarOffsetSide == RmPrevBarOffsetSide.Outside;
-            var offsetTicks = Math.Max(0, PrevBarOffsetTicks);
-            var offset      = offsetTicks * tickSize;
 
             // Si por algún motivo no hay ancla, reintenta: N-1 si existe, si no N
             decimal hi = _pendingAnchorHigh, lo = _pendingAnchorLow;
+            int anchorBar = _pendingAnchorBarAtFill;
             if (hi <= 0m && lo <= 0m)
             {
                 int idx = CurrentBar > 1 ? (CurrentBar - 2) : Math.Max(0, CurrentBar - 1);
                 var c = GetCandle(idx);
                 hi = c?.High ?? 0m;
                 lo = c?.Low  ?? 0m;
+                anchorBar = idx;
                 _pendingAnchorBarAtFill = idx;
             }
 
-            decimal rawSL;
-            if (dir > 0) // LONG → detrás del LOW de la ancla
-                rawSL = outside ? (lo - offset) : (lo + offset);
-            else         // SHORT → detrás del HIGH de la ancla
-                rawSL = outside ? (hi + offset) : (hi - offset);
+            // Determinar si estamos usando ancla N (contra-tendencia)
+            bool isAnchorN = (anchorBar >= CurrentBar - 1);
+            int ctExtra = isAnchorN ? CounterTrendExtraOffsetTicks : 0;
+            int totalOffset = Math.Max(0, PrevBarOffsetTicks) + ctExtra;
 
-            var px = ShrinkPrice(rawSL);
-            var dbg = $"anchorBar={_pendingAnchorBarAtFill} hi={hi:F2} lo={lo:F2} offTicks={offsetTicks} side={PrevBarOffsetSide} -> SL={px:F2}";
-            return (px, dbg);
+            decimal extreme = dir > 0 ? lo : hi;
+            decimal structSl = dir > 0
+                ? ShrinkPrice(extreme - totalOffset * tickSize)   // LONG: por debajo de la mecha
+                : ShrinkPrice(extreme + totalOffset * tickSize);  // SHORT: por encima de la mecha
+
+            var dbg = $"anchor={(isAnchorN ? "N" : "N-1")} offBase={PrevBarOffsetTicks} ctExtra={ctExtra} " +
+                      $"totalOff={totalOffset} → SL={structSl:F2}";
+            return (structSl, dbg);
         }
 
         private void TryAttachBracketsNow()
@@ -2098,15 +2232,6 @@ namespace MyAtas.Strategies
                         DebugLog.W("RM/STOPMODE", $"Active={StopPlacementMode} prevIdxAtFill={_pendingPrevBarIdxAtFill} offTicks={PrevBarOffsetTicks} side={PrevBarOffsetSide}");
                     if (StopPlacementMode == RmStopPlacement.PrevBarOppositeExtreme)
                     {
-                        // justo donde calculas el SL estructural, antes del STRUCT SL:
-                        if (EnableLogging)
-                        {
-                            var anchorBar = _pendingAnchorBarAtFill;
-                            var prevIdxAtFill = _pendingPrevBarIdxAtFill;
-                            DebugLog.W("RM/STOPMODE", $"ANCHOR CHOSEN: {(anchorBar == CurrentBar ? "N" : "N-1")} " +
-                                $"curBar={CurrentBar} anchorBar={anchorBar} prevIdxAtFill={prevIdxAtFill} offTicks={PrevBarOffsetTicks} side={PrevBarOffsetSide}");
-                        }
-
                         var (slPx, dbg) = ComputeStructureStopPx(dir, Convert.ToDecimal(tickSize));
                         overrideStopPx  = slPx;
                         approxStopTicks = Math.Max(1, (int)Math.Round(Math.Abs(entryPx - slPx) / tickSize));
@@ -2226,6 +2351,9 @@ namespace MyAtas.Strategies
                 // Sustituir TPs en plan
                 if (safeTps.Count > 0)
                     plan = new MyAtas.Risk.Models.RiskPlan(plan.TotalQty, plan.StopLoss, safeTps, plan.OcoPolicy, plan.Reason + " [TP-safe]");
+
+                // Guardar stop del plan final para stats de R
+                _lastPlannedStopPrice = plan.StopLoss?.Price ?? 0m;
 
                 // ===== "LA UI MANDA": Si EnforceManualQty está activo, usar ManualQty =====
                 var manualTarget = Math.Max(MinQty, ManualQty);
@@ -2969,38 +3097,51 @@ namespace MyAtas.Strategies
             try
             {
                 if (_currentPositionQty == 0 || _currentPositionEntryPrice == 0m)
-                {
-                    if (EnableLogging) DebugLog.W("RM/PNL", "TrackPositionClose: No position tracked to close");
-                    return;
-                }
+                { if (EnableLogging) DebugLog.W("RM/PNL", "TrackPositionClose: No position tracked to close"); return; }
 
                 var tickValue = ResolveTickValueUSD();
-                var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+                var tickSize  = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
 
-                // Calcular P&L de la posición cerrada
-                // Para LONG: P&L = (ExitPrice - EntryPrice) × Qty × (TickValue / TickSize)
-                // Para SHORT: P&L = (EntryPrice - ExitPrice) × Qty × (TickValue / TickSize)
-                var priceDiff = direction > 0 ? (exitPrice - _currentPositionEntryPrice) : (_currentPositionEntryPrice - exitPrice);
-                var ticks = priceDiff / tickSize;
-                var tradePnL = ticks * tickValue * Math.Abs(qty);
+                // P&L del fill
+                var priceDiff = direction > 0 ? (exitPrice - _currentPositionEntryPrice)
+                                              : (_currentPositionEntryPrice - exitPrice);
+                var ticks     = priceDiff / tickSize;
+                var tradePnL  = ticks * tickValue * Math.Abs(qty);
 
+                // Realized de la sesión
                 _sessionRealizedPnL += tradePnL;
 
-                if (EnableLogging)
-                    DebugLog.W("RM/PNL", $"Position close: Entry={_currentPositionEntryPrice:F2} Exit={exitPrice:F2} Qty={qty} Dir={direction} → P&L={tradePnL:F2} (Total Realized={_sessionRealizedPnL:F2})");
+                // ===== MÉTRICAS =====
+                _sessionRealizedUsd += tradePnL;
+                _sumTradeUsd        += tradePnL;
+                if (tradePnL > _bestTrade)  _bestTrade  = tradePnL;
+                if (tradePnL < _worstTrade) _worstTrade = tradePnL;
 
-                // Actualizar posición actual
+                if (tradePnL > 0m) { _wins++; _sumWinsUsd += tradePnL; if (direction > 0) _winsLong++; else if (direction < 0) _winsShort++; }
+                else if (tradePnL < 0m) { _losses++; _sumLossUsd += tradePnL; }
+                else { _breakevens++; }
+
+                if (direction > 0) LongPnL  += tradePnL; else if (direction < 0) ShortPnL += tradePnL;
+                if (_lastEntryRiskUsd > 0m) _totalR += tradePnL / _lastEntryRiskUsd;
+                if (_lastEntryTimeUtc != DateTime.MinValue) _sumHold += (DateTime.UtcNow - _lastEntryTimeUtc);
+                _lastEntryTimeUtc = DateTime.MinValue;
+                _lastEntryRiskUsd = 0m;
+
+                _realizedCurvePeak = Math.Max(_realizedCurvePeak, _sessionRealizedUsd);
+                var dd = _realizedCurvePeak - _sessionRealizedUsd;
+                if (dd > MaxDrawdownUsd) MaxDrawdownUsd = dd;
+
+                if (EnableLogging)
+                    DebugLog.W("RM/STATS", $"CLOSED dir={(direction>0?"LONG":"SHORT")} pnl={tradePnL:F2} " +
+                                            $"wins={_wins} losses={_losses} WR={WinRatePct:F2}% maxDD={MaxDrawdownUsd:F2} ∑R={_totalR:F3}");
+
+                // Reducir qty trackeada
                 _currentPositionQty = Math.Abs(_currentPositionQty) - Math.Abs(qty);
                 if (_currentPositionQty == 0)
-                {
-                    _currentPositionEntryPrice = 0m;
-                    if (EnableLogging) DebugLog.W("RM/PNL", "Position fully closed");
-                }
+                { _currentPositionEntryPrice = 0m; if (EnableLogging) DebugLog.W("RM/PNL", "Position fully closed"); }
             }
             catch (Exception ex)
-            {
-                if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionClose EX: {ex.Message}");
-            }
+            { if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionClose EX: {ex.Message}"); }
         }
 
         private void TrackPositionEntry(decimal entryPrice, int qty, int direction)
@@ -3009,26 +3150,30 @@ namespace MyAtas.Strategies
             {
                 if (_currentPositionQty == 0)
                 {
-                    // Nueva posición
                     _currentPositionEntryPrice = entryPrice;
-                    _currentPositionQty = qty * direction;  // signed: +LONG / -SHORT
-                    if (EnableLogging)
-                        DebugLog.W("RM/PNL", $"Position entry: Price={entryPrice:F2} Qty={qty} Dir={direction} → Tracking started");
+                    _currentPositionQty = qty * direction;
+                    if (EnableLogging) DebugLog.W("RM/PNL", $"Position entry: Price={entryPrice:F2} Qty={qty} Dir={direction} → Tracking started");
                 }
                 else
                 {
-                    // Incremento de posición existente (promedio ponderado)
                     var totalQty = Math.Abs(_currentPositionQty) + Math.Abs(qty);
                     _currentPositionEntryPrice = (_currentPositionEntryPrice * Math.Abs(_currentPositionQty) + entryPrice * Math.Abs(qty)) / totalQty;
                     _currentPositionQty = totalQty * direction;
-                    if (EnableLogging)
-                        DebugLog.W("RM/PNL", $"Position add: NewEntry={entryPrice:F2} Qty={qty} → AvgEntry={_currentPositionEntryPrice:F2} TotalQty={totalQty}");
+                    if (EnableLogging) DebugLog.W("RM/PNL", $"Position add: NewEntry={entryPrice:F2} Qty={qty} → AvgEntry={_currentPositionEntryPrice:F2} TotalQty={totalQty}");
                 }
+                // Riesgo inicial (USD) y timestamp
+                try
+                {
+                    var tickSize  = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+                    var tickValue = ResolveTickValueUsd(Security?.ToString() ?? "", TickValueOverrides, FallbackTickValueUsd);
+                    var riskPerContractUsd = Math.Abs(entryPrice - _lastPlannedStopPrice) / Math.Max(0.0000001m, tickSize) * tickValue;
+                    _lastEntryRiskUsd = Math.Max(0m, riskPerContractUsd * Math.Max(1, qty));
+                    _lastEntryTimeUtc = DateTime.UtcNow;
+                }
+                catch { _lastEntryRiskUsd = 0m; _lastEntryTimeUtc = DateTime.UtcNow; }
             }
             catch (Exception ex)
-            {
-                if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionEntry EX: {ex.Message}");
-            }
+            { if (EnableLogging) DebugLog.W("RM/PNL", $"TrackPositionEntry EX: {ex.Message}"); }
         }
 
     }
