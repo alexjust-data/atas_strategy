@@ -396,6 +396,122 @@ namespace MyAtas.Strategies
         }
     }
 
+    // =================== LADDER ADVANCED UI ===================
+    [Serializable]
+    public class LadderRow : INotifyPropertyChanged
+    {
+        public event PropertyChangedEventHandler PropertyChanged;
+        void OnChanged(string n) => PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(n));
+
+        private bool _active = true;
+        private decimal _r = 1m;
+        private int _percent = 0;
+
+        [DisplayName("Activo")]
+        public bool Active { get => _active; set { if (_active==value) return; _active=value; OnChanged(nameof(Active)); } }
+
+        [DisplayName("R")]
+        public decimal R { get => _r; set { if (_r==value) return; _r=value; OnChanged(nameof(R)); } }
+
+        [DisplayName("% a cerrar")]
+        public int Percent { get => _percent; set { if (_percent==value) return; _percent=value; OnChanged(nameof(Percent)); } }
+    }
+
+    [Serializable]
+    [TypeConverter(typeof(ExpandableObjectConverter))]
+    public class LadderModel
+    {
+        public BindingList<LadderRow> Rows { get; set; } = new BindingList<LadderRow>();
+        public override string ToString()
+        {
+            if (Rows == null || Rows.Count == 0) return "— desactivado —";
+            var act = Rows.Where(r => r.Active && r.R > 0m).OrderBy(r => r.R).ToList();
+            if (act.Count == 0) return "— sin filas activas —";
+            return $"Ladder: {act.Count} escalones";
+        }
+        public List<LadderRow> ActiveOrdered(bool includeZeroPercents = true)
+        {
+            if (Rows == null) return new List<LadderRow>();
+            var q = Rows.Where(r => r.Active && r.R > 0m);
+            if (!includeZeroPercents) q = q.Where(r => r.Percent > 0);
+            return q.OrderBy(r => r.R).ToList();
+        }
+        public void NormalizePercentsOnActive()
+        {
+            var act = ActiveOrdered(includeZeroPercents:false);
+            if (act.Count == 0) return;
+            var sum = act.Sum(x => x.Percent);
+            if (sum == 100) return;
+            for (int i=0;i<act.Count;i++)
+                act[i].Percent = (int)Math.Max(0, Math.Round(100m * act[i].Percent / Math.Max(1,sum)));
+            var diff = 100 - act.Sum(x=>x.Percent);
+            act[^1].Percent = Math.Max(1, act[^1].Percent + diff);
+        }
+    }
+
+    public class LadderEditor : UITypeEditor
+    {
+        public override UITypeEditorEditStyle GetEditStyle(ITypeDescriptorContext context) => UITypeEditorEditStyle.Modal;
+        public override object EditValue(ITypeDescriptorContext context, IServiceProvider provider, object value)
+        {
+            var edSvc = provider?.GetService(typeof(IWindowsFormsEditorService)) as IWindowsFormsEditorService;
+            if (edSvc == null) return value;
+            var model = value as LadderModel ?? new LadderModel();
+            using (var form = new LadderEditorForm(model))
+            {
+                return edSvc.ShowDialog(form) == DialogResult.OK ? form.ResultModel : value;
+            }
+        }
+    }
+
+    public class LadderEditorForm : Form
+    {
+        private DataGridView _grid;
+        private Button _ok, _cancel, _add, _del, _normalize;
+        public LadderModel ResultModel { get; private set; }
+        public LadderEditorForm(LadderModel model)
+        {
+            Text = "Targets ladder (avanzado)";
+            StartPosition = FormStartPosition.CenterParent;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            Width = 640; Height = 420;
+
+            var rows = new BindingList<LadderRow>(model?.Rows?.ToList() ?? new List<LadderRow>());
+            _grid = new DataGridView { Dock = DockStyle.Top, Height = 300, AutoGenerateColumns=false, AllowUserToAddRows=false, AllowUserToOrderColumns=false };
+            _grid.Columns.Add(new DataGridViewCheckBoxColumn { DataPropertyName="Active", HeaderText="Activo", Width=60 });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName="R", HeaderText="R", Width=80 });
+            _grid.Columns.Add(new DataGridViewTextBoxColumn { DataPropertyName="Percent", HeaderText="% a cerrar", Width=120 });
+            _grid.DataSource = new BindingSource { DataSource = rows };
+
+            _add = new Button { Text="+", Left=12, Top=310, Width=40 };
+            _del = new Button { Text="–", Left=58, Top=310, Width=40 };
+            _normalize = new Button { Text="Normalizar %", Left=110, Top=310, Width=120 };
+            _ok = new Button { Text="OK", Left=440, Top=310, Width=80, DialogResult=DialogResult.OK };
+            _cancel = new Button { Text="Cancelar", Left=530, Top=310, Width=80, DialogResult=DialogResult.Cancel };
+
+            _add.Click += (_,__) => { rows.Add(new LadderRow{ Active=true, R=(rows.Count==0?1m: rows.Max(x=>x.R)+1m), Percent=0 }); };
+            _del.Click += (_,__) => { if (_grid.CurrentRow?.DataBoundItem is LadderRow r) rows.Remove(r); };
+            _normalize.Click += (_,__) => {
+                var act = rows.Where(x=>x.Active && x.Percent>0).ToList();
+                if (act.Count==0) return;
+                var sum = act.Sum(x=>x.Percent);
+                for (int i=0;i<act.Count;i++)
+                    act[i].Percent = (int)Math.Max(0, Math.Round(100m*act[i].Percent/Math.Max(1,sum)));
+                var diff = 100 - act.Sum(x=>x.Percent);
+                act[^1].Percent = Math.Max(1, act[^1].Percent + diff);
+                _grid.Refresh();
+            };
+
+            Controls.AddRange(new Control[]{ _grid, _add, _del, _normalize, _ok, _cancel });
+            AcceptButton = _ok; CancelButton = _cancel;
+
+            FormClosing += (s,e) => {
+                if (DialogResult==DialogResult.OK)
+                    ResultModel = new LadderModel{ Rows = new BindingList<LadderRow>(rows.ToList()) };
+            };
+        }
+    }
+
     // Nota: esqueleto "safe". No envÃƒÂ¯Ã‚Â¿Ã‚Â½a ni cancela ÃƒÂ¯Ã‚Â¿Ã‚Â½rdenes.
     public class RiskManagerManualStrategy : ChartStrategy
     {
@@ -511,6 +627,31 @@ namespace MyAtas.Strategies
             }
         }
 
+        // ===== Ladder avanzado =====
+        private LadderModel _ladder;
+
+        [Category("Stops & TPs"), DisplayName("Targets ladder (avanzado)")]
+        [Description("Si contiene filas activas, gobierna hitos (BE/Trailing) y TPs reales con ventana de 3.")]
+        [Editor(typeof(LadderEditor), typeof(UITypeEditor))]
+        public LadderModel TargetsLadder
+        {
+            get => _ladder ??= new LadderModel();
+            set => _ladder = value ?? new LadderModel();
+        }
+
+        [Category("Stops & TPs"), DisplayName("Max concurrent TPs")]
+        [ReadOnly(true)]
+        public int MaxConcurrentTps => 3;
+
+        public enum RmTrailStart { BE, TP1, TPk, Immediately }
+
+        [Category("Trailing"), DisplayName("Trail starts at")]
+        public RmTrailStart TrailStartsAt { get; set; } = RmTrailStart.BE;
+
+        [Category("Trailing"), DisplayName("Trail start index (TPk)")]
+        [Description("Sólo si 'Trail starts at' = TPk. 1 = primer escalón del ladder/targets.")]
+        public int TrailStartIndex { get; set; } = 1;
+
         private void WireTargetsEvents(TargetsModel m)
         {
             if (m == null) return;
@@ -564,6 +705,148 @@ namespace MyAtas.Strategies
             }
             // Fallback: legacy
             return (PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit, "Legacy");
+        }
+
+        // Devuelve hitos (R) y pasos (R,% , virtual) desde Ladder o desde Targets3 si Ladder vacío
+        private (List<decimal> milestonesR, List<(decimal R, int Pct, bool Virtual)> steps, string src)
+            GetMilestonesFromLadderOrTargets()
+        {
+            var ladder = TargetsLadder;
+            if (ladder?.Rows != null && ladder.Rows.Any(r => r.Active && r.R > 0m))
+            {
+                var all = ladder.ActiveOrdered(includeZeroPercents: true);
+                var st = all.Select(x => (x.R, x.Percent, Virtual: x.Percent <= 0)).ToList();
+                return (st.Select(s => s.R).ToList(), st, "Ladder");
+            }
+            // Fallback → 3 targets clásicos
+            var (preset, r1, r2, r3, p1, p2, p3, _) = GetTargetsSnapshot();
+            var s = new List<(decimal, int, bool)>();
+            if (r1 > 0) s.Add((r1, p1, p1 <= 0));
+            if (r2 > 0) s.Add((r2, p2, p2 <= 0));
+            if (r3 > 0) s.Add((r3, p3, p3 <= 0));
+            return (s.Select(t => t.Item1).ToList(), s, "Targets3");
+        }
+
+        // Si no la tienes definida ya, añade esta (entry/stop → precio a R múltiplos)
+        private decimal CalcTargetPriceByR(decimal entry, decimal stop, decimal rMultiple)
+        {
+            if (entry <= 0m || stop <= 0m || rMultiple <= 0m) return 0m;
+            var dir = entry >= stop ? 1 : -1;
+            var risk = Math.Abs(entry - stop);
+            return dir > 0 ? entry + rMultiple * risk : entry - rMultiple * risk;
+        }
+
+        private decimal ShrinkPrice(decimal price)
+        {
+            try
+            {
+                var tickSize = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+                if (tickSize <= 0m) return price;
+                return Math.Round(price / tickSize) * tickSize;
+            }
+            catch { return price; }
+        }
+
+        private bool TryGetCurrentStop(out decimal stopPx)
+        {
+            stopPx = 0m;
+            try
+            {
+                var list = this.Orders;
+                if (list == null) return false;
+                foreach (var o in list)
+                {
+                    var c = o?.Comment ?? "";
+                    if (c.StartsWith(OwnerPrefix + "SL:") && o.Status() == OrderStatus.Placed)
+                    {
+                        stopPx = o.Price;
+                        return true;
+                    }
+                }
+            }
+            catch { }
+            return false;
+        }
+
+        private void ProcessTrailing()
+        {
+            if (TrailingMode != RmTrailMode.TpToTp) return;
+            if (_ladderSteps == null || _ladderEntryPx <= 0m || _ladderStop0Px <= 0m) return;
+
+            var snap = ReadPositionSnapshot();
+            var dir = Math.Sign(snap.NetQty);
+            if (dir == 0) return;
+
+            // Actualizar extremos
+            var (last, hi, lo) = GetLastPriceTriplet();
+            if (_trailMaxReached == 0m) _trailMaxReached = last;
+            if (_trailMinReached == 0m) _trailMinReached = last;
+            _trailMaxReached = Math.Max(_trailMaxReached, hi);
+            _trailMinReached = Math.Min(_trailMinReached, lo);
+
+            // Hitos (R) del ladder/targets
+            var (miles, _, _) = GetMilestonesFromLadderOrTargets();
+            if (miles == null || miles.Count == 0) return;
+
+            // ¿Qué escalón hemos tocado desde que armamos?
+            int touched = -1;
+            if (dir > 0)
+            { // LONG: maxReached ≥ nivel
+                for (int i = 0; i < miles.Count; i++)
+                {
+                    var levelPx = CalcTargetPriceByR(_ladderEntryPx, _ladderStop0Px, miles[i]);
+                    if (_trailMaxReached >= levelPx) touched = i;
+                }
+            }
+            else
+            {       // SHORT: minReached ≤ nivel
+                for (int i = 0; i < miles.Count; i++)
+                {
+                    var levelPx = CalcTargetPriceByR(_ladderEntryPx, _ladderStop0Px, miles[i]);
+                    if (_trailMinReached <= levelPx) touched = i;
+                }
+            }
+            if (touched < 0 || touched <= _trailLastStepIdx) return; // nada nuevo
+
+            // "Trail starts at" gating
+            int startIdx = 0;
+            switch (TrailStartsAt)
+            {
+                case RmTrailStart.BE: startIdx = 0; break; // primer peldaño → BE
+                case RmTrailStart.TP1: startIdx = 0; break; // equivalente a primer TP
+                case RmTrailStart.TPk: startIdx = Math.Max(0, TrailStartIndex - 1); break;
+                case RmTrailStart.Immediately: startIdx = 0; break;
+            }
+            if (touched < startIdx) return; // aún no arrancamos
+
+            // ¿Dónde mover?
+            decimal newStop = 0m;
+            if (touched == 0 && TrailStartsAt == RmTrailStart.BE)
+            {
+                // Primer peldaño → BE+offset
+                var ts = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+                var bePx = (_ladderEntryPx + (dir > 0 ? +BeOffsetTicks * ts : -BeOffsetTicks * ts));
+                newStop = bePx;
+            }
+            else
+            {
+                // del peldaño k mover al (k-1) ± distance
+                var prevIdx = Math.Max(0, touched - 1);
+                var refPx = CalcTargetPriceByR(_ladderEntryPx, _ladderStop0Px, miles[prevIdx]);
+                var ts = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+                newStop = dir > 0 ? (refPx - TrailDistanceTicks * ts) : (refPx + TrailDistanceTicks * ts);
+            }
+
+            // Monotonicidad
+            if (!TryGetCurrentStop(out var currStop)) return;
+            var oneTick = Convert.ToDecimal(Security?.TickSize ?? FallbackTickSize);
+            bool better = dir > 0 ? newStop > currStop + oneTick : newStop < currStop - oneTick;
+            if (!better) return;
+
+            if (EnableLogging) DebugLog.W("RM/TRAIL/MOVE", $"TpToTp touched={touched + 1} from={currStop:F2} to={newStop:F2}");
+            MoveAllRmStopsTo(newStop, "TRAIL/TpToTp");
+            _lastTrailMoveBar = CurrentBar;
+            _trailLastStepIdx = touched;
         }
 
         private int ComputeVolatilityTicks(int window, RmVolMetric metric, decimal tickSize)
@@ -1047,10 +1330,22 @@ namespace MyAtas.Strategies
         private DateTime _pendingSince = DateTime.MinValue;
         private int _pendingDirHint = 0;                 // +1/-1 si logramos leerlo del Order
         private int _pendingFillQty = 0;                 // qty del fill manual (si la API lo expone)
-        private readonly int _attachThrottleMs = 80;     // consolidaciÃƒÆ’Ã‚Â³n mÃƒÆ’Ã‚Â­nima (antes 200)
-        private readonly int _attachDeadlineMs = 90;     // fallback rÃƒÆ’Ã‚Â¡pido si el net no llega (antes 120)
+        private readonly int _attachThrottleMs = 80;     // consolidaciÃƒÆ'Ã‚Â³n mÃƒÆ'Ã‚Â­nima (antes 200)
+        private readonly int _attachDeadlineMs = 90;     // fallback rÃƒÆ'Ã‚Â¡pido si el net no llega (antes 120)
         private readonly System.Collections.Generic.List<Order> _liveOrders = new();
         private readonly object _liveOrdersLock = new();
+
+        // === Estado Ladder ===
+        private List<(decimal R, int Pct, bool Virtual)> _ladderSteps;  // snapshot al adjuntar
+        private int _ladderNextPublishAt = 0;                         // siguientes reales por publicar
+        private decimal _ladderEntryPx = 0m, _ladderStop0Px = 0m;     // para recalcular TPx por R
+
+        // === Estado Trailing ===
+        private decimal _trailMaxReached = 0m;   // máximo alcanzado desde armar trailing
+        private decimal _trailMinReached = 0m;   // mínimo alcanzado desde armar trailing
+        private int _trailLastStepIdx = -1;      // último peldaño tocado (-1 = ninguno)
+        private int _lastTrailMoveBar = -1;      // barra del último movimiento
+
         // Ancla estructural capturada en el fill
         private int _pendingPrevBarIdxAtFill = -1;
         private decimal _pendingAnchorHigh = 0m;
@@ -1070,6 +1365,9 @@ namespace MyAtas.Strategies
             _pendingFillQty = 0;
             _beArmed = false; _beDone = false; _beTargetPx = 0m;
             _beArmedAtPrice = _beMaxReached = _beMinReached = 0m;  // Limpiar tracking BE
+            _trailMaxReached = _trailMinReached = 0m;  // Limpiar tracking Trailing
+            _trailLastStepIdx = -1;
+            _lastTrailMoveBar = -1;
             if (EnableLogging) DebugLog.W("RM/GATE", $"ResetAttachState: {reason}");
         }
 
@@ -1458,32 +1756,21 @@ namespace MyAtas.Strategies
         }
 
         /// <summary>
-        /// Obtiene el R múltiple del TP configurado para trigger del BE desde el modelo Targets (UI nueva).
+        /// Obtiene el R múltiple del TP configurado para trigger del BE desde ladder o targets.
         /// NO depende del % de cobro: aunque sea 0 (TP virtual), devuelve el R correcto.
         /// </summary>
         private decimal GetBeRMultipleFromTargets()
         {
-            try
-            {
-                var tgt = Targets; // Lee desde UI "Targets (clic para editar)"
-                if (tgt == null) return 1m; // Fallback seguro
+            return GetBeRMultiple();
+        }
 
-                // Seleccionar TP según BeTriggerTp (1, 2 o 3)
-                var row = BeTriggerTp switch
-                {
-                    1 => tgt.TP1,
-                    2 => tgt.TP2,
-                    3 => tgt.TP3,
-                    _ => tgt.TP1 // Fallback a TP1
-                };
-
-                var r = row?.R ?? 0m;
-                return r > 0m ? r : 1m; // Fallback si R inválido
-            }
-            catch
-            {
-                return 1m; // Fallback en caso de error
-            }
+        // BE: toma el R del ladder o de Targets3
+        private decimal GetBeRMultiple()
+        {
+            var (miles, _, _) = GetMilestonesFromLadderOrTargets();
+            if (miles == null || miles.Count == 0) return 1m;
+            var idx = Math.Clamp(BeTriggerTp - 1, 0, miles.Count - 1);
+            return miles[idx] > 0m ? miles[idx] : 1m;
         }
 
 
@@ -1645,6 +1932,13 @@ namespace MyAtas.Strategies
                 }
             }
             catch (Exception ex) { DebugLog.W("RM/BE", $"BE touch check EX: {ex.Message}"); }
+
+            // === Trailing TpToTp (con ladder) ===
+            try
+            {
+                ProcessTrailing();
+            }
+            catch (Exception ex) { DebugLog.W("RM/TRAIL", $"ProcessTrailing EX: {ex.Message}"); }
         }
 
         protected override void OnOrderChanged(Order order)
@@ -1874,8 +2168,8 @@ namespace MyAtas.Strategies
                     if (exitPrice > 0m && filledQty > 0)
                     {
                         // DirecciÃ³n: TP/SL son Ã³rdenes de cierre, asÃ­ que estÃ¡n en direcciÃ³n opuesta a la posiciÃ³n
-                        // Si fue LONG â†’ TP/SL son SELL â†’ dir original = +1
-                        // Si fue SHORT â†’ TP/SL son BUY â†’ dir original = -1
+                        // Si fue LONG â†' TP/SL son SELL â†' dir original = +1
+                        // Si fue SHORT â†' TP/SL son BUY â†' dir original = -1
                         var orderDir = ExtractDirFromOrder(order);
                         var positionDir = -orderDir;  // invertir porque es orden de cierre
 
@@ -1891,6 +2185,35 @@ namespace MyAtas.Strategies
             catch (Exception ex)
             {
                 if (EnableLogging) DebugLog.W("RM/PNL", $"Track TP/SL fill EX: {ex.Message}");
+            }
+
+            // === LADDER SLIDE: al llenarse un TP real, publica el siguiente real (si existe) ===
+            try
+            {
+                var c = order?.Comment ?? "";
+                if (_ladderSteps != null && order.Status() == OrderStatus.Filled && c.StartsWith(OwnerPrefix + "TP:"))
+                {
+                    var realAll = _ladderSteps.Where(s => !s.Virtual && s.Pct > 0).ToList();
+                    if (_ladderNextPublishAt < realAll.Count)
+                    {
+                        var next = realAll[_ladderNextPublishAt];
+                        var nextPx = CalcTargetPriceByR(_ladderEntryPx, _ladderStop0Px, next.R);
+                        // Qty proporcional a la posición restante
+                        var rem = Math.Abs(ReadPositionSnapshot().NetQty);
+                        var qty = (int)Math.Max(1, Math.Round(rem * (next.Pct / 100m)));
+                        if (EnableLogging) DebugLog.W("RM/LADDER/WINDOW", $"publish next real: {next.R}R @ {nextPx:F2} qty={qty}");
+                        // Usa tu helper para crear un TP (mismo side cover y OCO actual)
+                        var snap = ReadPositionSnapshot();
+                        var dir = Math.Sign(snap.NetQty);
+                        var coverSide = dir > 0 ? OrderDirections.Sell : OrderDirections.Buy;
+                        SubmitRmLimit(null, coverSide, qty, nextPx);
+                        _ladderNextPublishAt++;
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                if (EnableLogging) DebugLog.W("RM/LADDER/WINDOW", $"Sliding window EX: {ex.Message}");
             }
         }
 
@@ -2274,43 +2597,36 @@ namespace MyAtas.Strategies
                 var rPrice = dir > 0 ? (entryPx - slPxForR) : (slPxForR - entryPx);
                 if (rPrice <= 0m) rPrice = Math.Max(1, approxStopTicks) * tickSize;
 
-                // Construir lista local de TPs seguros (precio>0) a partir de R-multiples UI
-                var tpRlocals = new System.Collections.Generic.List<decimal>();
-                if (PresetTPs >= 1 && TP1pctunit > 0) tpRlocals.Add(Math.Max(0.25m, TP1R));
-                if (PresetTPs >= 2 && TP2pctunit > 0) tpRlocals.Add(Math.Max(0.25m, TP2R));
-                if (PresetTPs >= 3 && TP3pctunit > 0) tpRlocals.Add(Math.Max(0.25m, TP3R));
+                // === LADDER: snapshot y ventana inicial de TPs reales (máx. 3) ===
+                var (miles, steps, src) = GetMilestonesFromLadderOrTargets();
+                if (EnableLogging) DebugLog.W("RM/LADDER/SNAPSHOT", $"src={src} steps={string.Join(",", steps.Select(x => $"{x.R}R/{x.Pct}%{(x.Virtual ? "V" : "R")}"))}");
 
-                // Validar y reconstruir TPs del plan
-                var safeTps = new System.Collections.Generic.List<MyAtas.Risk.Models.BracketLeg>();
-                for (int i = 0; i < plan.TakeProfits.Count; i++)
+                // Guardar snapshot (para sliding)
+                _ladderSteps = steps;
+                _ladderEntryPx = _pendingEntryPrice != 0m ? _pendingEntryPrice : GetLastPriceSafe();
+                _ladderStop0Px = plan?.StopLoss?.Price ?? 0m;
+
+                // Reales iniciales → primeros 3 con %>0 (virtuales se saltan)
+                var realInit = steps.Where(s => !s.Virtual && s.Pct > 0).Take(MaxConcurrentTps).ToList();
+                _ladderNextPublishAt = steps.Where(s => !s.Virtual && s.Pct > 0).Count() > MaxConcurrentTps
+                    ? MaxConcurrentTps
+                    : steps.Where(s => !s.Virtual && s.Pct > 0).Count();
+
+                var initialTps = new List<MyAtas.Risk.Models.BracketLeg>();
+                foreach (var row in realInit)
                 {
-                    var tp = plan.TakeProfits[i];
-                    var px = tp.Price;
-                    if (px <= 0m)
-                    {
-                        // Motor no puso precio vÃ¡lido â†’ calcular localmente
-                        var rMult = (i < tpRlocals.Count) ? tpRlocals[i] : (tpRlocals.Count > 0 ? tpRlocals[tpRlocals.Count - 1] : 1m);
-                        var raw = dir > 0 ? (entryPx + rMult * rPrice) : (entryPx - rMult * rPrice);
-                        px = ShrinkPrice(raw);
-                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"TP[{i}] era 0 â†’ calculado: {px:F2} (R={rMult:F2})");
-                    }
-                    if (px > 0m) safeTps.Add(new MyAtas.Risk.Models.BracketLeg(px, tp.Quantity));
+                    var px = CalcTargetPriceByR(_ladderEntryPx, _ladderStop0Px, row.R);
+                    // Qty proporcional a la qty objetivo del attach (usa tu helper de splits si lo prefieres)
+                    var qty = (int)Math.Max(1, Math.Round(plan.TotalQty * (row.Pct / 100m)));
+                    initialTps.Add(new MyAtas.Risk.Models.BracketLeg(px, qty));
                 }
 
-                // Si no hay TPs vÃ¡lidos, crear uno en 1R con el 100% de qty
-                if (safeTps.Count == 0)
-                {
-                    var px1 = ShrinkPrice(dir > 0 ? (entryPx + 1m * rPrice) : (entryPx - 1m * rPrice));
-                    if (px1 > 0m)
-                    {
-                        safeTps.Add(new MyAtas.Risk.Models.BracketLeg(px1, Math.Max(1, plan.TotalQty)));
-                        if (EnableLogging) DebugLog.W("RM/TP-FALLBACK", $"No TPs vÃ¡lidos â†’ creado 1 TP en 1R: {px1:F2}");
-                    }
-                }
+                // Si no hay reales → SOLO-SL (permitido)
+                bool onlySL = initialTps.Count == 0;
+                plan = new MyAtas.Risk.Models.RiskPlan(plan.TotalQty, plan.StopLoss, initialTps, plan.OcoPolicy, plan.Reason + (onlySL ? " [SOLO-SL]" : " [LADDER-INIT]"));
 
-                // Sustituir TPs en plan
-                if (safeTps.Count > 0)
-                    plan = new MyAtas.Risk.Models.RiskPlan(plan.TotalQty, plan.StopLoss, safeTps, plan.OcoPolicy, plan.Reason + " [TP-safe]");
+                if (EnableLogging)
+                    DebugLog.W("RM/LADDER/INIT", initialTps.Count == 0 ? "SOLO-SL" : $"INIT REALS: {string.Join(",", initialTps.Select(t => $"{t.Price:F2}@{t.Quantity}"))}");
 
                 // ===== "LA UI MANDA": Si EnforceManualQty estÃ¡ activo, usar ManualQty =====
                 var manualTarget = Math.Max(MinQty, ManualQty);
