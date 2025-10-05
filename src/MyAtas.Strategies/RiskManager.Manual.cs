@@ -770,12 +770,47 @@ namespace MyAtas.Strategies
 
         private void ProcessTrailing()
         {
-            if (TrailingMode != RmTrailMode.TpToTp) return;
-            if (_ladderSteps == null || _ladderEntryPx <= 0m || _ladderStop0Px <= 0m) return;
+            // === LOG ENTRY SIEMPRE ===
+            if (EnableLogging)
+                DebugLog.W("RM/TRAIL/TRACE", $"ENTRY: steps={(_ladderSteps!=null)} entry={_ladderEntryPx:F2} stop0={_ladderStop0Px:F2}");
 
+            // === GATES BÁSICOS ===
+            if (TrailingMode != RmTrailMode.TpToTp)
+            {
+                if (EnableLogging)
+                    DebugLog.W("RM/TRAIL/DBG", "SKIP: mode!=TpToTp");
+                return;
+            }
+
+            if (_ladderSteps == null || _ladderEntryPx <= 0m || _ladderStop0Px <= 0m)
+            {
+                if (EnableLogging)
+                    DebugLog.W("RM/TRAIL/DBG", $"SKIP: steps={(_ladderSteps!=null)} entry={_ladderEntryPx:F2} stop0={_ladderStop0Px:F2}");
+                return;
+            }
+
+            // === SNAPSHOT POSICIÓN ===
             var snap = ReadPositionSnapshot();
-            var dir = Math.Sign(snap.NetQty);
-            if (dir == 0) return;
+            int dir = Math.Sign(snap.NetQty);
+            if (dir == 0 && _prevNet != 0) dir = Math.Sign(_prevNet);
+            if (dir == 0 && _beDirHint != 0) dir = Math.Sign(_beDirHint);
+
+            bool haveMySL = HasLiveOrdersWithPrefix(OwnerPrefix + "SL:");
+            if (dir == 0 && haveMySL)
+                dir = InferDirFromLiveSl();
+
+            if (dir == 0)
+            {
+                if (EnableLogging)
+                    DebugLog.W("RM/TRAIL/DBG", $"SKIP: dir=0 net={snap.NetQty} prev={_prevNet} beHint={_beDirHint} slLive={haveMySL}");
+                return;
+            }
+
+            if (EnableLogging)
+            {
+                var (last_, hi_, lo_) = GetLastPriceTriplet();
+                DebugLog.W("RM/TRAIL/TRACE", $"STATE: dir={(dir>0?"LONG":"SHORT")} last={last_:F2} hi={hi_:F2} lo={lo_:F2} entry={_ladderEntryPx:F2} stop0={_ladderStop0Px:F2} lastStepIdx={_trailLastStepIdx}");
+            }
 
             // Actualizar extremos
             var (last, hi, lo) = GetLastPriceTriplet();
@@ -786,7 +821,12 @@ namespace MyAtas.Strategies
 
             // Hitos (R) del ladder/targets
             var (miles, _, _) = GetMilestonesFromLadderOrTargets();
-            if (miles == null || miles.Count == 0) return;
+            if (miles == null || miles.Count == 0)
+            {
+                if (EnableLogging)
+                    DebugLog.W("RM/TRAIL/DBG", "SKIP: miles=null/empty");
+                return;
+            }
 
             // ¿Qué escalón hemos tocado desde que armamos?
             int touched = -1;
@@ -806,7 +846,20 @@ namespace MyAtas.Strategies
                     if (_trailMinReached <= levelPx) touched = i;
                 }
             }
-            if (touched < 0 || touched <= _trailLastStepIdx) return; // nada nuevo
+
+            if (touched < 0)
+            {
+                if (EnableLogging)
+                    DebugLog.W("RM/TRAIL/DBG", $"NO-TOUCH: last={last:F2} hi={hi:F2} lo={lo:F2} max={_trailMaxReached:F2} min={_trailMinReached:F2}");
+                return;
+            }
+
+            if (touched <= _trailLastStepIdx)
+            {
+                if (EnableLogging)
+                    DebugLog.W("RM/TRAIL/DBG", $"SKIP: touched={touched} <= lastStepIdx={_trailLastStepIdx}");
+                return;
+            }
 
             // "Trail starts at" gating
             int startIdx = 0;
@@ -845,6 +898,16 @@ namespace MyAtas.Strategies
 
             if (EnableLogging) DebugLog.W("RM/TRAIL/MOVE", $"TpToTp touched={touched + 1} from={currStop:F2} to={newStop:F2}");
             MoveAllRmStopsTo(newStop, "TRAIL/TpToTp");
+
+            // Actualizar stop0 del ladder para siguientes cálculos de trailing
+            if (_ladderStop0Px > 0m)
+            {
+                var oldStop0 = _ladderStop0Px;
+                _ladderStop0Px = newStop;
+                if (EnableLogging)
+                    DebugLog.W("RM/TRAIL/MOVE", $"Updated ladder stop0: {oldStop0:F2} → {_ladderStop0Px:F2} (for next trailing calc)");
+            }
+
             _lastTrailMoveBar = CurrentBar;
             _trailLastStepIdx = touched;
         }
@@ -1190,8 +1253,44 @@ namespace MyAtas.Strategies
                     }
                 }
 
+                // === NUEVO: mover SLs standalone (sin TP en el mismo OCO) ===
+                var modifiedStandalone = 0;
+                var recreatedStandalone = 0;
+
+                foreach (var kv in slsByOco)
+                {
+                    var oco = kv.Key;
+                    if (tpsByOco.ContainsKey(oco)) continue; // ya tratados arriba (parejas SL+TP)
+
+                    var slOld = kv.Value;
+                    var qty = Math.Max(0, slOld.QuantityToFill);
+                    if (qty <= 0) continue;
+
+                    // 1) Intentar modificar in-place
+                    if (TryModifyStopInPlace(slOld, newStopPx)) { modifiedStandalone++; continue; }
+
+                    // 2) Fallback: cancelar y recrear SOLO el SL (sin TP)
+                    try { CancelOrder(slOld); } catch { }
+                    var slNew = new Order
+                    {
+                        Portfolio      = Portfolio,
+                        Security       = Security,
+                        Direction      = slOld.Direction,         // cover side correcto
+                        Type           = OrderTypes.Stop,
+                        TriggerPrice   = newStopPx,
+                        QuantityToFill = qty,
+                        OCOGroup       = string.IsNullOrEmpty(oco) ? null : oco, // mantener null si era standalone
+                        IsAttached     = true,
+                        Comment        = $"{OwnerPrefix}SL:{Guid.NewGuid():N}"
+                    };
+                    TrySetReduceOnly(slNew);
+                    TrySetCloseOnTrigger(slNew);
+                    OpenOrder(slNew);
+                    recreatedStandalone++;
+                }
+
                 if (EnableLogging)
-                    DebugLog.W("RM/BE", $"Moved SLs to {newStopPx:F2} (modified={modified} replaced={replaced} tpRecreated={recreated}) reason={reason}");
+                    DebugLog.W("RM/BE", $"Moved SLs to {newStopPx:F2} (modified={modified} replaced={replaced} tpRecreated={recreated} standaloneMod={modifiedStandalone} standaloneRecreated={recreatedStandalone}) reason={reason}");
             }
             catch (Exception ex)
             {
@@ -1296,9 +1395,12 @@ namespace MyAtas.Strategies
 
         private RiskEngine _engine;
 
+        // =================== Lifecycle Debug ===================
+        private bool _firstOnCalculateLog = true;
+
         // =================== Stop-to-Flat (RM Close) ===================
-        // Cuando el usuario pulsa el botÃƒÆ’Ã‚Â³n rojo de ATAS (Stop Strategy),
-        // queremos: cancelar brackets propios y hacer FLATTEN de la posiciÃƒÆ’Ã‚Â³n.
+        // Cuando el usuario pulsa el botÃƒÆ'Ã‚Â³n rojo de ATAS (Stop Strategy),
+        // queremos: cancelar brackets propios y hacer FLATTEN de la posiciÃƒÆ'Ã‚Â³n.
         private bool _stopToFlat = false;
         private DateTime _rmStopGraceUntil = DateTime.MinValue;     // mientras now<=esto, estamos drenando cancel/fill
         private const int _rmStopGraceMs = 900;                     // holgura post-cancel/flatten (antes 2200)
@@ -1306,7 +1408,7 @@ namespace MyAtas.Strategies
         private const int _stopSweepEveryMs = 250;                  // sweep periÃƒÆ’Ã‚Â³dico durante el stop
 
         // ==== Diagnostics / Build stamp ====
-        private const string BuildStamp = "RM.Manual/stop-to-flat 2025-09-30T22:00Z";
+        private const string BuildStamp = "RM.Manual/TRAILING-DEBUG 2025-10-05T22:40Z";
 
         // ==== Post-Close grace & timeouts ====
         private DateTime _postCloseUntil = DateTime.MinValue; // if now <= this ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ inGrace
@@ -1376,13 +1478,17 @@ namespace MyAtas.Strategies
         {
             try
             {
-                // No inicializar aquÃƒÆ’Ã‚Â­ para evitar problemas de carga
+                // No inicializar aquÃƒÆ'Ã‚Â­ para evitar problemas de carga
                 _engine = null;
                 _targets = TargetsModel.FromLegacy(PresetTPs, TP1R, TP2R, TP3R, TP1pctunit, TP2pctunit, TP3pctunit);
+
+                // LOG CRÍTICO: Constructor ejecutado
+                if (EnableLogging) DebugLog.W("RM/LIFECYCLE", "RiskManagerManualStrategy() constructor executed");
             }
-            catch
+            catch (Exception ex)
             {
                 // Constructor sin excepciones para ATAS
+                DebugLog.W("RM/LIFECYCLE", $"Constructor EXCEPTION: {ex.Message}");
             }
         }
 
@@ -1776,7 +1882,23 @@ namespace MyAtas.Strategies
 
         protected override void OnCalculate(int bar, decimal value)
         {
-            if (!IsActivated) return;
+            // LOG CRÍTICO primera vez: OnCalculate ejecutándose
+            if (_firstOnCalculateLog)
+            {
+                _firstOnCalculateLog = false;
+                if (EnableLogging)
+                {
+                    DebugLog.W("RM/LIFECYCLE", $"OnCalculate() FIRST CALL: bar={bar} IsActivated={IsActivated}");
+                }
+            }
+
+            if (!IsActivated)
+            {
+                // LOG: explicar por qué no procesa
+                if (EnableLogging && bar % 100 == 0) // cada 100 barras para no saturar
+                    DebugLog.W("RM/LIFECYCLE", $"OnCalculate SKIPPED: IsActivated=False (ManageManualEntries={ManageManualEntries})");
+                return;
+            }
 
             // Refresca equity en UI (1Ã—/s)
             if (DateTime.UtcNow >= _nextEquityProbeAt)
@@ -1926,6 +2048,16 @@ namespace MyAtas.Strategies
                                 DebugLog.W("RM/BE/SAFE", $"clamp {bePx:F2} â†’ {newTrigger:F2} (last={GetLastPriceSafe():F2})");
                             if (EnableLogging) DebugLog.W("RM/BE", $"TOUCH trigger @ {_beTargetPx:F2} ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ move SL to BE {newTrigger:F2}");
                             MoveAllRmStopsTo(newTrigger, "BE touch");
+
+                            // Actualizar stop0 del ladder para trailing (después de BE, el nuevo riesgo es desde entry hasta nuevo SL)
+                            if (_ladderStop0Px > 0m)
+                            {
+                                var oldStop0 = _ladderStop0Px;
+                                _ladderStop0Px = newTrigger;
+                                if (EnableLogging)
+                                    DebugLog.W("RM/BE", $"Updated ladder stop0: {oldStop0:F2} → {_ladderStop0Px:F2} (for trailing calc)");
+                            }
+
                             _beDone = true;
                         }
                     }
@@ -1970,7 +2102,13 @@ namespace MyAtas.Strategies
 
             try
             {
-                if (!IsActivated || !ManageManualEntries) return;
+                // LOG CRÍTICO: ¿Por qué no procesamos órdenes manuales?
+                if (!IsActivated || !ManageManualEntries)
+                {
+                    if (EnableLogging && order?.Status() == OrderStatus.Filled)
+                        DebugLog.W("RM/ORD/SKIP", $"Manual entry BLOCKED: IsActivated={IsActivated} ManageManualEntries={ManageManualEntries} comment={order?.Comment}");
+                    return;
+                }
 
                 var comment = order?.Comment ?? "";
                 var st = order.Status();
@@ -2136,6 +2274,16 @@ namespace MyAtas.Strategies
                                 DebugLog.W("RM/BE/SAFE", $"clamp {bePx:F2} â†’ {newTrigger:F2} (last={GetLastPriceSafe():F2})");
                             if (EnableLogging) DebugLog.W("RM/BE", $"FILL trigger by TP ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ move SL to BE {newTrigger:F2}");
                             MoveAllRmStopsTo(newTrigger, "BE fill");
+
+                            // Actualizar stop0 del ladder para trailing (después de BE, el nuevo riesgo es desde entry hasta nuevo SL)
+                            if (_ladderStop0Px > 0m)
+                            {
+                                var oldStop0 = _ladderStop0Px;
+                                _ladderStop0Px = newTrigger;
+                                if (EnableLogging)
+                                    DebugLog.W("RM/BE", $"Updated ladder stop0: {oldStop0:F2} → {_ladderStop0Px:F2} (for trailing calc)");
+                            }
+
                             _beDone = true;
                         }
                     }
@@ -2244,6 +2392,13 @@ namespace MyAtas.Strategies
         {
             try
             {
+                // LOG CRÍTICO: OnStarted se ejecutó
+                if (EnableLogging)
+                {
+                    DebugLog.W("RM/LIFECYCLE", "=========== OnStarted() EXECUTED ===========");
+                    DebugLog.W("RM/LIFECYCLE", $"IsActivated={IsActivated} ManageManualEntries={ManageManualEntries}");
+                }
+
                 AccountEquitySnapshot = ReadAccountEquityUSD();
                 if (EnableLogging) DebugLog.W("RM/SNAP", $"Equity init ÃƒÂ¢Ã¢â‚¬ Â°Ã‹â€  {AccountEquitySnapshot:F2} USD");
 
@@ -2252,7 +2407,10 @@ namespace MyAtas.Strategies
                 _nextStopSweepAt   = DateTime.MinValue;
                 if (EnableLogging) DebugLog.W("RM/STOP", "Started ÃƒÂ¢Ã¢â‚¬ Ã¢â‚¬â„¢ reset stop-to-flat flags");
             }
-            catch { }
+            catch (Exception ex)
+            {
+                DebugLog.W("RM/LIFECYCLE", $"OnStarted EXCEPTION: {ex.Message}");
+            }
         }
 
         protected override void OnStopping()
@@ -2349,6 +2507,10 @@ namespace MyAtas.Strategies
         {
             try
             {
+                // LOG CRÍTICO: Cada llamada a TryAttachBracketsNow
+                if (EnableLogging)
+                    DebugLog.W("RM/ATTACH/ENTRY", $"TryAttachBracketsNow() called: _pendingAttach={_pendingAttach}");
+
                 // Si acabamos de armar attach, no bloquees por una grace antigua
                 if (_pendingAttach && DateTime.UtcNow <= _postCloseUntil)
                     _postCloseUntil = DateTime.MinValue;
@@ -2778,6 +2940,18 @@ namespace MyAtas.Strategies
                         DebugLog.W("RM/ORD", $"PAIR #{idx + 1}: OCO SL {q}@{slPriceToUse:F2} + TP {q}@{tp.Price:F2} (dir={(dir>0?"LONG":"SHORT")})");
                 }
 
+                // === SOLO-SL: Publicar SL standalone si no hay TPs ===
+                if (plan.TakeProfits.Count == 0)
+                {
+                    var slPx = overrideStopPx ?? plan.StopLoss.Price;
+                    var slQty = targetForEnforce; // toda la posición
+
+                    if (EnableLogging)
+                        DebugLog.W("RM/ORD", $"SOLO-SL MODE: standalone SL {coverSide} {slQty}@{slPx:F2} (no OCO, no TPs)");
+
+                    SubmitRmStop(null, coverSide, slQty, slPx);  // OCO=null → orden simple
+                }
+
                 // Armar el BE (vigilancia del TP trigger para mover SL a breakeven)
                 if (BreakEvenMode != RmBeMode.Off)
                 {
@@ -2829,7 +3003,11 @@ namespace MyAtas.Strategies
 
                 _pendingAttach = false;
                 _pendingPrevBarIdxAtFill = -1; // limpiar el ancla para la siguiente entrada
-                if (EnableLogging) DebugLog.W("RM/PLAN", "Attach DONE");
+                if (EnableLogging)
+                {
+                    DebugLog.W("RM/PLAN", "Attach DONE");
+                    LogOrderStateHistogram("post-attach");  // Verificar presencia de SL tras publicación
+                }
             }
             catch (Exception ex)
             {
@@ -3246,7 +3424,7 @@ namespace MyAtas.Strategies
                 {
                     var c = o?.Comment ?? "";
                     if (!c.StartsWith(prefix)) return false;
-                    // consideramos viva si NO estÃƒÆ’Ã‚Â¡ cancelada y NO estÃƒÆ’Ã‚Â¡ llena
+                    // consideramos viva si NO estÃƒÆ'Ã‚Â¡ cancelada y NO estÃƒÆ'Ã‚Â¡ llena
                     var st = o.Status();
                     return !o.Canceled
                            && st != OrderStatus.Filled
@@ -3256,7 +3434,29 @@ namespace MyAtas.Strategies
             catch { return false; }
         }
 
-        // Log de cancelaciÃƒÆ’Ã‚Â³n fallida (para ver por quÃƒÆ’Ã‚Â© queda algo "working")
+        // Deducción de dirección cuando TM.Position reporta net=0 pero existe un SL propio "vivo".
+        // Regla: SL Sell => cubre una posición LONG => dir=+1; SL Buy => cubre una posición SHORT => dir=-1.
+        private int InferDirFromLiveSl()
+        {
+            try
+            {
+                var list = this.Orders;
+                if (list == null) return 0;
+                foreach (var o in list)
+                {
+                    if (o == null) continue;
+                    var c = o.Comment ?? "";
+                    if (!c.StartsWith(OwnerPrefix + "SL:")) continue;
+                    var st = o.Status();
+                    if (o.Canceled || st == OrderStatus.Filled || st == OrderStatus.Canceled) continue;
+                    return (o.Direction == OrderDirections.Sell) ? +1 : -1;
+                }
+            }
+            catch { }
+            return 0;
+        }
+
+        // Log de cancelaciÃƒÆ'Ã‚Â³n fallida (para ver por quÃƒÆ'Ã‚Â© queda algo "working")
         protected override void OnOrderCancelFailed(Order order, string message)
         {
             if (!EnableLogging) return;
